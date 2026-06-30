@@ -7,6 +7,7 @@ import type {
   LocalRunnerConfig,
 } from "./contracts.js";
 import { writeJson, fileUri } from "./artifacts.js";
+import { openRouterChat } from "./openrouter.js";
 
 function normalize(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLowerCase();
@@ -69,21 +70,67 @@ async function runInferenceCommand(args: {
   });
 }
 
+async function judgeWithOpenRouter(args: {
+  prompt: string;
+  expected: string;
+  actual: string;
+  config: LocalRunnerConfig;
+}): Promise<{ score: number; reasoning: string; model: string | null }> {
+  if (!args.config.llm) {
+    throw new Error("evaluation.mode=llm_judge requires llm OpenRouter config");
+  }
+  const result = await openRouterChat([
+    {
+      role: "system",
+      content: "You are a strict evaluator. Return JSON only with keys score (0 to 1), passed (boolean), and reasoning (string).",
+    },
+    {
+      role: "user",
+      content: JSON.stringify({
+        prompt: args.prompt,
+        expected: args.expected,
+        actual: args.actual,
+      }),
+    },
+  ], {
+    model: args.config.llm.model,
+    apiKeyEnv: args.config.llm.apiKeyEnv,
+    appName: args.config.llm.appName,
+    siteUrl: args.config.llm.siteUrl,
+    timeoutMs: args.config.evaluation.timeoutMs,
+  });
+  const parsed = JSON.parse(result.content) as { score?: unknown; reasoning?: unknown };
+  const score = typeof parsed.score === "number"
+    ? Math.max(0, Math.min(1, parsed.score))
+    : 0;
+  return {
+    score,
+    reasoning: typeof parsed.reasoning === "string" ? parsed.reasoning : "OpenRouter judge returned no reasoning.",
+    model: result.model ?? args.config.llm.model,
+  };
+}
+
 export async function evaluateExamples(args: {
   kind: "baseline" | "candidate";
   modelId: string;
   examples: BehaviorSpecExample[];
   system: string;
-  config: LocalRunnerConfig["evaluation"];
+  config: LocalRunnerConfig;
   outputPath: string;
 }): Promise<EvalReport> {
-  const maxExamples = args.config.maxExamples ?? args.examples.length;
+  const maxExamples = args.config.evaluation.maxExamples ?? args.examples.length;
   const selected = args.examples.slice(0, maxExamples);
   const command = args.kind === "baseline"
-    ? args.config.baselineCommand
-    : args.config.candidateCommand;
-  const mode: "command" | "heuristic" = args.config.mode === "command" && command ? "command" : "heuristic";
+    ? args.config.evaluation.baselineCommand
+    : args.config.evaluation.candidateCommand;
+  const mode: "command" | "heuristic" | "llm_judge" =
+    args.config.evaluation.mode === "llm_judge"
+      ? "llm_judge"
+      : args.config.evaluation.mode === "command" && command
+        ? "command"
+        : "heuristic";
   const results: EvalExampleResult[] = [];
+  let judgeModelId: string | null = null;
 
   for (const example of selected) {
     const started = performance.now();
@@ -93,20 +140,29 @@ export async function evaluateExamples(args: {
           prompt: example.input,
           system: args.system,
           expected: example.output,
-          timeoutMs: args.config.timeoutMs,
+          timeoutMs: args.config.evaluation.timeoutMs,
         })
       : "";
+    const judged = mode === "llm_judge"
+      ? await judgeWithOpenRouter({
+          prompt: example.input,
+          expected: example.output,
+          actual,
+          config: args.config,
+        })
+      : null;
+    if (judged?.model) judgeModelId = judged.model;
     const latencyMs = Math.max(0, Math.round(performance.now() - started));
-    const score = scoreActual(example.output, actual);
+    const score = judged?.score ?? scoreActual(example.output, actual);
     results.push({
       prompt: example.input,
       expected: example.output,
       actual,
       passed: score === 1,
       score,
-      reasoning: mode === "heuristic"
+      reasoning: judged?.reasoning ?? (mode === "heuristic"
         ? "No inference command configured; recorded an empty local response."
-        : "Scored by normalized exact match against command output.",
+        : "Scored by normalized exact match against command output."),
       latency_ms: latencyMs,
     });
   }
@@ -135,7 +191,7 @@ export async function evaluateExamples(args: {
     results,
     artifact_uri: fileUri(args.outputPath),
     scoring_method: mode,
-    judge_model_id: null,
+    judge_model_id: judgeModelId,
   };
   await writeJson(args.outputPath, report);
   return report;

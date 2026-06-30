@@ -35,7 +35,8 @@ orchestration, and uv-managed Python GPU execution.
 
 This repository now contains a preview local runner. It can validate run
 requests, compile datasets, write local artifacts, run dry workflows, launch a
-configured uv training process, and emit a structured `run-report.json`.
+configured uv training process, persist run state to a local file-backed store,
+serve a small dashboard/API, and emit a structured `run-report.json`.
 
 The training process is intentionally a separate contract: configure a uv
 script or module that reads the local training environment variables and writes
@@ -60,10 +61,13 @@ npm test
 npm run build
 node dist/index.js validate examples/smoke-run-request.json --config examples/local-runner.json
 node dist/index.js run examples/smoke-run-request.json --config examples/local-runner.json
+node dist/index.js runs list --config examples/local-runner.json
+node dist/index.js serve --config examples/local-runner.json
 ```
 
 The example config uses `dryRun: true`, so it verifies the orchestration and
-artifact flow without starting GPU training.
+artifact flow without starting GPU training. It writes artifacts to
+`.tt-local/artifacts` and run/model/spec metadata to `.tt-local/store`.
 
 ## Commands
 
@@ -72,9 +76,57 @@ node dist/index.js info
 node dist/index.js doctor --config examples/local-runner.json
 node dist/index.js validate <request.json> --config <local-runner.json>
 node dist/index.js run <request.json> --config <local-runner.json>
+node dist/index.js serve --config <local-runner.json>
+node dist/index.js runs list --config <local-runner.json>
+node dist/index.js runs get <run-id> --config <local-runner.json>
+node dist/index.js runs events <run-id> --config <local-runner.json>
+node dist/index.js runs watch <run-id> --config <local-runner.json>
+node dist/index.js runs report <run-id> --config <local-runner.json>
+node dist/index.js models list --config <local-runner.json>
+node dist/index.js specs list --config <local-runner.json>
+node dist/index.js store rebuild-index --config <local-runner.json>
 ```
 
 For Spark-specific notes, see [docs/spark.md](docs/spark.md).
+
+## Local Store
+
+Set `storeRoot` in the runner config to keep dashboard state, runs, specs, model
+records, progress events, and copied reports in a portable local directory:
+
+```json
+{
+  "artifactRoot": ".tt-local/artifacts",
+  "storeRoot": ".tt-local/store"
+}
+```
+
+If `storeRoot` is omitted, the runner uses `TT_LOCAL_HOME` or
+`~/.tuned-tensor-local`.
+
+## OpenRouter Judge
+
+The local runner can use OpenRouter for LLM-as-judge evaluation while keeping
+training and artifacts local:
+
+```json
+{
+  "evaluation": {
+    "mode": "llm_judge",
+    "maxExamples": 10
+  },
+  "llm": {
+    "provider": "openrouter",
+    "model": "openai/gpt-5.2",
+    "apiKeyEnv": "OPENROUTER_API_KEY",
+    "appName": "Tuned Tensor Local"
+  }
+}
+```
+
+For command-backed evaluation, set `evaluation.mode` to `command` and provide
+`baselineCommand` and/or `candidateCommand`. The command receives JSON on stdin
+and should print either plain text or JSON with `content`, `output`, or `actual`.
 
 ## Real Training Config
 
@@ -83,6 +135,7 @@ Set `dryRun` to `false` and point `training.script` at the SFT script:
 ```json
 {
   "artifactRoot": "/home/eve/tt-local-artifacts",
+  "storeRoot": "/home/eve/tt-local-store",
   "dryRun": false,
   "training": {
     "backend": "uv",

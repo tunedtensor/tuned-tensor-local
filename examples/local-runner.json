@@ -1,5 +1,6 @@
 {
   "artifactRoot": ".tt-local/artifacts",
+  "storeRoot": ".tt-local/store",
   "dryRun": true,
   "training": {
     "backend": "uv",

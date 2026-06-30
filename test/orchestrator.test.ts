@@ -34,7 +34,8 @@ test("runs a dry local workflow and writes compatible artifacts", async () => {
       },
     });
     const config = localRunnerConfigSchema.parse({
-      artifactRoot: root,
+      artifactRoot: join(root, "artifacts"),
+      storeRoot: join(root, "store"),
       dryRun: true,
       evaluation: { mode: "heuristic" },
     });

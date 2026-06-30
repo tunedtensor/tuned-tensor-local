@@ -104,7 +104,7 @@ export const evalReportSchema = z.object({
   avg_latency_ms: z.number().int().nonnegative(),
   results: z.array(evalExampleResultSchema),
   artifact_uri: z.string(),
-  scoring_method: z.enum(["heuristic", "command"]),
+  scoring_method: z.enum(["heuristic", "command", "llm_judge"]),
   judge_model_id: z.string().nullable().optional(),
 });
 
@@ -170,6 +170,7 @@ export const runReportSchema = z.object({
 export const commandSchema = z.array(z.string().min(1)).min(1);
 
 export const localRunnerConfigSchema = z.object({
+  storeRoot: z.string().optional(),
   artifactRoot: z.string().default(".tt-local/artifacts"),
   dryRun: z.boolean().default(false),
   training: z.object({
@@ -192,7 +193,7 @@ export const localRunnerConfigSchema = z.object({
     modelCache: z.string().optional(),
   }).default({}),
   evaluation: z.object({
-    mode: z.enum(["heuristic", "command"]).default("heuristic"),
+    mode: z.enum(["heuristic", "command", "llm_judge"]).default("heuristic"),
     baselineCommand: commandSchema.optional(),
     candidateCommand: commandSchema.optional(),
     timeoutMs: z.number().int().min(100).default(120_000),
@@ -201,6 +202,13 @@ export const localRunnerConfigSchema = z.object({
     mode: "heuristic",
     timeoutMs: 120_000,
   }),
+  llm: z.object({
+    provider: z.literal("openrouter").default("openrouter"),
+    model: z.string().min(1).default("openai/gpt-5.2"),
+    apiKeyEnv: z.string().min(1).default("OPENROUTER_API_KEY"),
+    appName: z.string().optional(),
+    siteUrl: z.string().url().optional(),
+  }).optional(),
 });
 
 export type DocumentInputAsset = z.infer<typeof documentInputAssetSchema>;
