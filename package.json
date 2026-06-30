@@ -14,7 +14,11 @@
   },
   "files": [
     "dist",
+    "docs",
+    "examples",
+    "training",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
