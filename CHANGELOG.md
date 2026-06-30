@@ -2,14 +2,26 @@
 
 All notable changes to Tuned Tensor Local will be documented in this file.
 
+## 0.1.2 - 2026-06-30
+
+### Added
+
+- Added live `tt-local run` stage logging to stderr while preserving final JSON output on stdout.
+- Added `--verbose` subprocess streaming and `--quiet` JSON-only mode for local runs.
+- Added baseline and candidate inference log files for Transformers evaluation subprocesses.
+- Surfaced report, model, training log, evaluation artifact, and comparison paths in `tt-local run` output.
+
+### Fixed
+
+- Sanitized obvious token and API key patterns from streamed subprocess logs.
+- Ignored generated `.tt-local/` state in git.
+- Updated GitHub Actions pins and disabled uv action caching to avoid Node runtime and cache warnings.
+
 ## 0.1.1 - 2026-06-30
 
 ### Fixed
 
 - Fixed the published/global CLI binary entrypoint when invoked through npm symlinks.
-- Added live `tt-local run` stage logging, with `--verbose` subprocess streaming and `--quiet` JSON-only mode.
-- Added baseline/candidate inference log files and surfaced key report, model, training log, and comparison paths in run output.
-- Updated GitHub Actions pins and disabled uv action caching to avoid Node runtime and cache warnings.
 
 ## 0.1.0 - 2026-06-30
 
