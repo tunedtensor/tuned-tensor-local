@@ -9,7 +9,7 @@ All notable changes to Tuned Tensor Local will be documented in this file.
 - Fixed the published/global CLI binary entrypoint when invoked through npm symlinks.
 - Added live `tt-local run` stage logging, with `--verbose` subprocess streaming and `--quiet` JSON-only mode.
 - Added baseline/candidate inference log files and surfaced key report, model, training log, and comparison paths in run output.
-- Disabled uv action caching in CI to avoid misleading cache warnings when no uv lockfile is present.
+- Updated GitHub Actions pins and disabled uv action caching to avoid Node runtime and cache warnings.
 
 ## 0.1.0 - 2026-06-30
 
