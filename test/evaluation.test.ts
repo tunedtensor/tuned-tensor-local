@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -8,13 +8,16 @@ import { evaluateExamples } from "../src/evaluation.js";
 
 async function writeFakeEvaluator(root: string, actual: string): Promise<string> {
   const path = join(root, "fake-evaluate.py");
-  await writeFile(path, `
+await writeFile(path, `
 import argparse, json
+import sys
 parser = argparse.ArgumentParser()
 parser.add_argument("--input", required=True)
 parser.add_argument("--output", required=True)
 args = parser.parse_args()
 payload = json.load(open(args.input))
+print("fake evaluator started")
+print("fake evaluator loading model", file=sys.stderr)
 json.dump({
   "provider": "transformers",
   "model_id": payload["model_id"],
@@ -68,6 +71,10 @@ test("transformers evaluation adapter records generated outputs and exact-match 
     assert.equal(report.results[0]?.actual, "positive");
     assert.equal(report.avg_score, 1);
     assert.equal(report.exact_match_rate, 1);
+    assert.ok(report.log_uri);
+    const logText = await readFile(report.log_uri.replace(/^file:\/\//, ""), "utf8");
+    assert.match(logText, /fake evaluator started/);
+    assert.match(logText, /fake evaluator loading model/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

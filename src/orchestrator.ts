@@ -19,7 +19,8 @@ import {
 import { buildSystemMessage, compileSpecToJsonl, examplesFromChatJsonl, examplesFromSpec } from "./dataset.js";
 import { compareEvalReports, evaluateExamples } from "./evaluation.js";
 import { launchProcessTraining } from "./process-training.js";
-import { createLocalStore } from "./store.js";
+import type { LocalRunReporter } from "./run-reporter.js";
+import { createLocalStore, type LocalRunStatus } from "./store.js";
 
 export interface LocalRunResult {
   request: FineTuneRunRequest;
@@ -49,10 +50,11 @@ function elapsed(started: number): { ms: number; seconds: number } {
 export async function runLocalFineTune(input: {
   request: FineTuneRunRequest;
   config: LocalRunnerConfig;
+  reporter?: LocalRunReporter;
 }): Promise<LocalRunResult> {
   const startedPerf = performance.now();
   const startedAt = new Date().toISOString();
-  const { request, config } = input;
+  const { request, config, reporter } = input;
   const prefix = request.artifacts?.prefix ?? defaultArtifactPrefix({
     userId: request.user_id,
     behaviorSpecId: request.behavior_spec_id,
@@ -65,8 +67,30 @@ export async function runLocalFineTune(input: {
   await store.startRun({ request, artifactDir: artifacts.runDir });
 
   try {
-    await store.updateRun({
-      runId: request.run_id,
+    async function updateRun(args: {
+      status: LocalRunStatus;
+      stage: string;
+      message: string;
+      details?: Record<string, unknown>;
+    }) {
+      const state = await store.updateRun({ runId: request.run_id, ...args });
+      await reporter?.onEvent?.({
+        stage: args.stage,
+        status: args.status,
+        message: args.message,
+        details: args.details,
+      });
+      return state;
+    }
+
+    await reporter?.onEvent?.({
+      stage: "queued",
+      status: "queued",
+      message: "Run queued.",
+      details: { run_id: request.run_id, artifact_dir: artifacts.runDir },
+    });
+
+    await updateRun({
       status: "preparing",
       stage: "preparing",
       message: "Preparing local run artifacts.",
@@ -85,12 +109,15 @@ export async function runLocalFineTune(input: {
 
     const system = buildSystemMessage(request.spec_snapshot);
     const baseModelForEvaluation = config.paths.baseModel ?? request.spec_snapshot.base_model;
-    await store.updateRun({
-      runId: request.run_id,
+    await updateRun({
       status: "evaluating_baseline",
       stage: "evaluating_baseline",
       message: "Running baseline evaluation.",
-      details: { examples: examples.length },
+      details: {
+        examples: examples.length,
+        eval_examples_used: config.evaluation.maxExamples ?? examples.length,
+        model_id: baseModelForEvaluation,
+      },
     });
     const baseline = await evaluateExamples({
       kind: "baseline",
@@ -100,19 +127,18 @@ export async function runLocalFineTune(input: {
       system,
       config,
       outputPath: artifacts.baselineEvalJson,
+      reporter,
     });
 
-    await store.updateRun({
-      runId: request.run_id,
+    await updateRun({
       status: "training",
       stage: "training",
       message: config.dryRun ? "Recording dry-run training result." : "Launching local uv training process.",
       details: { training_backend: config.training.backend, dry_run: config.dryRun },
     });
-    const training = await launchProcessTraining({ request, artifacts, config });
+    const training = await launchProcessTraining({ request, artifacts, config, reporter });
 
-    await store.updateRun({
-      runId: request.run_id,
+    await updateRun({
       status: "evaluating_candidate",
       stage: "evaluating_candidate",
       message: "Running candidate evaluation.",
@@ -127,6 +153,7 @@ export async function runLocalFineTune(input: {
       system,
       config,
       outputPath: artifacts.candidateEvalJson,
+      reporter,
     });
     const comparison = compareEvalReports(baseline, candidate);
     const completedAt = new Date().toISOString();
@@ -167,6 +194,17 @@ export async function runLocalFineTune(input: {
     });
     await writeJson(artifacts.runReportJson, report);
     await store.completeRun(report, artifacts.runDir, artifacts.runReportJson);
+    await reporter?.onEvent?.({
+      stage: "completed",
+      status: "completed",
+      message: "Run completed successfully.",
+      details: {
+        report_path: artifacts.runReportJson,
+        model_id: `local-${request.run_id}`,
+        avg_score_delta: comparison.avg_score_delta,
+        elapsed_seconds: duration.seconds,
+      },
+    });
     return {
       request,
       report,
@@ -175,6 +213,11 @@ export async function runLocalFineTune(input: {
     };
   } catch (error) {
     await store.failRun(request.run_id, error instanceof Error ? error.message : String(error)).catch(() => undefined);
+    await reporter?.onEvent?.({
+      stage: "failed",
+      status: "failed",
+      message: error instanceof Error ? error.message : String(error),
+    });
     throw error;
   }
 }

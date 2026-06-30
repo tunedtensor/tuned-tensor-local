@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createWriteStream } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -10,6 +11,7 @@ import type {
 } from "./contracts.js";
 import { writeJson, fileUri } from "./artifacts.js";
 import { openRouterChat } from "./openrouter.js";
+import { forwardStreamLines, type LocalRunReporter } from "./run-reporter.js";
 
 function normalize(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLowerCase();
@@ -115,9 +117,11 @@ async function runTransformersInference(args: {
   system: string;
   config: LocalRunnerConfig;
   outputPath: string;
+  reporter?: LocalRunReporter;
 }): Promise<TransformersInferenceResult> {
   const inputPath = `${args.outputPath}.inference-input.json`;
   const outputPath = `${args.outputPath}.inference-output.json`;
+  const logPath = `${args.outputPath}.inference.log`;
   await mkdir(dirname(inputPath), { recursive: true });
   await writeFile(inputPath, `${JSON.stringify({
     kind: args.kind,
@@ -137,34 +141,66 @@ async function runTransformersInference(args: {
   }, null, 2)}\n`, "utf8");
 
   const uvArgs = buildUvInferenceArgs(args.config, inputPath, outputPath);
-  await new Promise<void>((resolvePromise, reject) => {
-    const child = spawn("uv", uvArgs, {
-      cwd: args.config.evaluation.inference.cwd ? resolve(args.config.evaluation.inference.cwd) : process.cwd(),
-      stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        ...args.config.evaluation.inference.env,
-      },
+  const command = ["uv", ...uvArgs];
+  await args.reporter?.onEvent?.({
+    stage: `evaluating_${args.kind}`,
+    status: "running",
+    message: `Starting ${args.kind} Transformers inference.`,
+    details: {
+      model_id: args.modelId,
+      examples: args.examples.length,
+      command,
+      log_path: logPath,
+    },
+  });
+  const logStream = createWriteStream(logPath, { flags: "w" });
+  try {
+    await new Promise<void>((resolvePromise, reject) => {
+      const child = spawn("uv", uvArgs, {
+        cwd: args.config.evaluation.inference.cwd ? resolve(args.config.evaluation.inference.cwd) : process.cwd(),
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          ...args.config.evaluation.inference.env,
+        },
+      });
+      let stderr = "";
+      const timer = setTimeout(() => {
+        child.kill("SIGTERM");
+        reject(new Error(`Transformers inference timed out after ${args.config.evaluation.timeoutMs}ms`));
+      }, args.config.evaluation.timeoutMs);
+      child.stdout.pipe(logStream, { end: false });
+      child.stderr.pipe(logStream, { end: false });
+      forwardStreamLines(child.stdout, (line) => {
+        if (args.reporter?.verbose) void args.reporter.onLog?.({ stage: `evaluating_${args.kind}`, stream: "stdout", message: line });
+      });
+      forwardStreamLines(child.stderr, (line) => {
+        stderr += `${line}\n`;
+        if (args.reporter?.verbose) void args.reporter.onLog?.({ stage: `evaluating_${args.kind}`, stream: "stderr", message: line });
+      });
+      child.on("error", (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        if (code !== 0) {
+          reject(new Error(`Transformers inference exited ${code}: ${stderr.slice(0, 1000)}`));
+          return;
+        }
+        resolvePromise();
+      });
     });
-    let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error(`Transformers inference timed out after ${args.config.evaluation.timeoutMs}ms`));
-    }, args.config.evaluation.timeoutMs);
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
+  } finally {
+    await new Promise<void>((resolveEnd) => {
+      logStream.end(resolveEnd);
     });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) {
-        reject(new Error(`Transformers inference exited ${code}: ${stderr.slice(0, 1000)}`));
-        return;
-      }
-      resolvePromise();
-    });
+  }
+  await args.reporter?.onEvent?.({
+    stage: `evaluating_${args.kind}`,
+    status: "running",
+    message: `Finished ${args.kind} Transformers inference.`,
+    details: { output_path: outputPath, log_path: logPath },
   });
   return JSON.parse(await readFile(outputPath, "utf8")) as TransformersInferenceResult;
 }
@@ -223,6 +259,7 @@ export async function evaluateExamples(args: {
   system: string;
   config: LocalRunnerConfig;
   outputPath: string;
+  reporter?: LocalRunReporter;
 }): Promise<EvalReport> {
   const maxExamples = args.config.evaluation.maxExamples ?? args.examples.length;
   const selected = args.examples.slice(0, maxExamples);
@@ -255,6 +292,7 @@ export async function evaluateExamples(args: {
         system: args.system,
         config: args.config,
         outputPath: args.outputPath,
+        reporter: args.reporter,
       })
     : null;
   generationConfig = inferred?.generation_config;
@@ -277,6 +315,14 @@ export async function evaluateExamples(args: {
     if (scoringMode === "llm_judge" && !shouldJudge && args.config.evaluation.scoring.fallback === "fail") {
       const keyName = args.config.llm?.apiKeyEnv ?? "OPENROUTER_API_KEY";
       throw new Error(`evaluation.scoring.mode=llm_judge requires ${keyName} or scoring.fallback=exact_match`);
+    }
+    if (shouldJudge && index === 0) {
+      await args.reporter?.onEvent?.({
+        stage: `evaluating_${args.kind}`,
+        status: "running",
+        message: `Scoring ${args.kind} outputs with OpenRouter judge.`,
+        details: { model: args.config.llm?.model, examples: selected.length },
+      });
     }
     const judged = shouldJudge
       ? await judgeWithOpenRouter({
@@ -342,6 +388,7 @@ export async function evaluateExamples(args: {
     inference_provider: inferenceProvider,
     scoring_mode: scoringMode,
     generation_config: generationConfig,
+    log_uri: inferenceProvider === "transformers" ? fileUri(`${args.outputPath}.inference.log`) : undefined,
   };
   await writeJson(args.outputPath, report);
   return report;

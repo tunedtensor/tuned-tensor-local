@@ -6,6 +6,7 @@ import type { FineTuneRunRequest, LocalRunnerConfig, TrainingReport } from "./co
 import type { RunArtifacts } from "./artifacts.js";
 import { copyDatasetToTrainingChannel, fileUri, writeJson } from "./artifacts.js";
 import { resolveTrainingModel } from "./model-registry.js";
+import { forwardStreamLines, type LocalRunReporter } from "./run-reporter.js";
 
 export function buildTrainingHyperparameters(request: FineTuneRunRequest): Record<string, string> {
   const model = resolveTrainingModel(request.spec_snapshot.base_model);
@@ -62,6 +63,7 @@ export async function launchProcessTraining(args: {
   request: FineTuneRunRequest;
   artifacts: RunArtifacts;
   config: LocalRunnerConfig;
+  reporter?: LocalRunReporter;
 }): Promise<TrainingReport> {
   const { request, artifacts, config } = args;
   const jobName = `tt-local-${request.run_id}`;
@@ -89,6 +91,7 @@ export async function launchProcessTraining(args: {
   }
 
   const uvArgs = buildUvArgs(config.training);
+  const command = ["uv", ...uvArgs];
   const logStream = createWriteStream(artifacts.trainingLog, { flags: "w" });
   const childEnv: NodeJS.ProcessEnv = {
     ...process.env,
@@ -107,19 +110,42 @@ export async function launchProcessTraining(args: {
 
   if (config.paths.modelCache) await mkdir(config.paths.modelCache, { recursive: true });
 
-  const exitCode = await new Promise<number>((resolvePromise, reject) => {
-    const child = spawn("uv", uvArgs, {
-      cwd: config.training.cwd ? resolve(config.training.cwd) : process.cwd(),
-      stdio: ["ignore", "pipe", "pipe"],
-      env: childEnv,
-    });
-    child.stdout.pipe(logStream, { end: false });
-    child.stderr.pipe(logStream, { end: false });
-    child.on("error", reject);
-    child.on("close", (code) => resolvePromise(code ?? 1));
-  }).finally(() => {
-    logStream.end();
+  await args.reporter?.onEvent?.({
+    stage: "training",
+    status: "running",
+    message: "Starting uv training process.",
+    details: {
+      command,
+      log_path: artifacts.trainingLog,
+      model_dir: artifacts.trainingModelDir,
+      output_dir: artifacts.trainingOutputDir,
+    },
   });
+
+  let exitCode = 1;
+  try {
+    exitCode = await new Promise<number>((resolvePromise, reject) => {
+      const child = spawn("uv", uvArgs, {
+        cwd: config.training.cwd ? resolve(config.training.cwd) : process.cwd(),
+        stdio: ["ignore", "pipe", "pipe"],
+        env: childEnv,
+      });
+      child.stdout.pipe(logStream, { end: false });
+      child.stderr.pipe(logStream, { end: false });
+      forwardStreamLines(child.stdout, (line) => {
+        if (args.reporter?.verbose) void args.reporter.onLog?.({ stage: "training", stream: "stdout", message: line });
+      });
+      forwardStreamLines(child.stderr, (line) => {
+        if (args.reporter?.verbose) void args.reporter.onLog?.({ stage: "training", stream: "stderr", message: line });
+      });
+      child.on("error", reject);
+      child.on("close", (code) => resolvePromise(code ?? 1));
+    });
+  } finally {
+    await new Promise<void>((resolveEnd) => {
+      logStream.end(resolveEnd);
+    });
+  }
 
   const metricsPath = join(artifacts.trainingModelDir, "training-metrics.json");
   const metrics = await pathExists(metricsPath)
@@ -138,6 +164,18 @@ export async function launchProcessTraining(args: {
     await copyFile(modelTarPath, join(artifacts.runDir, "model.tar.gz")).catch(() => undefined);
   }
 
+  await args.reporter?.onEvent?.({
+    stage: "training",
+    status: "running",
+    message: "uv training process completed.",
+    details: {
+      exit_code: exitCode,
+      model_artifact_uri: modelUri,
+      log_path: artifacts.trainingLog,
+      metrics,
+    },
+  });
+
   return {
     provider: "local-uv",
     training_job_name: jobName,
@@ -146,6 +184,6 @@ export async function launchProcessTraining(args: {
     metrics,
     exit_code: exitCode,
     log_uri: fileUri(artifacts.trainingLog),
-    command: ["uv", ...uvArgs],
+    command,
   };
 }

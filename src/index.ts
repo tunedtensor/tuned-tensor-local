@@ -18,12 +18,14 @@ import {
   loadLocalRunInput,
   runRequestFromLocalSpec,
 } from "./local-project.js";
+import { sanitizeLogLine, type LocalRunProgressEvent, type LocalRunReporter } from "./run-reporter.js";
 
 export * from "./contracts.js";
 export * from "./dataset.js";
 export * from "./orchestrator.js";
 export * from "./local-project.js";
 export * from "./openrouter.js";
+export * from "./run-reporter.js";
 export * from "./server.js";
 export * from "./store.js";
 
@@ -59,7 +61,7 @@ Commands:
   init [--name "My Local Model"] [--model Qwen/Qwen3.5-2B] [--output tunedtensor.json] [--force]
   doctor [--config local-runner.json]
   validate [tunedtensor.json|request.json] [--config local-runner.json]
-  run [tunedtensor.json|request.json] [--config local-runner.json] [--dry-run]
+  run [tunedtensor.json|request.json] [--config local-runner.json] [--dry-run] [--verbose] [--quiet]
   serve [--config local-runner.json] [--host 127.0.0.1] [--port 8787]
   runs list|get|events|watch|report|cancel|reconcile [args] [--config local-runner.json]
   models list|get [args] [--config local-runner.json]
@@ -110,6 +112,43 @@ async function configFromArgv(argv: string[]): Promise<LocalRunnerConfig> {
 
 function printJson(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
+}
+
+function shortValue(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  if (Array.isArray(value)) return `[${value.length} items]`;
+  return null;
+}
+
+function formatEvent(event: LocalRunProgressEvent): string {
+  const detailText = Object.entries(event.details ?? {})
+    .filter(([key]) => key !== "metrics")
+    .map(([key, value]) => {
+      const formatted = key === "command" && Array.isArray(value)
+        ? value.join(" ")
+        : shortValue(value);
+      return formatted ? `${key}=${formatted}` : null;
+    })
+    .filter((value): value is string => Boolean(value))
+    .slice(0, 5)
+    .join(" ");
+  return sanitizeLogLine(`[tt-local] ${event.stage}: ${event.message}${detailText ? ` (${detailText})` : ""}`);
+}
+
+function createConsoleReporter(options: { verbose: boolean; quiet: boolean }): LocalRunReporter | undefined {
+  if (options.quiet) return undefined;
+  return {
+    verbose: options.verbose,
+    onEvent(event) {
+      process.stderr.write(`${formatEvent(event)}\n`);
+    },
+    onLog(log) {
+      process.stderr.write(sanitizeLogLine(`[tt-local] ${log.stage}${log.stream ? ` ${log.stream}` : ""}: ${log.message}`) + "\n");
+    },
+  };
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -192,7 +231,14 @@ async function main(argv: string[]): Promise<void> {
       runNumber: readNumberOption(argv, "--run-number"),
     });
     const request = input.request;
-    const result = await runLocalFineTune({ request, config });
+    const result = await runLocalFineTune({
+      request,
+      config,
+      reporter: createConsoleReporter({
+        verbose: hasFlag(argv, "--verbose"),
+        quiet: hasFlag(argv, "--quiet"),
+      }),
+    });
     printJson({
       status: result.report.status,
       input_kind: input.kind,
@@ -200,7 +246,12 @@ async function main(argv: string[]): Promise<void> {
       behavior_spec_id: result.report.behavior_spec_id,
       report_path: result.reportPath,
       artifact_dir: result.artifactDir,
-      avg_score_delta: result.report.comparison.avg_score_delta,
+      model_id: `local-${result.report.run_id}`,
+      fine_tuned_model_id: result.report.fine_tuned_model_id,
+      training_log: result.report.training.log_uri,
+      baseline_eval: result.report.artifact_uris.baseline_eval,
+      candidate_eval: result.report.artifact_uris.candidate_eval,
+      comparison: result.report.comparison,
     });
     return;
   }

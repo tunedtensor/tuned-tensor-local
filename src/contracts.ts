@@ -118,6 +118,7 @@ export const evalReportSchema = z.object({
   inference_provider: z.enum(["none", "command", "transformers"]).optional(),
   scoring_mode: z.enum(["exact_match", "llm_judge"]).optional(),
   generation_config: z.record(z.string(), z.unknown()).optional(),
+  log_uri: z.string().optional(),
 });
 
 export const comparisonReportSchema = z.object({

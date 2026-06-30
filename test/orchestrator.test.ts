@@ -39,8 +39,17 @@ test("runs a dry local workflow and writes compatible artifacts", async () => {
       dryRun: true,
       evaluation: { mode: "heuristic" },
     });
+    const events: Array<{ stage: string; message: string }> = [];
 
-    const result = await runLocalFineTune({ request, config });
+    const result = await runLocalFineTune({
+      request,
+      config,
+      reporter: {
+        onEvent(event) {
+          events.push({ stage: event.stage, message: event.message });
+        },
+      },
+    });
     assert.equal(result.report.status, "completed");
     assert.equal(result.report.training.provider, "local-uv");
     assert.equal(result.report.baseline.total, 2);
@@ -50,6 +59,14 @@ test("runs a dry local workflow and writes compatible artifacts", async () => {
     assert.match(reportText, /local-uv/);
     const datasetText = await readFile(result.report.artifact_uris.dataset.replace(/^file:\/\//, ""), "utf8");
     assert.match(datasetText, /Classify: good/);
+    assert.deepEqual(events.map((event) => event.stage), [
+      "queued",
+      "preparing",
+      "evaluating_baseline",
+      "training",
+      "evaluating_candidate",
+      "completed",
+    ]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

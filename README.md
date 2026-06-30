@@ -179,6 +179,10 @@ Run the job:
 tt-local run --config spark-runner.json
 ```
 
+`tt-local run` prints live stage updates to stderr and writes the final JSON
+summary to stdout. Use `--verbose` to stream Python subprocess output, or
+`--quiet` for script-only JSON output.
+
 Watch progress:
 
 ```bash
@@ -201,12 +205,21 @@ The runner writes two local roots:
 If `storeRoot` is omitted, `tt-local` uses `TT_LOCAL_HOME` or
 `~/.tuned-tensor-local`.
 
+Per-run artifacts include:
+
+- `progress.jsonl`: stage changes for the run.
+- `baseline-eval.json.inference.log` and `candidate-eval.json.inference.log`:
+  local inference subprocess output.
+- `training/training.log`: uv fine-tuning output.
+- `run-report.json`: baseline, candidate, comparison, and artifact references.
+
 ## Useful Commands
 
 ```bash
 tt-local init --name "Support Bot" --model Qwen/Qwen3.5-2B
 tt-local validate --config spark-runner.json
 tt-local run --config spark-runner.json
+tt-local run --config spark-runner.json --verbose
 tt-local runs list --config spark-runner.json
 tt-local runs get <run-id> --config spark-runner.json
 tt-local runs events <run-id> --config spark-runner.json
