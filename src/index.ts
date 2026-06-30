@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
+import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { fineTuneRunRequestSchema, localBehaviorSpecFileSchema, localRunnerConfigSchema, specSnapshotSchema, type LocalRunnerConfig } from "./contracts.js";
 import {
   loadLocalRunnerConfig,
@@ -327,7 +329,12 @@ async function main(argv: string[]): Promise<void> {
   process.exitCode = 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+function isCliEntrypoint(): boolean {
+  if (!process.argv[1]) return false;
+  return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+}
+
+if (isCliEntrypoint()) {
   main(process.argv).catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
