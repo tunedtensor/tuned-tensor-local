@@ -67,6 +67,12 @@ The runner sets:
 - `SM_CHANNEL_BASE_MODEL` when a local base-model artifact path is configured;
 - `HF_HOME` when `paths.modelCache` is configured.
 
+Real runs also use the Transformers/PEFT evaluator by default. Baseline
+evaluation loads the original Hugging Face model, and candidate evaluation loads
+that same base model plus the fine-tuned artifact from the run directory. Set
+`paths.modelCache` to a persistent Spark-local cache so training and evaluation
+reuse downloads.
+
 The included first-pass SFT script can be run by the local runner through uv:
 
 ```bash

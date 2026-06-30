@@ -84,6 +84,7 @@ export async function runLocalFineTune(input: {
     }
 
     const system = buildSystemMessage(request.spec_snapshot);
+    const baseModelForEvaluation = config.paths.baseModel ?? request.spec_snapshot.base_model;
     await store.updateRun({
       runId: request.run_id,
       status: "evaluating_baseline",
@@ -93,7 +94,8 @@ export async function runLocalFineTune(input: {
     });
     const baseline = await evaluateExamples({
       kind: "baseline",
-      modelId: request.spec_snapshot.base_model,
+      modelId: baseModelForEvaluation,
+      baseModelId: baseModelForEvaluation,
       examples,
       system,
       config,
@@ -119,6 +121,8 @@ export async function runLocalFineTune(input: {
     const candidate = await evaluateExamples({
       kind: "candidate",
       modelId: training.model_artifact_uri ?? training.training_job_name,
+      baseModelId: baseModelForEvaluation,
+      adapterPath: training.model_artifact_uri,
       examples,
       system,
       config,

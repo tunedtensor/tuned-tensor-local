@@ -17,9 +17,9 @@ packaged as a standalone CLI.
   records as JSON/JSONL under a configured `storeRoot` for the dashboard and CLI.
 - Training adapter: launches a uv-managed Python process with local input,
   model cache, and output directories passed through environment variables.
-- Serving and evaluation adapter: starts local model servers or direct inference
-  processes for baseline and candidate evaluation. Evaluation can also use an
-  OpenRouter LLM judge when configured.
+- Evaluation adapter: runs local Hugging Face/PEFT inference for baseline and
+  candidate evaluation. Evaluation can also use an OpenRouter LLM judge to score
+  locally generated outputs.
 - Report writer: emits structured JSON reports that are portable across local
   and hosted environments.
 - Dashboard/API server: serves local run/model/spec metadata from the local
@@ -47,7 +47,7 @@ The first runnable milestone should support:
 - standalone `tt-local init`, `validate`, `run`, `serve`, and inspection
   commands;
 - uv-based training;
-- heuristic, command, and optional OpenRouter judge evaluation;
+- native Transformers/PEFT evaluation with optional OpenRouter judge scoring;
 - local dashboard and CLI inspection commands;
 - a tiny smoke-run fixture that finishes quickly.
 
@@ -58,6 +58,19 @@ configuration. The run request describes the behavior spec, base model,
 examples, and hyperparameters. The local runner configuration describes artifact
 paths, store paths, uv entrypoint settings, model cache paths, OpenRouter judge
 settings, and timeout limits.
+
+## Evaluation Loop
+
+The local loop intentionally compares like-for-like model artifacts:
+
+- baseline loads the original Hugging Face base model from the behavior spec;
+- training writes a Hugging Face/PEFT artifact under the run directory;
+- candidate evaluation loads the same base model plus that fine-tuned artifact;
+- the report compares the two eval reports and stores generated outputs.
+
+The first native backend is `transformers`. `llama.cpp`/GGUF conversion is not
+part of the default path because conversion would make the baseline/candidate
+comparison less direct.
 
 ## Local State Layout
 

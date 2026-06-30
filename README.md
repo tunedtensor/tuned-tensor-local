@@ -29,9 +29,9 @@ Python GPU execution.
 
 1. Read a behavior spec and run configuration.
 2. Compile examples into training and evaluation datasets.
-3. Run a baseline evaluation.
+3. Run a baseline evaluation against the original Hugging Face model.
 4. Launch local GPU fine-tuning through uv.
-5. Run candidate evaluation against the tuned artifact.
+5. Run candidate evaluation against the fine-tuned Hugging Face/PEFT artifact.
 6. Write a structured report under the local artifact root.
 
 ## Current Status
@@ -127,10 +127,40 @@ records, progress events, and copied reports in a portable local directory:
 If `storeRoot` is omitted, the runner uses `TT_LOCAL_HOME` or
 `~/.tuned-tensor-local`.
 
+## Native Evaluation
+
+For real non-dry runs, `tt-local` can evaluate with the same model family and
+artifact format used for training. The baseline loads the original Hugging Face
+model. The candidate loads that same base model plus the fine-tuned PEFT/HF
+artifact produced by training. This avoids GGUF conversion and keeps the
+comparison fair.
+
+```json
+{
+  "evaluation": {
+    "inference": {
+      "provider": "transformers",
+      "project": "training/sft-local",
+      "script": "training/sft-local/src/evaluate.py",
+      "maxNewTokens": 256,
+      "temperature": 0,
+      "topP": 1
+    },
+    "scoring": {
+      "mode": "llm_judge",
+      "fallback": "exact_match"
+    },
+    "maxExamples": 10
+  }
+}
+```
+
+`dryRun: true` skips model loading and keeps evaluation cheap.
+
 ## OpenRouter Judge
 
-The local runner can use OpenRouter for LLM-as-judge evaluation while keeping
-training and artifacts local:
+The local runner can use OpenRouter for LLM-as-judge scoring while keeping
+inference, training, and artifacts local:
 
 ```json
 {
@@ -140,12 +170,15 @@ training and artifacts local:
   },
   "llm": {
     "provider": "openrouter",
-    "model": "openai/gpt-5.2",
+    "model": "openai/gpt-5.5",
     "apiKeyEnv": "OPENROUTER_API_KEY",
     "appName": "Tuned Tensor Local"
   }
 }
 ```
+
+OpenRouter scores generated local outputs. It does not generate the baseline or
+candidate responses.
 
 For command-backed evaluation, set `evaluation.mode` to `command` and provide
 `baselineCommand` and/or `candidateCommand`. The command receives JSON on stdin
@@ -164,6 +197,17 @@ Set `dryRun` to `false` and point `training.script` at the SFT script:
     "backend": "uv",
     "project": "training/sft-local",
     "script": "training/sft-local/src/train.py"
+  },
+  "evaluation": {
+    "inference": {
+      "provider": "transformers",
+      "project": "training/sft-local",
+      "script": "training/sft-local/src/evaluate.py"
+    },
+    "scoring": {
+      "mode": "llm_judge",
+      "fallback": "exact_match"
+    }
   },
   "paths": {
     "modelCache": "/home/eve/.cache/huggingface"
