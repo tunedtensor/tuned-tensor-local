@@ -1,0 +1,31 @@
+{
+  "name": "tuned-tensor-local",
+  "version": "0.1.0",
+  "description": "Local, cloud-independent fine-tuning runner for Tuned Tensor behavior specs.",
+  "license": "Apache-2.0",
+  "private": false,
+  "type": "module",
+  "bin": {
+    "tt-local": "./dist/index.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "typescript": "^6.0.0"
+  }
+}
