@@ -6,6 +6,7 @@ All notable changes to Tuned Tensor Local will be documented in this file.
 
 ### Added
 
+- Initial npm package under `@tuned-tensor/local`.
 - Native Transformers/PEFT evaluation for local runs.
 - Baseline vs fine-tuned comparison using the original Hugging Face base model and the trained HF/PEFT artifact.
 - OpenRouter LLM-judge scoring for locally generated outputs.

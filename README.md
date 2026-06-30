@@ -38,7 +38,7 @@ npm link
 After the package is published, you can install the CLI globally:
 
 ```bash
-npm install -g tuned-tensor-local
+npm install -g @tuned-tensor/local
 ```
 
 Check the CLI:

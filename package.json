@@ -1,5 +1,5 @@
 {
-  "name": "tuned-tensor-local",
+  "name": "@tuned-tensor/local",
   "version": "0.1.0",
   "description": "Local, cloud-independent fine-tuning runner for Tuned Tensor behavior specs.",
   "license": "Apache-2.0",
