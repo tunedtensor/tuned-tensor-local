@@ -2,7 +2,7 @@
 
 All notable changes to Tuned Tensor Local will be documented in this file.
 
-## 0.1.2 - 2026-06-30
+## 0.1.1 - 2026-06-30
 
 ### Added
 
@@ -13,15 +13,10 @@ All notable changes to Tuned Tensor Local will be documented in this file.
 
 ### Fixed
 
+- Fixed the published/global CLI binary entrypoint when invoked through npm symlinks.
 - Sanitized obvious token and API key patterns from streamed subprocess logs.
 - Ignored generated `.tt-local/` state in git.
 - Updated GitHub Actions pins and disabled uv action caching to avoid Node runtime and cache warnings.
-
-## 0.1.1 - 2026-06-30
-
-### Fixed
-
-- Fixed the published/global CLI binary entrypoint when invoked through npm symlinks.
 
 ## 0.1.0 - 2026-06-30
 
