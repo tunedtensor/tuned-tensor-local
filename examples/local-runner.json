@@ -1,0 +1,13 @@
+{
+  "artifactRoot": ".tt-local/artifacts",
+  "dryRun": true,
+  "training": {
+    "backend": "uv",
+    "project": "training/sft-local",
+    "script": "training/sft-local/src/train.py"
+  },
+  "evaluation": {
+    "mode": "heuristic",
+    "maxExamples": 2
+  }
+}

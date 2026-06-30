@@ -10,3 +10,6 @@ coverage/
 artifacts/
 models/
 .cache/
+.venv/
+__pycache__/
+*.py[cod]
