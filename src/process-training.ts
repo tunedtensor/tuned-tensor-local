@@ -1,0 +1,151 @@
+import { spawn } from "node:child_process";
+import { createWriteStream } from "node:fs";
+import { access, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import type { FineTuneRunRequest, LocalRunnerConfig, TrainingReport } from "./contracts.js";
+import type { RunArtifacts } from "./artifacts.js";
+import { copyDatasetToTrainingChannel, fileUri, writeJson } from "./artifacts.js";
+import { resolveTrainingModel } from "./model-registry.js";
+
+export function buildTrainingHyperparameters(request: FineTuneRunRequest): Record<string, string> {
+  const model = resolveTrainingModel(request.spec_snapshot.base_model);
+  const hyper = request.hyperparameters;
+  return {
+    run_id: request.run_id,
+    base_model: model.id,
+    model_family: model.family,
+    model_loader: model.loader,
+    n_epochs: String(hyper.n_epochs),
+    learning_rate: String(hyper.learning_rate ?? model.defaultLearningRate),
+    per_device_train_batch_size: String(hyper.batch_size ?? model.defaultPerDeviceBatchSize),
+    gradient_accumulation_steps: String(
+      hyper.gradient_accumulation_steps ?? model.defaultGradientAccumulationSteps,
+    ),
+    lora_rank: String(hyper.lora_rank ?? model.defaultLoraRank),
+    lora_alpha: String(hyper.lora_alpha ?? model.defaultLoraAlpha),
+    lora_dropout: String(hyper.lora_dropout ?? model.defaultLoraDropout),
+    max_seq_length: String(hyper.max_seq_length ?? model.defaultMaxSeqLength),
+    save_adapter_only: String(hyper.save_adapter_only),
+    requires_hf_token: String(model.requiresHfToken),
+    trust_remote_code: String(model.trustRemoteCode),
+  };
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function buildUvArgs(training: LocalRunnerConfig["training"]): string[] {
+  const args: string[] = ["run"];
+  if (training.project) args.push("--project", training.project);
+  if (training.with?.length) {
+    for (const dependency of training.with) args.push("--with", dependency);
+  }
+  args.push("python");
+  if (training.module) {
+    args.push("-m", training.module);
+  } else if (training.script) {
+    args.push(training.script);
+  } else {
+    args.push("training/sft-local/src/train.py");
+  }
+  args.push(...training.args);
+  return args;
+}
+
+export async function launchProcessTraining(args: {
+  request: FineTuneRunRequest;
+  artifacts: RunArtifacts;
+  config: LocalRunnerConfig;
+}): Promise<TrainingReport> {
+  const { request, artifacts, config } = args;
+  const jobName = `tt-local-${request.run_id}`;
+  await mkdir(artifacts.trainingDir, { recursive: true });
+  await copyDatasetToTrainingChannel(artifacts);
+  const hyperparameters = buildTrainingHyperparameters(request);
+  await writeJson(join(artifacts.trainingConfigDir, "hyperparameters.json"), hyperparameters);
+
+  if (config.dryRun) {
+    await writeFile(
+      artifacts.trainingLog,
+      "Dry run enabled. uv training process was not launched.\n",
+      "utf8",
+    );
+    return {
+      provider: "local-uv",
+      training_job_name: jobName,
+      model_artifact_uri: fileUri(artifacts.trainingModelDir),
+      base_model_artifact_uri: config.paths.baseModel ? fileUri(config.paths.baseModel) : undefined,
+      metrics: { dry_run: true },
+      exit_code: 0,
+      log_uri: fileUri(artifacts.trainingLog),
+      command: ["uv", ...buildUvArgs(config.training)],
+    };
+  }
+
+  const uvArgs = buildUvArgs(config.training);
+  const logStream = createWriteStream(artifacts.trainingLog, { flags: "w" });
+  const childEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...config.training.env,
+    BACKEND: "local",
+    SM_CHANNEL_TRAINING: resolve(artifacts.trainingInputDir),
+    SM_CHANNEL_BASE_MODEL: config.paths.baseModel ? resolve(config.paths.baseModel) : undefined,
+    SM_MODEL_DIR: resolve(artifacts.trainingModelDir),
+    SM_OUTPUT_DIR: resolve(artifacts.trainingOutputDir),
+    TT_HYPERPARAMETERS_PATH: resolve(artifacts.trainingConfigDir, "hyperparameters.json"),
+    HF_HOME: config.paths.modelCache ? resolve(config.paths.modelCache) : process.env.HF_HOME,
+  };
+  for (const [key, value] of Object.entries(childEnv)) {
+    if (value === undefined) delete childEnv[key];
+  }
+
+  if (config.paths.modelCache) await mkdir(config.paths.modelCache, { recursive: true });
+
+  const exitCode = await new Promise<number>((resolvePromise, reject) => {
+    const child = spawn("uv", uvArgs, {
+      cwd: config.training.cwd ? resolve(config.training.cwd) : process.cwd(),
+      stdio: ["ignore", "pipe", "pipe"],
+      env: childEnv,
+    });
+    child.stdout.pipe(logStream, { end: false });
+    child.stderr.pipe(logStream, { end: false });
+    child.on("error", reject);
+    child.on("close", (code) => resolvePromise(code ?? 1));
+  }).finally(() => {
+    logStream.end();
+  });
+
+  const metricsPath = join(artifacts.trainingModelDir, "training-metrics.json");
+  const metrics = await pathExists(metricsPath)
+    ? JSON.parse(await readFile(metricsPath, "utf8")) as Record<string, unknown>
+    : null;
+
+  if (exitCode !== 0) {
+    throw new Error(`uv training exited with code ${exitCode}. See ${artifacts.trainingLog}.`);
+  }
+
+  const modelTarPath = join(artifacts.trainingOutputDir, "model.tar.gz");
+  const modelUri = await pathExists(modelTarPath)
+    ? fileUri(modelTarPath)
+    : fileUri(artifacts.trainingModelDir);
+  if (await pathExists(modelTarPath)) {
+    await copyFile(modelTarPath, join(artifacts.runDir, "model.tar.gz")).catch(() => undefined);
+  }
+
+  return {
+    provider: "local-uv",
+    training_job_name: jobName,
+    model_artifact_uri: modelUri,
+    base_model_artifact_uri: config.paths.baseModel ? fileUri(config.paths.baseModel) : undefined,
+    metrics,
+    exit_code: exitCode,
+    log_uri: fileUri(artifacts.trainingLog),
+    command: ["uv", ...uvArgs],
+  };
+}
