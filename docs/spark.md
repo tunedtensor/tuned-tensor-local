@@ -27,7 +27,7 @@ Then run the project doctor command:
 
 ```bash
 npm run build
-node dist/index.js doctor --config examples/local-runner.json
+tt-local doctor --config examples/local-runner.json
 ```
 
 ## Dry Run
@@ -36,7 +36,7 @@ The example config uses `dryRun: true`, so it validates orchestration, dataset
 compilation, artifact writing, and report generation without launching training:
 
 ```bash
-node dist/index.js run examples/smoke-run-request.json --config examples/local-runner.json
+tt-local run examples/smoke-run-request.json --config examples/local-runner.json
 ```
 
 ## Real Training
@@ -70,7 +70,7 @@ The runner sets:
 The included first-pass SFT script can be run by the local runner through uv:
 
 ```bash
-node dist/index.js run examples/smoke-run-request.json --config examples/local-runner.json
+tt-local run examples/smoke-run-request.json --config examples/local-runner.json
 ```
 
 The SFT uv project currently points Linux installs at the PyTorch CUDA 13.0

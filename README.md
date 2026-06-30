@@ -63,11 +63,11 @@ npm test
 
 ```bash
 npm run build
-node dist/index.js init --name "Local Assistant" --output /tmp/tunedtensor.json --force
-node dist/index.js validate /tmp/tunedtensor.json --config examples/local-runner.json
-node dist/index.js run /tmp/tunedtensor.json --config examples/local-runner.json
-node dist/index.js runs list --config examples/local-runner.json
-node dist/index.js serve --config examples/local-runner.json
+tt-local init --name "Local Assistant" --output /tmp/tunedtensor.json --force
+tt-local validate /tmp/tunedtensor.json --config examples/local-runner.json
+tt-local run /tmp/tunedtensor.json --config examples/local-runner.json
+tt-local runs list --config examples/local-runner.json
+tt-local serve --config examples/local-runner.json
 ```
 
 The example config uses `dryRun: true`, so it verifies the orchestration and
@@ -77,20 +77,20 @@ artifact flow without starting GPU training. It writes artifacts to
 ## Commands
 
 ```bash
-node dist/index.js info
-node dist/index.js init --name "Support Bot" --model Qwen/Qwen3.5-2B
-node dist/index.js doctor --config examples/local-runner.json
-node dist/index.js validate <tunedtensor.json|request.json> --config <local-runner.json>
-node dist/index.js run <tunedtensor.json|request.json> --config <local-runner.json>
-node dist/index.js serve --config <local-runner.json>
-node dist/index.js runs list --config <local-runner.json>
-node dist/index.js runs get <run-id> --config <local-runner.json>
-node dist/index.js runs events <run-id> --config <local-runner.json>
-node dist/index.js runs watch <run-id> --config <local-runner.json>
-node dist/index.js runs report <run-id> --config <local-runner.json>
-node dist/index.js models list --config <local-runner.json>
-node dist/index.js specs list --config <local-runner.json>
-node dist/index.js store rebuild-index --config <local-runner.json>
+tt-local info
+tt-local init --name "Support Bot" --model Qwen/Qwen3.5-2B
+tt-local doctor --config examples/local-runner.json
+tt-local validate <tunedtensor.json|request.json> --config <local-runner.json>
+tt-local run <tunedtensor.json|request.json> --config <local-runner.json>
+tt-local serve --config <local-runner.json>
+tt-local runs list --config <local-runner.json>
+tt-local runs get <run-id> --config <local-runner.json>
+tt-local runs events <run-id> --config <local-runner.json>
+tt-local runs watch <run-id> --config <local-runner.json>
+tt-local runs report <run-id> --config <local-runner.json>
+tt-local models list --config <local-runner.json>
+tt-local specs list --config <local-runner.json>
+tt-local store rebuild-index --config <local-runner.json>
 ```
 
 For Spark-specific notes, see [docs/spark.md](docs/spark.md).
