@@ -228,6 +228,7 @@ npm run build
 - Real evaluation uses `training/sft-local/src/evaluate.py`.
 - The default evaluation path uses Hugging Face/PEFT artifacts directly; it does
   not convert models to GGUF.
+- Release notes are in [CHANGELOG.md](CHANGELOG.md).
 - Spark-specific details live in [docs/spark.md](docs/spark.md).
 
 ## License
