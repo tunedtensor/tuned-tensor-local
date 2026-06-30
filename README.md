@@ -1,5 +1,7 @@
 # Tuned Tensor Local
 
+[![CI](https://github.com/tunedtensor/tuned-tensor-local/actions/workflows/ci.yml/badge.svg)](https://github.com/tunedtensor/tuned-tensor-local/actions/workflows/ci.yml)
+
 Tuned Tensor Local is a standalone CLI for running Tuned Tensor-style fine-tuning
 jobs on a machine you control. It stores specs, datasets, model artifacts,
 progress, reports, and dashboard state on local disk.
@@ -221,6 +223,10 @@ npm run typecheck
 npm test
 npm run build
 ```
+
+CI runs those checks on pull requests and pushes to `main`. Publishing to npm
+runs when a GitHub Release is published and requires an `NPM_TOKEN` repository
+secret.
 
 ## Notes
 
