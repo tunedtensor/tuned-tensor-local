@@ -81,6 +81,15 @@ export const fineTuneRunRequestSchema = z.object({
   }
 });
 
+export const localBehaviorSpecFileSchema = specSnapshotSchema.extend({
+  id: z.string().uuid().optional(),
+  user_id: z.string().min(1).default("local-user"),
+  run_number: z.number().int().min(1).default(1),
+  hyperparameters: fineTuneHyperparametersSchema.optional(),
+  artifacts: localArtifactsSchema.optional(),
+  dataset_prebuilt: datasetPrebuiltSchema.optional(),
+});
+
 export const evalExampleResultSchema = z.object({
   prompt: z.string(),
   expected: z.string(),
@@ -104,7 +113,7 @@ export const evalReportSchema = z.object({
   avg_latency_ms: z.number().int().nonnegative(),
   results: z.array(evalExampleResultSchema),
   artifact_uri: z.string(),
-  scoring_method: z.enum(["heuristic", "command"]),
+  scoring_method: z.enum(["heuristic", "command", "llm_judge"]),
   judge_model_id: z.string().nullable().optional(),
 });
 
@@ -170,6 +179,7 @@ export const runReportSchema = z.object({
 export const commandSchema = z.array(z.string().min(1)).min(1);
 
 export const localRunnerConfigSchema = z.object({
+  storeRoot: z.string().optional(),
   artifactRoot: z.string().default(".tt-local/artifacts"),
   dryRun: z.boolean().default(false),
   training: z.object({
@@ -192,7 +202,7 @@ export const localRunnerConfigSchema = z.object({
     modelCache: z.string().optional(),
   }).default({}),
   evaluation: z.object({
-    mode: z.enum(["heuristic", "command"]).default("heuristic"),
+    mode: z.enum(["heuristic", "command", "llm_judge"]).default("heuristic"),
     baselineCommand: commandSchema.optional(),
     candidateCommand: commandSchema.optional(),
     timeoutMs: z.number().int().min(100).default(120_000),
@@ -201,6 +211,13 @@ export const localRunnerConfigSchema = z.object({
     mode: "heuristic",
     timeoutMs: 120_000,
   }),
+  llm: z.object({
+    provider: z.literal("openrouter").default("openrouter"),
+    model: z.string().min(1).default("openai/gpt-5.2"),
+    apiKeyEnv: z.string().min(1).default("OPENROUTER_API_KEY"),
+    appName: z.string().optional(),
+    siteUrl: z.string().url().optional(),
+  }).optional(),
 });
 
 export type DocumentInputAsset = z.infer<typeof documentInputAssetSchema>;
@@ -208,6 +225,7 @@ export type BehaviorSpecExample = z.infer<typeof behaviorSpecExampleSchema>;
 export type SpecSnapshot = z.infer<typeof specSnapshotSchema>;
 export type FineTuneHyperparameters = z.infer<typeof fineTuneHyperparametersSchema>;
 export type FineTuneRunRequest = z.infer<typeof fineTuneRunRequestSchema>;
+export type LocalBehaviorSpecFile = z.infer<typeof localBehaviorSpecFileSchema>;
 export type EvalExampleResult = z.infer<typeof evalExampleResultSchema>;
 export type EvalReport = z.infer<typeof evalReportSchema>;
 export type ComparisonReport = z.infer<typeof comparisonReportSchema>;

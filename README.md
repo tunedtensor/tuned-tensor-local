@@ -3,9 +3,10 @@
 Tuned Tensor Local is an open-source local runner for fine-tuning small
 open-weight models from behavior specs on a machine you control.
 
-The project is starting as a clean standalone implementation. It is designed to
-run without a required cloud provider, with local disk artifacts, local process
-orchestration, and uv-managed Python GPU execution.
+The project is a standalone command line tool. It is designed to run without a
+required cloud provider or the hosted Tuned Tensor CLI, with local disk
+artifacts, local process orchestration, file-backed tracking, and uv-managed
+Python GPU execution.
 
 ## Goals
 
@@ -14,6 +15,8 @@ orchestration, and uv-managed Python GPU execution.
 - Use uv for lightweight Python dependency and environment management.
 - Produce portable run reports that can be inspected or integrated elsewhere.
 - Keep the public implementation independent from Tuned Tensor's hosted runner.
+- Let users create, validate, run, inspect, and serve local jobs entirely through
+  `tt-local`.
 
 ## Non-Goals For The Initial Version
 
@@ -34,8 +37,10 @@ orchestration, and uv-managed Python GPU execution.
 ## Current Status
 
 This repository now contains a preview local runner. It can validate run
-requests, compile datasets, write local artifacts, run dry workflows, launch a
-configured uv training process, and emit a structured `run-report.json`.
+local specs or compatible run requests, compile datasets, write local artifacts,
+run dry workflows, launch a configured uv training process, persist run state to
+a local file-backed store, serve a small dashboard/API, and emit a structured
+`run-report.json`.
 
 The training process is intentionally a separate contract: configure a uv
 script or module that reads the local training environment variables and writes
@@ -58,23 +63,93 @@ npm test
 
 ```bash
 npm run build
-node dist/index.js validate examples/smoke-run-request.json --config examples/local-runner.json
-node dist/index.js run examples/smoke-run-request.json --config examples/local-runner.json
+tt-local init --name "Local Assistant" --output /tmp/tunedtensor.json --force
+tt-local validate /tmp/tunedtensor.json --config examples/local-runner.json
+tt-local run /tmp/tunedtensor.json --config examples/local-runner.json
+tt-local runs list --config examples/local-runner.json
+tt-local serve --config examples/local-runner.json
 ```
 
 The example config uses `dryRun: true`, so it verifies the orchestration and
-artifact flow without starting GPU training.
+artifact flow without starting GPU training. It writes artifacts to
+`.tt-local/artifacts` and run/model/spec metadata to `.tt-local/store`.
 
 ## Commands
 
 ```bash
-node dist/index.js info
-node dist/index.js doctor --config examples/local-runner.json
-node dist/index.js validate <request.json> --config <local-runner.json>
-node dist/index.js run <request.json> --config <local-runner.json>
+tt-local info
+tt-local init --name "Support Bot" --model Qwen/Qwen3.5-2B
+tt-local doctor --config examples/local-runner.json
+tt-local validate <tunedtensor.json|request.json> --config <local-runner.json>
+tt-local run <tunedtensor.json|request.json> --config <local-runner.json>
+tt-local serve --config <local-runner.json>
+tt-local runs list --config <local-runner.json>
+tt-local runs get <run-id> --config <local-runner.json>
+tt-local runs events <run-id> --config <local-runner.json>
+tt-local runs watch <run-id> --config <local-runner.json>
+tt-local runs report <run-id> --config <local-runner.json>
+tt-local models list --config <local-runner.json>
+tt-local specs list --config <local-runner.json>
+tt-local store rebuild-index --config <local-runner.json>
 ```
 
 For Spark-specific notes, see [docs/spark.md](docs/spark.md).
+
+## Standalone CLI Workflow
+
+Install or link the package, then use `tt-local` directly:
+
+```bash
+npm install -g tuned-tensor-local
+tt-local init --name "Support Bot" --model Qwen/Qwen3.5-2B
+tt-local validate --config examples/local-runner.json
+tt-local run --config examples/local-runner.json
+tt-local serve --config examples/local-runner.json
+```
+
+By default, `init`, `validate`, and `run` use `tunedtensor.json` in the current
+directory. The local spec file is intentionally compatible with the hosted
+behavior spec shape, but this tool does not require hosted auth or the
+centralized `tt` CLI.
+
+## Local Store
+
+Set `storeRoot` in the runner config to keep dashboard state, runs, specs, model
+records, progress events, and copied reports in a portable local directory:
+
+```json
+{
+  "artifactRoot": ".tt-local/artifacts",
+  "storeRoot": ".tt-local/store"
+}
+```
+
+If `storeRoot` is omitted, the runner uses `TT_LOCAL_HOME` or
+`~/.tuned-tensor-local`.
+
+## OpenRouter Judge
+
+The local runner can use OpenRouter for LLM-as-judge evaluation while keeping
+training and artifacts local:
+
+```json
+{
+  "evaluation": {
+    "mode": "llm_judge",
+    "maxExamples": 10
+  },
+  "llm": {
+    "provider": "openrouter",
+    "model": "openai/gpt-5.2",
+    "apiKeyEnv": "OPENROUTER_API_KEY",
+    "appName": "Tuned Tensor Local"
+  }
+}
+```
+
+For command-backed evaluation, set `evaluation.mode` to `command` and provide
+`baselineCommand` and/or `candidateCommand`. The command receives JSON on stdin
+and should print either plain text or JSON with `content`, `output`, or `actual`.
 
 ## Real Training Config
 
@@ -83,6 +158,7 @@ Set `dryRun` to `false` and point `training.script` at the SFT script:
 ```json
 {
   "artifactRoot": "/home/eve/tt-local-artifacts",
+  "storeRoot": "/home/eve/tt-local-store",
   "dryRun": false,
   "training": {
     "backend": "uv",
