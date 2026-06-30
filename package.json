@@ -6,7 +6,8 @@
   "private": false,
   "type": "module",
   "bin": {
-    "tt-local": "./dist/index.js"
+    "tt-local": "./dist/index.js",
+    "tuned-tensor-local": "./dist/index.js"
   },
   "exports": {
     ".": "./dist/index.js"

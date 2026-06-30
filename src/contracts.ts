@@ -81,6 +81,15 @@ export const fineTuneRunRequestSchema = z.object({
   }
 });
 
+export const localBehaviorSpecFileSchema = specSnapshotSchema.extend({
+  id: z.string().uuid().optional(),
+  user_id: z.string().min(1).default("local-user"),
+  run_number: z.number().int().min(1).default(1),
+  hyperparameters: fineTuneHyperparametersSchema.optional(),
+  artifacts: localArtifactsSchema.optional(),
+  dataset_prebuilt: datasetPrebuiltSchema.optional(),
+});
+
 export const evalExampleResultSchema = z.object({
   prompt: z.string(),
   expected: z.string(),
@@ -216,6 +225,7 @@ export type BehaviorSpecExample = z.infer<typeof behaviorSpecExampleSchema>;
 export type SpecSnapshot = z.infer<typeof specSnapshotSchema>;
 export type FineTuneHyperparameters = z.infer<typeof fineTuneHyperparametersSchema>;
 export type FineTuneRunRequest = z.infer<typeof fineTuneRunRequestSchema>;
+export type LocalBehaviorSpecFile = z.infer<typeof localBehaviorSpecFileSchema>;
 export type EvalExampleResult = z.infer<typeof evalExampleResultSchema>;
 export type EvalReport = z.infer<typeof evalReportSchema>;
 export type ComparisonReport = z.infer<typeof comparisonReportSchema>;

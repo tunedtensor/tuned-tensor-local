@@ -2,19 +2,25 @@
 
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { fineTuneRunRequestSchema, localRunnerConfigSchema, specSnapshotSchema, type LocalRunnerConfig } from "./contracts.js";
+import { fineTuneRunRequestSchema, localBehaviorSpecFileSchema, localRunnerConfigSchema, specSnapshotSchema, type LocalRunnerConfig } from "./contracts.js";
 import {
   loadLocalRunnerConfig,
-  loadRunRequest,
   runLocalFineTune,
 } from "./orchestrator.js";
 import { runDoctor } from "./doctor.js";
 import { createLocalStore } from "./store.js";
 import { serveLocalDashboard } from "./server.js";
+import {
+  DEFAULT_LOCAL_SPEC_PATH,
+  initLocalSpecFile,
+  loadLocalRunInput,
+  runRequestFromLocalSpec,
+} from "./local-project.js";
 
 export * from "./contracts.js";
 export * from "./dataset.js";
 export * from "./orchestrator.js";
+export * from "./local-project.js";
 export * from "./openrouter.js";
 export * from "./server.js";
 export * from "./store.js";
@@ -48,9 +54,10 @@ function printHelp(): void {
 
 Commands:
   info
+  init [--name "My Local Model"] [--model Qwen/Qwen3.5-2B] [--output tunedtensor.json] [--force]
   doctor [--config local-runner.json]
-  validate <request.json> [--config local-runner.json]
-  run <request.json> [--config local-runner.json] [--dry-run]
+  validate [tunedtensor.json|request.json] [--config local-runner.json]
+  run [tunedtensor.json|request.json] [--config local-runner.json] [--dry-run]
   serve [--config local-runner.json] [--host 127.0.0.1] [--port 8787]
   runs list|get|events|watch|report|cancel|reconcile [args] [--config local-runner.json]
   models list|get [args] [--config local-runner.json]
@@ -60,6 +67,38 @@ Commands:
 The run command writes local artifacts under config.artifactRoot, defaulting to
 .tt-local/artifacts. The file-backed local store defaults to
 ~/.tuned-tensor-local unless config.storeRoot or TT_LOCAL_HOME is set.`);
+}
+
+const optionNamesWithValues = new Set([
+  "--config",
+  "--host",
+  "--port",
+  "--name",
+  "--model",
+  "--output",
+  "--id",
+  "--user-id",
+  "--run-number",
+]);
+
+function readPositionals(argv: string[], startIndex = 3): string[] {
+  const positionals: string[] = [];
+  for (let index = startIndex; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (!arg) continue;
+    if (optionNamesWithValues.has(arg)) {
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--")) continue;
+    positionals.push(arg);
+  }
+  return positionals;
+}
+
+function readNumberOption(argv: string[], name: string): number | undefined {
+  const value = readOption(argv, name);
+  return value ? Number(value) : undefined;
 }
 
 async function configFromArgv(argv: string[]): Promise<LocalRunnerConfig> {
@@ -99,14 +138,38 @@ async function main(argv: string[]): Promise<void> {
     return;
   }
 
+  if (command === "init") {
+    const outputPath = resolve(readOption(argv, "--output") ?? DEFAULT_LOCAL_SPEC_PATH);
+    const spec = await initLocalSpecFile({
+      outputPath,
+      name: readOption(argv, "--name") ?? "Local Tuned Tensor Spec",
+      baseModel: readOption(argv, "--model") ?? "Qwen/Qwen3.5-2B",
+      force: hasFlag(argv, "--force"),
+    });
+    printJson({
+      ok: true,
+      path: outputPath,
+      id: spec.id,
+      name: spec.name,
+      base_model: spec.base_model,
+    });
+    return;
+  }
+
   if (command === "validate") {
-    const requestPath = argv[3];
-    if (!requestPath) throw new Error("validate requires <request.json>");
-    const request = await loadRunRequest(resolve(requestPath));
+    const inputPath = resolve(readPositionals(argv)[0] ?? DEFAULT_LOCAL_SPEC_PATH);
+    const input = await loadLocalRunInput(inputPath, {
+      userId: readOption(argv, "--user-id"),
+      runNumber: readNumberOption(argv, "--run-number"),
+    });
+    const request = input.request;
     const config = await configFromArgv(argv);
     printJson({
       ok: true,
+      input_kind: input.kind,
+      input_path: input.path,
       run_id: request.run_id,
+      behavior_spec_id: request.behavior_spec_id,
       base_model: request.spec_snapshot.base_model,
       artifact_root: config.artifactRoot,
       store_root: config.storeRoot,
@@ -116,18 +179,23 @@ async function main(argv: string[]): Promise<void> {
   }
 
   if (command === "run") {
-    const requestPath = argv[3];
-    if (!requestPath) throw new Error("run requires <request.json>");
+    const inputPath = resolve(readPositionals(argv)[0] ?? DEFAULT_LOCAL_SPEC_PATH);
     const configInput = await configFromArgv(argv);
     const config = localRunnerConfigSchema.parse({
       ...configInput,
       dryRun: hasFlag(argv, "--dry-run") ? true : configInput.dryRun,
     });
-    const request = await loadRunRequest(resolve(requestPath));
+    const input = await loadLocalRunInput(inputPath, {
+      userId: readOption(argv, "--user-id"),
+      runNumber: readNumberOption(argv, "--run-number"),
+    });
+    const request = input.request;
     const result = await runLocalFineTune({ request, config });
     printJson({
       status: result.report.status,
+      input_kind: input.kind,
       run_id: result.report.run_id,
+      behavior_spec_id: result.report.behavior_spec_id,
       report_path: result.reportPath,
       artifact_dir: result.artifactDir,
       avg_score_delta: result.report.comparison.avg_score_delta,
@@ -229,6 +297,14 @@ async function main(argv: string[]): Promise<void> {
       const input = JSON.parse(await readFile(resolve(path), "utf8")) as unknown;
       const request = fineTuneRunRequestSchema.safeParse(input);
       if (request.success) return printJson(await store.importSpec(request.data.behavior_spec_id, request.data.spec_snapshot));
+      const localSpec = localBehaviorSpecFileSchema.safeParse(input);
+      if (localSpec.success) {
+        const localRequest = runRequestFromLocalSpec(localSpec.data, {
+          userId: readOption(argv, "--user-id"),
+          runNumber: readNumberOption(argv, "--run-number"),
+        });
+        return printJson(await store.importSpec(localRequest.behavior_spec_id, localRequest.spec_snapshot));
+      }
       const id = readOption(argv, "--id");
       if (!id) throw new Error("specs import requires --id when importing a raw spec snapshot");
       return printJson(await store.importSpec(id, specSnapshotSchema.parse(input)));

@@ -1,12 +1,16 @@
 # Architecture
 
 Tuned Tensor Local is organized around a small set of replaceable local
-adapters. The first implementation targets a single Linux GPU host.
+adapters. The first implementation targets a single Linux GPU host and is
+packaged as a standalone CLI.
 
 ## Subsystems
 
 - Local orchestrator: runs the workflow states in-process and records progress
   to local files.
+- Local project spec: `tt-local init` creates a local `tunedtensor.json`, and
+  `tt-local run` converts that spec into the same run request contract used by
+  compatible hosted exports.
 - Artifact store: writes datasets, logs, model outputs, and reports beneath a
   configured local artifact root.
 - Local state store: persists specs, runs, progress events, reports, and model
@@ -27,6 +31,11 @@ This repository should remain a clean open-source implementation. Private
 deployment code, proprietary provider adapters, account projection code, and
 billing integrations stay out of this project.
 
+The hosted Tuned Tensor CLI can keep cloud-specific workflows such as auth,
+accounts, billing, and managed runs. `tt-local` must be useful on its own: local
+spec creation, validation, execution, run tracking, model inspection, and the
+dashboard should not depend on the hosted CLI.
+
 ## First Milestone
 
 The first runnable milestone should support:
@@ -35,6 +44,8 @@ The first runnable milestone should support:
 - one GPU device;
 - local filesystem artifacts;
 - local file-backed run/model/spec tracking;
+- standalone `tt-local init`, `validate`, `run`, `serve`, and inspection
+  commands;
 - uv-based training;
 - heuristic, command, and optional OpenRouter judge evaluation;
 - local dashboard and CLI inspection commands;
