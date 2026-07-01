@@ -2,6 +2,13 @@
 
 All notable changes to Tuned Tensor Local will be documented in this file.
 
+## 0.1.3 - 2026-07-01
+
+### Added
+
+- Added `evaluation.scoring.mode: "json_fields"` for structured JSON output scoring, including per-field accuracy, schema match rate, valid JSON rate, and all-fields match rate.
+- Added parsed training progress events from trainer metric lines and tqdm progress bars so `tt-local runs watch` and run `progress.jsonl` show loss, epoch, step, percentage, and ETA updates during long jobs.
+
 ## 0.1.2 - 2026-07-01
 
 ### Fixed

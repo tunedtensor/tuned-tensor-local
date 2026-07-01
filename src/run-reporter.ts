@@ -31,7 +31,7 @@ export function forwardStreamLines(
   stream.setEncoding("utf8");
   stream.on("data", (chunk: string) => {
     buffered += chunk;
-    const lines = buffered.split(/\r?\n/);
+    const lines = buffered.split(/\r\n|\n|\r/);
     buffered = lines.pop() ?? "";
     for (const line of lines) {
       if (line.trim()) onLine(sanitizeLogLine(line));

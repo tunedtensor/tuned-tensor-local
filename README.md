@@ -167,6 +167,25 @@ Create a Spark config, for example `spark-runner.json`:
 }
 ```
 
+For structured JSON tasks, use field-level scoring instead of whole-output
+exact matching:
+
+```json
+{
+  "evaluation": {
+    "scoring": {
+      "mode": "json_fields",
+      "fields": ["triage", "priority", "should_process"]
+    }
+  }
+}
+```
+
+The evaluation report still includes `exact_match_rate`, but `avg_score`,
+`pass_rate`, and `json_field_metrics` are based on the selected JSON fields.
+If `fields` is omitted, the evaluator scores every key in the expected JSON
+object for each example.
+
 If you want OpenRouter judging, set your key:
 
 ```bash
@@ -182,6 +201,11 @@ tt-local run --config spark-runner.json
 `tt-local run` prints live stage updates to stderr and writes the final JSON
 summary to stdout. Use `--verbose` to stream Python subprocess output, or
 `--quiet` for script-only JSON output.
+
+Training progress from Python metric lines and tqdm progress bars is also
+recorded as run events, so `tt-local runs watch` and per-run `progress.jsonl`
+show epoch, loss, step, percentage, and ETA updates when the trainer emits
+them.
 
 For prebuilt datasets, `dataset_prebuilt.training` is always copied into the
 run artifact as the training set. Evaluation uses `dataset_prebuilt.test` when
@@ -212,7 +236,7 @@ If `storeRoot` is omitted, `tt-local` uses `TT_LOCAL_HOME` or
 
 Per-run artifacts include:
 
-- `progress.jsonl`: stage changes for the run.
+- `progress.jsonl`: stage changes and parsed training progress for the run.
 - `baseline-eval.json.inference.log` and `candidate-eval.json.inference.log`:
   local inference subprocess output.
 - `training/training.log`: uv fine-tuning output.

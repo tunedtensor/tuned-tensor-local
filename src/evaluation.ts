@@ -21,6 +21,127 @@ function scoreActual(expected: string, actual: string): number {
   return normalize(expected) === normalize(actual) ? 1 : 0;
 }
 
+function extractJsonObject(value: string): Record<string, unknown> | null {
+  const trimmed = value.trim();
+  const candidates = [trimmed];
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced?.[1]) candidates.push(fenced[1].trim());
+  const objectLike = trimmed.match(/\{[\s\S]*\}/);
+  if (objectLike?.[0]) candidates.push(objectLike[0]);
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Try the next candidate.
+    }
+  }
+  return null;
+}
+
+function normalizeJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => normalizeJsonValue(item));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, normalizeJsonValue(item)]),
+    );
+  }
+  return value;
+}
+
+function jsonValuesEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(normalizeJsonValue(left)) === JSON.stringify(normalizeJsonValue(right));
+}
+
+interface JsonFieldScore {
+  score: number;
+  passed: boolean;
+  reasoning: string;
+  actualJsonValid: boolean;
+  schemaMatch: boolean;
+  fields: string[];
+  fieldResults: Record<string, boolean>;
+}
+
+function scoreJsonFields(expected: string, actual: string, configuredFields?: string[]): JsonFieldScore {
+  const expectedJson = extractJsonObject(expected);
+  const actualJson = extractJsonObject(actual);
+  if (!expectedJson) {
+    const exactScore = scoreActual(expected, actual);
+    return {
+      score: exactScore,
+      passed: exactScore === 1,
+      reasoning: "Expected output is not a JSON object; fell back to normalized exact match.",
+      actualJsonValid: Boolean(actualJson),
+      schemaMatch: false,
+      fields: [],
+      fieldResults: {},
+    };
+  }
+
+  const fields = configuredFields?.length
+    ? configuredFields
+    : Object.keys(expectedJson).sort();
+  const expectedKeys = Object.keys(expectedJson).sort();
+  const actualKeys = actualJson ? Object.keys(actualJson).sort() : [];
+  const schemaMatch = Boolean(actualJson)
+    && expectedKeys.length === actualKeys.length
+    && expectedKeys.every((key, index) => key === actualKeys[index]);
+  const fieldResults: Record<string, boolean> = {};
+
+  for (const field of fields) {
+    fieldResults[field] = actualJson ? jsonValuesEqual(expectedJson[field], actualJson[field]) : false;
+  }
+
+  const correct = Object.values(fieldResults).filter(Boolean).length;
+  const score = fields.length > 0 ? correct / fields.length : 0;
+  const passed = fields.length > 0 && correct === fields.length;
+  return {
+    score,
+    passed,
+    reasoning: actualJson
+      ? `JSON field score: ${correct}/${fields.length} configured fields matched.`
+      : "Actual output is not a JSON object.",
+    actualJsonValid: Boolean(actualJson),
+    schemaMatch,
+    fields,
+    fieldResults,
+  };
+}
+
+function aggregateJsonFieldMetrics(scores: JsonFieldScore[], total: number) {
+  if (total === 0 || scores.length === 0) return undefined;
+  const fields = [...new Set(scores.flatMap((score) => score.fields))].sort();
+  const field_accuracy: Record<string, { correct: number; total: number; accuracy: number }> = {};
+  for (const field of fields) {
+    const scored = scores.filter((score) => score.fields.includes(field));
+    const correct = scored.filter((score) => score.fieldResults[field]).length;
+    field_accuracy[field] = {
+      correct,
+      total: scored.length,
+      accuracy: scored.length > 0 ? correct / scored.length : 0,
+    };
+  }
+  const validJsonCount = scores.filter((score) => score.actualJsonValid).length;
+  const schemaMatchCount = scores.filter((score) => score.schemaMatch).length;
+  const allFieldsMatchCount = scores.filter((score) => score.passed).length;
+  return {
+    fields,
+    valid_json_count: validJsonCount,
+    valid_json_rate: validJsonCount / total,
+    schema_match_count: schemaMatchCount,
+    schema_match_rate: schemaMatchCount / total,
+    all_fields_match_count: allFieldsMatchCount,
+    all_fields_match_rate: allFieldsMatchCount / total,
+    field_accuracy,
+  };
+}
+
 function fileUriToPath(value?: string): string | undefined {
   if (!value) return undefined;
   return value.startsWith("file://") ? value.slice("file://".length) : value;
@@ -272,13 +393,16 @@ export async function evaluateExamples(args: {
       : args.config.evaluation.mode === "command" && command
         ? "command"
         : args.config.evaluation.inference.provider;
-  const scoringMode: "exact_match" | "llm_judge" =
-    args.config.dryRun || inferenceProvider === "none" || inferenceProvider === "command"
+  const configuredScoringMode: "exact_match" | "llm_judge" | "json_fields" =
+    args.config.evaluation.mode === "llm_judge"
+      ? "llm_judge"
+      : args.config.evaluation.scoring.mode;
+  const scoringMode: "exact_match" | "llm_judge" | "json_fields" =
+    (args.config.dryRun || inferenceProvider === "none") && configuredScoringMode === "llm_judge"
       ? "exact_match"
-      : args.config.evaluation.mode === "llm_judge"
-        ? "llm_judge"
-        : args.config.evaluation.scoring.mode;
+      : configuredScoringMode;
   const results: EvalExampleResult[] = [];
+  const jsonFieldScores: JsonFieldScore[] = [];
   let judgeModelId: string | null = null;
   let generationConfig: Record<string, unknown> | undefined;
 
@@ -334,14 +458,18 @@ export async function evaluateExamples(args: {
       : null;
     if (judged?.model) judgeModelId = judged.model;
     const latencyMs = inferredResult?.latency_ms ?? Math.max(0, Math.round(performance.now() - started));
-    const score = judged?.score ?? exactScore;
+    const jsonFieldScore = scoringMode === "json_fields"
+      ? scoreJsonFields(example.output, actual, args.config.evaluation.scoring.fields)
+      : null;
+    if (jsonFieldScore) jsonFieldScores.push(jsonFieldScore);
+    const score = judged?.score ?? jsonFieldScore?.score ?? exactScore;
     results.push({
       prompt: example.input,
       expected: example.output,
       actual,
-      passed: judged?.passed ?? score === 1,
+      passed: judged?.passed ?? jsonFieldScore?.passed ?? score === 1,
       score,
-      reasoning: judged?.reasoning ?? (inferenceProvider === "none"
+      reasoning: judged?.reasoning ?? jsonFieldScore?.reasoning ?? (inferenceProvider === "none"
         ? "No inference command configured; recorded an empty local response."
         : scoringMode === "llm_judge"
           ? "OpenRouter judge unavailable; fell back to normalized exact match."
@@ -365,6 +493,8 @@ export async function evaluateExamples(args: {
     : 0;
   const scoringMethod = judgeModelId
     ? "llm_judge"
+    : scoringMode === "json_fields"
+      ? "json_fields"
     : inferenceProvider === "command"
       ? "command"
       : inferenceProvider === "none"
@@ -387,6 +517,9 @@ export async function evaluateExamples(args: {
     judge_model_id: judgeModelId,
     inference_provider: inferenceProvider,
     scoring_mode: scoringMode,
+    json_field_metrics: scoringMode === "json_fields"
+      ? aggregateJsonFieldMetrics(jsonFieldScores, total)
+      : undefined,
     generation_config: generationConfig,
     log_uri: inferenceProvider === "transformers" ? fileUri(`${args.outputPath}.inference.log`) : undefined,
   };

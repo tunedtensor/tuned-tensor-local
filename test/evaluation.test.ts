@@ -80,6 +80,65 @@ test("transformers evaluation adapter records generated outputs and exact-match 
   }
 });
 
+test("transformers evaluation can score structured JSON fields", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-json-fields-test-"));
+  try {
+    const script = await writeFakeEvaluator(
+      root,
+      "{\"triage\":\"reply\",\"priority\":\"low\",\"should_process\":true,\"summary\":\"Different words\",\"reason\":\"Different reason\"}",
+    );
+    const config = localRunnerConfigSchema.parse({
+      dryRun: false,
+      evaluation: {
+        inference: {
+          provider: "transformers",
+          script,
+          maxNewTokens: 8,
+          temperature: 0,
+          topP: 1,
+        },
+        scoring: {
+          mode: "json_fields",
+          fields: ["triage", "priority", "should_process"],
+        },
+      },
+    });
+    const report = await evaluateExamples({
+      kind: "candidate",
+      modelId: `file://${join(root, "adapter")}`,
+      baseModelId: "Qwen/Qwen3.5-2B",
+      adapterPath: `file://${join(root, "adapter")}`,
+      examples: [{
+        input: "Classify: urgent reply",
+        output: "{\"triage\":\"reply\",\"priority\":\"normal\",\"should_process\":true,\"summary\":\"Sender asks for a reply.\",\"reason\":\"Direct request.\"}",
+      }],
+      system: "Return labels.",
+      config,
+      outputPath: join(root, "candidate-eval.json"),
+    });
+
+    assert.equal(report.scoring_method, "json_fields");
+    assert.equal(report.scoring_mode, "json_fields");
+    assert.equal(report.results[0]?.score, 2 / 3);
+    assert.equal(report.results[0]?.passed, false);
+    assert.equal(report.exact_match_rate, 0);
+    assert.equal(report.json_field_metrics?.valid_json_rate, 1);
+    assert.equal(report.json_field_metrics?.schema_match_rate, 1);
+    assert.deepEqual(report.json_field_metrics?.field_accuracy.triage, {
+      correct: 1,
+      total: 1,
+      accuracy: 1,
+    });
+    assert.deepEqual(report.json_field_metrics?.field_accuracy.priority, {
+      correct: 0,
+      total: 1,
+      accuracy: 0,
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("transformers evaluation can score generated outputs with OpenRouter judge", async () => {
   const root = await mkdtemp(join(tmpdir(), "tt-local-eval-judge-test-"));
   const originalFetch = globalThis.fetch;
