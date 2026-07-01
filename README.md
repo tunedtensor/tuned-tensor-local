@@ -1,6 +1,7 @@
 # Tuned Tensor Local
 
 [![CI](https://github.com/tunedtensor/tuned-tensor-local/actions/workflows/ci.yml/badge.svg)](https://github.com/tunedtensor/tuned-tensor-local/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/@tuned-tensor/local)](https://www.npmjs.com/package/@tuned-tensor/local)
 
 Tuned Tensor Local is a standalone CLI for running Tuned Tensor-style fine-tuning
 jobs on a machine you control. It stores specs, datasets, model artifacts,
@@ -35,7 +36,8 @@ npm run build
 npm link
 ```
 
-After the package is published, you can install the CLI globally:
+You can install the published [@tuned-tensor/local npm package](https://www.npmjs.com/package/@tuned-tensor/local)
+globally:
 
 ```bash
 npm install -g @tuned-tensor/local
@@ -211,6 +213,32 @@ For prebuilt datasets, `dataset_prebuilt.training` is always copied into the
 run artifact as the training set. Evaluation uses `dataset_prebuilt.test` when
 present, then `dataset_prebuilt.validation`, and otherwise falls back to the
 training file.
+
+Multimodal runs use the same chat JSONL shape with structured user content.
+For `image_text_to_text` models such as `Qwen/Qwen3-VL-2B-Instruct`, image
+parts are loaded by the local SFT trainer and evaluator:
+
+```json
+{
+  "messages": [
+    { "role": "system", "content": "Answer chart questions concisely." },
+    {
+      "role": "user",
+      "content": [
+        { "type": "image", "image": "charts/example.png" },
+        { "type": "text", "text": "What is the blue value?" }
+      ]
+    },
+    { "role": "assistant", "content": "42" }
+  ]
+}
+```
+
+Image values in prebuilt JSONL may be absolute paths, paths relative to the
+JSONL file, `file://` URIs, HTTP(S) URLs, or `data:` URIs. Behavior spec
+examples can also use `input_assets` with `image`, `path`, `uri`, or
+`data_uri`; use absolute paths, `file://` URIs, URLs, or `data:` URIs there so
+the copied run artifact can still resolve the image.
 
 Watch progress:
 

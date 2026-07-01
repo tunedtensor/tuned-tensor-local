@@ -1,24 +1,31 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import tarfile
 import time
-from dataclasses import dataclass
+import urllib.request
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
 import torch
+from datasets import Dataset as HFDataset
 from peft import LoraConfig, get_peft_model
+from PIL import Image
 from torch.utils.data import Dataset
 from transformers import (
     AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
     AutoTokenizer,
     DataCollatorForLanguageModeling,
     Trainer,
     TrainingArguments,
 )
+from trl import SFTConfig, SFTTrainer
 
 
 TRAINING_DIR = Path(os.environ.get("SM_CHANNEL_TRAINING", "/opt/ml/input/data/training"))
@@ -28,6 +35,7 @@ HYPERPARAMETERS_PATH = Path(
 )
 MODEL_DIR = Path(os.environ.get("SM_MODEL_DIR", "/opt/ml/model"))
 OUTPUT_DIR = Path(os.environ.get("SM_OUTPUT_DIR", "/opt/ml/output"))
+ROW_SOURCE_DIR_KEY = "_tt_source_dir"
 
 
 def load_hyperparameters() -> dict[str, str]:
@@ -71,6 +79,7 @@ def load_rows() -> list[dict[str, Any]]:
             row = json.loads(line)
             if "messages" not in row:
                 raise ValueError(f"{path}:{line_number} missing messages")
+            row[ROW_SOURCE_DIR_KEY] = str(path.parent)
             rows.append(row)
     if not rows:
         raise ValueError(f"No chat JSONL rows found under {TRAINING_DIR}")
@@ -132,7 +141,82 @@ class TextDataset(Dataset[dict[str, torch.Tensor]]):
         }
 
 
-def create_model_and_tokenizer(model_source: str):
+def image_from_data_uri(value: str) -> Image.Image:
+    _, encoded = value.split(",", 1)
+    return Image.open(BytesIO(base64.b64decode(encoded))).convert("RGB")
+
+
+def load_image(value: str, base_dir: Path) -> Image.Image:
+    if value.startswith("data:"):
+        return image_from_data_uri(value)
+    if value.startswith("http://") or value.startswith("https://"):
+        with urllib.request.urlopen(value, timeout=30) as response:
+            return Image.open(BytesIO(response.read())).convert("RGB")
+    path_value = value[7:] if value.startswith("file://") else value
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    return Image.open(path).convert("RGB")
+
+
+def image_value_from_part(part: dict[str, Any], fallback: str | None) -> str | None:
+    for key in ("image", "path", "uri", "data_uri"):
+        value = part.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return fallback
+
+
+def multimodal_content(
+    content: Any,
+    top_level_images: list[str],
+    base_dir: Path,
+) -> tuple[str | list[dict[str, Any]], list[Image.Image]]:
+    if isinstance(content, str):
+        return content, []
+    if not isinstance(content, list):
+        return str(content), []
+
+    images: list[Image.Image] = []
+    image_index = 0
+    converted: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            converted.append({"type": "text", "text": str(part)})
+            continue
+        if part.get("type") != "image":
+            converted.append(part)
+            continue
+        fallback = top_level_images[image_index] if image_index < len(top_level_images) else None
+        image_index += 1
+        image_value = image_value_from_part(part, fallback)
+        if image_value:
+            images.append(load_image(image_value, base_dir))
+        converted.append({"type": "image"})
+    return converted, images
+
+
+def row_to_multimodal_example(row: dict[str, Any]) -> dict[str, Any]:
+    source_dir = Path(str(row.get(ROW_SOURCE_DIR_KEY) or TRAINING_DIR))
+    top_level_images = [str(value) for value in row.get("images", []) if isinstance(value, str)]
+    all_images: list[Image.Image] = []
+    messages: list[dict[str, Any]] = []
+    for message in row["messages"]:
+        content, images = multimodal_content(message.get("content", ""), top_level_images, source_dir)
+        all_images.extend(images)
+        messages.append({
+            "role": message.get("role", "user"),
+            "content": content,
+        })
+    if not all_images and top_level_images:
+        all_images = [load_image(value, source_dir) for value in top_level_images]
+    return {
+        "messages": messages,
+        "images": all_images,
+    }
+
+
+def create_text_model_and_tokenizer(model_source: str):
     trust_remote_code = hp_bool("trust_remote_code", True)
     token = os.getenv("HF_TOKEN")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -155,6 +239,36 @@ def create_model_and_tokenizer(model_source: str):
     return model, tokenizer
 
 
+def create_multimodal_model_and_processor(model_source: str):
+    trust_remote_code = hp_bool("trust_remote_code", True)
+    token = os.getenv("HF_TOKEN")
+    processor = AutoProcessor.from_pretrained(
+        model_source,
+        trust_remote_code=trust_remote_code,
+        token=token,
+    )
+    if getattr(processor, "tokenizer", None) is not None and processor.tokenizer.pad_token is None:
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+
+    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_source,
+        trust_remote_code=trust_remote_code,
+        token=token,
+        torch_dtype=dtype if torch.cuda.is_available() else None,
+        device_map="auto" if torch.cuda.is_available() else None,
+    )
+    model.config.use_cache = False
+    return model, processor
+
+
+def lora_target_modules(default: str) -> list[str] | str:
+    raw = hp("lora_target_modules", default) or default
+    if raw == "all-linear":
+        return raw
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def maybe_apply_lora(model: Any):
     rank = hp_int("lora_rank", 16)
     alpha = hp_int("lora_alpha", 32)
@@ -165,9 +279,19 @@ def maybe_apply_lora(model: Any):
         lora_dropout=dropout,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules="all-linear",
+        target_modules=lora_target_modules("all-linear"),
     )
     return get_peft_model(model, config)
+
+
+def multimodal_lora_config() -> LoraConfig:
+    return LoraConfig(
+        r=hp_int("lora_rank", 16),
+        lora_alpha=hp_int("lora_alpha", 32),
+        lora_dropout=hp_float("lora_dropout", 0.05),
+        bias="none",
+        target_modules=lora_target_modules("q_proj,v_proj"),
+    )
 
 
 def create_model_archive() -> Path:
@@ -178,14 +302,8 @@ def create_model_archive() -> Path:
     return archive_path
 
 
-def main() -> None:
-    started = time.time()
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    rows = load_rows()
-    model_source = resolve_model_source()
-    model, tokenizer = create_model_and_tokenizer(model_source)
+def run_text_training(rows: list[dict[str, Any]], model_source: str) -> dict[str, Any]:
+    model, tokenizer = create_text_model_and_tokenizer(model_source)
     model = maybe_apply_lora(model)
 
     texts = [row_to_text(tokenizer, row) for row in rows]
@@ -216,17 +334,69 @@ def main() -> None:
 
     model.save_pretrained(MODEL_DIR)
     tokenizer.save_pretrained(MODEL_DIR)
+    return result.metrics
+
+
+def run_multimodal_training(rows: list[dict[str, Any]], model_source: str) -> dict[str, Any]:
+    model, processor = create_multimodal_model_and_processor(model_source)
+    dataset = HFDataset.from_list([row_to_multimodal_example(row) for row in rows])
+
+    with TemporaryDirectory() as tmp:
+        args = SFTConfig(
+            output_dir=tmp,
+            num_train_epochs=hp_int("n_epochs", 3),
+            learning_rate=hp_float("learning_rate", 0.00001),
+            per_device_train_batch_size=hp_int("per_device_train_batch_size", 1),
+            gradient_accumulation_steps=hp_int("gradient_accumulation_steps", 8),
+            logging_steps=1,
+            save_strategy="no",
+            report_to="none",
+            remove_unused_columns=False,
+            bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
+            fp16=torch.cuda.is_available() and not torch.cuda.is_bf16_supported(),
+            gradient_checkpointing=True,
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+            dataset_kwargs={"skip_prepare_dataset": True},
+            max_length=None,
+        )
+        trainer = SFTTrainer(
+            model=model,
+            args=args,
+            train_dataset=dataset,
+            processing_class=processor,
+            peft_config=multimodal_lora_config(),
+        )
+        result = trainer.train()
+        trainer.save_model(MODEL_DIR)
+    processor.save_pretrained(MODEL_DIR)
+    return result.metrics
+
+
+def main() -> None:
+    started = time.time()
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    rows = load_rows()
+    model_source = resolve_model_source()
+    model_loader = hp("model_loader", "causal_lm")
+    if model_loader == "image_text_to_text":
+        metrics = run_multimodal_training(rows, model_source)
+    else:
+        metrics = run_text_training(rows, model_source)
+
     archive_path = create_model_archive()
-    metrics = {
+    output_metrics = {
         "training_rows": len(rows),
         "model_source": model_source,
+        "model_loader": model_loader,
         "train_runtime": round(time.time() - started, 3),
-        **{key: float(value) for key, value in result.metrics.items() if isinstance(value, (int, float))},
+        **{key: float(value) for key, value in metrics.items() if isinstance(value, (int, float))},
         "model_archive": str(archive_path),
     }
-    (MODEL_DIR / "training-metrics.json").write_text(json.dumps(metrics, indent=2))
-    (OUTPUT_DIR / "training-metrics.json").write_text(json.dumps(metrics, indent=2))
-    print(json.dumps(metrics, indent=2))
+    (MODEL_DIR / "training-metrics.json").write_text(json.dumps(output_metrics, indent=2))
+    (OUTPUT_DIR / "training-metrics.json").write_text(json.dumps(output_metrics, indent=2))
+    print(json.dumps(output_metrics, indent=2))
 
 
 if __name__ == "__main__":

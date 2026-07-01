@@ -6,6 +6,7 @@ export interface ChatJsonlRow {
     role: "system" | "user" | "assistant";
     content: string | Array<Record<string, unknown>>;
   }>;
+  images?: string[];
 }
 
 export function buildSystemMessage(spec: SpecSnapshot): string {
@@ -62,9 +63,52 @@ export async function examplesFromChatJsonl(path: string): Promise<BehaviorSpecE
     if (!user || !assistant || typeof assistant.content !== "string") {
       throw new Error(`Invalid chat JSONL row ${index + 1}: expected user and assistant messages`);
     }
+    const inputAssets: BehaviorSpecExample["input_assets"] = [];
+    let textInput = "";
+    if (typeof user.content === "string") {
+      textInput = user.content;
+      if (Array.isArray(row.images)) {
+        for (const image of row.images) {
+          if (typeof image === "string" && image) {
+            inputAssets.push({ type: "image", image });
+          }
+        }
+      }
+    } else {
+      const topLevelImages = Array.isArray(row.images) ? row.images : [];
+      let imageIndex = 0;
+      const textParts: string[] = [];
+      for (const part of user.content) {
+        if (part.type === "text" && typeof part.text === "string") {
+          textParts.push(part.text);
+          continue;
+        }
+        if (part.type !== "image") continue;
+        const image = typeof part.image === "string"
+          ? part.image
+          : typeof part.path === "string"
+            ? part.path
+            : typeof part.uri === "string"
+              ? part.uri
+              : typeof part.data_uri === "string"
+                ? part.data_uri
+                : topLevelImages[imageIndex];
+        imageIndex += 1;
+        if (image) {
+          inputAssets.push({
+            type: "image",
+            image,
+            ...(typeof part.mime_type === "string" ? { mime_type: part.mime_type } : {}),
+            ...(typeof part.page === "number" ? { page: part.page } : {}),
+          });
+        }
+      }
+      textInput = textParts.join("\n").trim() || JSON.stringify(user.content);
+    }
     examples.push({
-      input: typeof user.content === "string" ? user.content : JSON.stringify(user.content),
+      input: textInput,
       output: assistant.content,
+      ...(inputAssets.length ? { input_assets: inputAssets } : {}),
     });
   }
   return examples;
