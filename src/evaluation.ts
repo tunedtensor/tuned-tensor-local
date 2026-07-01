@@ -10,6 +10,7 @@ import type {
   LocalRunnerConfig,
 } from "./contracts.js";
 import { writeJson, fileUri } from "./artifacts.js";
+import { resolveTrainingModel } from "./model-registry.js";
 import { openRouterChat } from "./openrouter.js";
 import { forwardStreamLines, type LocalRunReporter } from "./run-reporter.js";
 
@@ -244,10 +245,17 @@ async function runTransformersInference(args: {
   const outputPath = `${args.outputPath}.inference-output.json`;
   const logPath = `${args.outputPath}.inference.log`;
   await mkdir(dirname(inputPath), { recursive: true });
+  let modelLoader: string | undefined;
+  try {
+    modelLoader = resolveTrainingModel(args.baseModelId).loader;
+  } catch {
+    modelLoader = undefined;
+  }
   await writeFile(inputPath, `${JSON.stringify({
     kind: args.kind,
     model_id: args.modelId,
     base_model: args.baseModelId,
+    model_loader: modelLoader,
     adapter_path: fileUriToPath(args.adapterPath),
     system: args.system,
     examples: args.examples,

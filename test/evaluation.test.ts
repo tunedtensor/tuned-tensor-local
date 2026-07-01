@@ -80,6 +80,45 @@ test("transformers evaluation adapter records generated outputs and exact-match 
   }
 });
 
+test("transformers evaluation payload includes image-text loader for multimodal models", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-mm-test-"));
+  try {
+    const script = await writeFakeEvaluator(root, "42");
+    const config = localRunnerConfigSchema.parse({
+      dryRun: false,
+      evaluation: {
+        inference: {
+          provider: "transformers",
+          script,
+          maxNewTokens: 8,
+          temperature: 0,
+          topP: 1,
+        },
+        scoring: { mode: "exact_match" },
+      },
+    });
+    await evaluateExamples({
+      kind: "baseline",
+      modelId: "Qwen/Qwen3-VL-2B-Instruct",
+      baseModelId: "Qwen/Qwen3-VL-2B-Instruct",
+      examples: [{
+        input: "What is the blue value?",
+        output: "42",
+        input_assets: [{ type: "image", image: "charts/example.png" }],
+      }],
+      system: "Read charts.",
+      config,
+      outputPath: join(root, "baseline-eval.json"),
+    });
+
+    const payload = JSON.parse(await readFile(join(root, "baseline-eval.json.inference-input.json"), "utf8"));
+    assert.equal(payload.model_loader, "image_text_to_text");
+    assert.deepEqual(payload.examples[0].input_assets, [{ type: "image", image: "charts/example.png" }]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("transformers evaluation can score structured JSON fields", async () => {
   const root = await mkdtemp(join(tmpdir(), "tt-local-eval-json-fields-test-"));
   try {
