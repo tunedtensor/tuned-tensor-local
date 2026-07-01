@@ -47,6 +47,15 @@ function elapsed(started: number): { ms: number; seconds: number } {
   return { ms, seconds: Math.round((ms / 1000) * 1000) / 1000 };
 }
 
+function stripFileUri(path: string): string {
+  return path.replace(/^file:\/\//, "");
+}
+
+function selectPrebuiltEvaluationPath(dataset: FineTuneRunRequest["dataset_prebuilt"]): string {
+  if (!dataset) throw new Error("dataset_prebuilt is required");
+  return stripFileUri(dataset.test ?? dataset.validation ?? dataset.training);
+}
+
 export async function runLocalFineTune(input: {
   request: FineTuneRunRequest;
   config: LocalRunnerConfig;
@@ -99,9 +108,10 @@ export async function runLocalFineTune(input: {
 
     let examples = examplesFromSpec(request.spec_snapshot);
     if (request.dataset_prebuilt) {
-      const trainingPath = request.dataset_prebuilt.training.replace(/^file:\/\//, "");
+      const trainingPath = stripFileUri(request.dataset_prebuilt.training);
+      const evaluationPath = selectPrebuiltEvaluationPath(request.dataset_prebuilt);
       await copyFile(trainingPath, artifacts.trainingJsonl);
-      examples = await examplesFromChatJsonl(trainingPath);
+      examples = await examplesFromChatJsonl(evaluationPath);
     } else {
       const jsonl = compileSpecToJsonl(request.spec_snapshot);
       await writeFile(artifacts.trainingJsonl, `${jsonl}\n`, "utf8");

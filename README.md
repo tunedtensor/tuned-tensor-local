@@ -183,6 +183,11 @@ tt-local run --config spark-runner.json
 summary to stdout. Use `--verbose` to stream Python subprocess output, or
 `--quiet` for script-only JSON output.
 
+For prebuilt datasets, `dataset_prebuilt.training` is always copied into the
+run artifact as the training set. Evaluation uses `dataset_prebuilt.test` when
+present, then `dataset_prebuilt.validation`, and otherwise falls back to the
+training file.
+
 Watch progress:
 
 ```bash
