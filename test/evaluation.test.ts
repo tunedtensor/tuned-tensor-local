@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { localRunnerConfigSchema } from "../src/contracts.js";
-import { evaluateExamples } from "../src/evaluation.js";
+import { deriveSampleSeed, evaluateExamples, sampleExamples, splitSpecExamples } from "../src/evaluation.js";
 
 async function writeFakeEvaluator(root: string, actual: string): Promise<string> {
   const path = join(root, "fake-evaluate.py");
@@ -174,6 +174,287 @@ test("transformers evaluation can score structured JSON fields", async () => {
       accuracy: 0,
     });
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("sampleExamples takes a deterministic seeded sample preserving original order", () => {
+  const examples = ["a", "b", "c", "d", "e", "f", "g", "h"];
+  const first = sampleExamples(examples, 3, 42);
+  const second = sampleExamples(examples, 3, 42);
+  assert.deepEqual(first, second);
+  assert.equal(first.length, 3);
+  const positions = first.map((item) => examples.indexOf(item));
+  assert.deepEqual(positions, [...positions].sort((left, right) => left - right));
+  assert.deepEqual(sampleExamples(examples, 8, 42), examples);
+  assert.deepEqual(sampleExamples(examples, 20, 42), examples);
+  assert.equal(deriveSampleSeed("run-a"), deriveSampleSeed("run-a"));
+  assert.notEqual(deriveSampleSeed("run-a"), deriveSampleSeed("run-b"));
+});
+
+test("splitSpecExamples deterministically holds out ~20% with min 1 train and 1 holdout", () => {
+  const examples = Array.from({ length: 10 }, (_, index) => `example ${index}`);
+  const first = splitSpecExamples(examples, 42);
+  const second = splitSpecExamples(examples, 42);
+  assert.deepEqual(first, second);
+  assert.equal(first.holdout.length, 2);
+  assert.equal(first.train.length, 8);
+  // Splits are disjoint and cover all examples, preserving original order.
+  assert.deepEqual([...first.train, ...first.holdout].sort(), [...examples].sort());
+  for (const item of first.holdout) assert.ok(!first.train.includes(item));
+  const trainPositions = first.train.map((item) => examples.indexOf(item));
+  assert.deepEqual(trainPositions, [...trainPositions].sort((left, right) => left - right));
+
+  // Different seeds can produce different holdouts.
+  assert.notDeepEqual(splitSpecExamples(examples, 1).holdout, splitSpecExamples(examples, 7).holdout);
+
+  // Two examples: one train, one holdout.
+  const pair = splitSpecExamples(["a", "b"], 5);
+  assert.equal(pair.train.length, 1);
+  assert.equal(pair.holdout.length, 1);
+
+  // Fewer than 2 examples: no holdout.
+  assert.deepEqual(splitSpecExamples(["only"], 5), { train: ["only"], holdout: [] });
+  assert.deepEqual(splitSpecExamples([], 5), { train: [], holdout: [] });
+});
+
+test("evaluation records eval split and seeded sample when maxExamples truncates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-sample-test-"));
+  try {
+    const config = localRunnerConfigSchema.parse({
+      dryRun: true,
+      evaluation: {
+        mode: "heuristic",
+        scoring: { mode: "exact_match" },
+        maxExamples: 2,
+      },
+    });
+    const examples = Array.from({ length: 6 }, (_, index) => ({
+      input: `input ${index}`,
+      output: `output ${index}`,
+    }));
+    const shared = {
+      examples,
+      system: "Return labels.",
+      config,
+      evalSplit: "prebuilt_test" as const,
+      sampleSeed: 1234,
+    };
+    const baseline = await evaluateExamples({
+      ...shared,
+      kind: "baseline",
+      modelId: "Qwen/Qwen3.5-2B",
+      outputPath: join(root, "baseline-eval.json"),
+    });
+    const candidate = await evaluateExamples({
+      ...shared,
+      kind: "candidate",
+      modelId: "local-adapter",
+      outputPath: join(root, "candidate-eval.json"),
+    });
+
+    assert.equal(baseline.eval_truncated, true);
+    assert.equal(baseline.eval_examples_used, 2);
+    assert.equal(baseline.eval_examples_total, 6);
+    assert.equal(baseline.eval_split, "prebuilt_test");
+    assert.equal(baseline.eval_sample_seed, 1234);
+    assert.deepEqual(
+      baseline.results.map((result) => result.prompt),
+      candidate.results.map((result) => result.prompt),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("evaluation reports no sample seed when all examples are used", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-noseed-test-"));
+  try {
+    const config = localRunnerConfigSchema.parse({
+      dryRun: true,
+      evaluation: { mode: "heuristic", scoring: { mode: "exact_match" } },
+    });
+    const report = await evaluateExamples({
+      kind: "baseline",
+      modelId: "Qwen/Qwen3.5-2B",
+      examples: [{ input: "Classify: good", output: "positive" }],
+      system: "Return labels.",
+      config,
+      outputPath: join(root, "baseline-eval.json"),
+      evalSplit: "spec_examples",
+      sampleSeed: 99,
+    });
+    assert.equal(report.eval_truncated, false);
+    assert.equal(report.eval_sample_seed, null);
+    assert.equal(report.eval_split, "spec_examples");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("json_fields scoring does not credit configured fields missing from expected output", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-json-missing-test-"));
+  try {
+    const script = await writeFakeEvaluator(root, "{\"triage\":\"reply\"}");
+    const config = localRunnerConfigSchema.parse({
+      dryRun: false,
+      evaluation: {
+        inference: { provider: "transformers", script },
+        scoring: {
+          mode: "json_fields",
+          fields: ["triage", "not_in_expected"],
+        },
+      },
+    });
+    const report = await evaluateExamples({
+      kind: "candidate",
+      modelId: "Qwen/Qwen3.5-2B",
+      baseModelId: "Qwen/Qwen3.5-2B",
+      examples: [{ input: "Classify: urgent reply", output: "{\"triage\":\"reply\"}" }],
+      system: "Return labels.",
+      config,
+      outputPath: join(root, "candidate-eval.json"),
+    });
+
+    assert.equal(report.results[0]?.score, 0.5);
+    assert.equal(report.results[0]?.passed, false);
+    assert.match(report.results[0]?.reasoning ?? "", /missing from expected output/);
+    assert.match(report.results[0]?.reasoning ?? "", /not_in_expected/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("malformed judge output falls back to exact match without failing the run", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-judge-malformed-test-"));
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.OPENROUTER_API_KEY;
+  try {
+    const script = await writeFakeEvaluator(root, "positive");
+    process.env.OPENROUTER_API_KEY = "test-key";
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      model: "openai/gpt-5.5",
+      choices: [{ message: { content: "sorry, I cannot produce JSON right now" } }],
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })) as typeof fetch;
+
+    const config = localRunnerConfigSchema.parse({
+      dryRun: false,
+      evaluation: {
+        inference: { provider: "transformers", script },
+        scoring: { mode: "llm_judge", fallback: "exact_match" },
+      },
+      llm: { provider: "openrouter", model: "openai/gpt-5.5", apiKeyEnv: "OPENROUTER_API_KEY" },
+    });
+    const report = await evaluateExamples({
+      kind: "baseline",
+      modelId: "Qwen/Qwen3.5-2B",
+      baseModelId: "Qwen/Qwen3.5-2B",
+      examples: [{ input: "Classify: good", output: "positive" }],
+      system: "Return labels.",
+      config,
+      outputPath: join(root, "baseline-eval.json"),
+    });
+
+    assert.equal(report.results[0]?.score, 1);
+    assert.equal(report.results[0]?.passed, true);
+    assert.match(report.results[0]?.reasoning ?? "", /LLM judge failed/);
+    assert.equal(report.judge_model_id, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.OPENROUTER_API_KEY;
+    } else {
+      process.env.OPENROUTER_API_KEY = originalKey;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("judge request failure falls back to exact match with fallback=exact_match", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-judge-error-test-"));
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.OPENROUTER_API_KEY;
+  try {
+    const script = await writeFakeEvaluator(root, "negative");
+    process.env.OPENROUTER_API_KEY = "test-key";
+    globalThis.fetch = (async () => {
+      throw new Error("network unreachable");
+    }) as typeof fetch;
+
+    const config = localRunnerConfigSchema.parse({
+      dryRun: false,
+      evaluation: {
+        inference: { provider: "transformers", script },
+        scoring: { mode: "llm_judge", fallback: "exact_match" },
+      },
+      llm: { provider: "openrouter", model: "openai/gpt-5.5", apiKeyEnv: "OPENROUTER_API_KEY" },
+    });
+    const report = await evaluateExamples({
+      kind: "baseline",
+      modelId: "Qwen/Qwen3.5-2B",
+      baseModelId: "Qwen/Qwen3.5-2B",
+      examples: [{ input: "Classify: good", output: "positive" }],
+      system: "Return labels.",
+      config,
+      outputPath: join(root, "baseline-eval.json"),
+    });
+
+    assert.equal(report.results[0]?.score, 0);
+    assert.equal(report.results[0]?.passed, false);
+    assert.match(report.results[0]?.reasoning ?? "", /LLM judge failed/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.OPENROUTER_API_KEY;
+    } else {
+      process.env.OPENROUTER_API_KEY = originalKey;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("malformed judge output fails the run when fallback=fail", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-judge-fail-test-"));
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.OPENROUTER_API_KEY;
+  try {
+    const script = await writeFakeEvaluator(root, "positive");
+    process.env.OPENROUTER_API_KEY = "test-key";
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      model: "openai/gpt-5.5",
+      choices: [{ message: { content: "not json" } }],
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })) as typeof fetch;
+
+    const config = localRunnerConfigSchema.parse({
+      dryRun: false,
+      evaluation: {
+        inference: { provider: "transformers", script },
+        scoring: { mode: "llm_judge", fallback: "fail" },
+      },
+      llm: { provider: "openrouter", model: "openai/gpt-5.5", apiKeyEnv: "OPENROUTER_API_KEY" },
+    });
+    await assert.rejects(evaluateExamples({
+      kind: "baseline",
+      modelId: "Qwen/Qwen3.5-2B",
+      baseModelId: "Qwen/Qwen3.5-2B",
+      examples: [{ input: "Classify: good", output: "positive" }],
+      system: "Return labels.",
+      config,
+      outputPath: join(root, "baseline-eval.json"),
+    }), /malformed JSON/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.OPENROUTER_API_KEY;
+    } else {
+      process.env.OPENROUTER_API_KEY = originalKey;
+    }
     await rm(root, { recursive: true, force: true });
   }
 });

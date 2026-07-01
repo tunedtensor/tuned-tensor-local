@@ -186,7 +186,25 @@ exact matching:
 The evaluation report still includes `exact_match_rate`, but `avg_score`,
 `pass_rate`, and `json_field_metrics` are based on the selected JSON fields.
 If `fields` is omitted, the evaluator scores every key in the expected JSON
-object for each example.
+object for each example. A configured field that is missing from the expected
+JSON is always scored as incorrect (with a reasoning note), so misconfigured
+field lists cannot inflate scores.
+
+With `"mode": "llm_judge"`, `scoring.fallback` controls what happens when the
+judge is unavailable, a judge request fails, or the judge returns malformed
+JSON. With `"fallback": "exact_match"` (the default), the affected example is
+scored by normalized exact match and its reasoning records the judge failure;
+the run does not fail. With `"fallback": "fail"`, judge errors fail the run.
+
+`evaluation.maxExamples` caps how many evaluation examples are scored. If it
+is unset, the request hyperparameter `max_eval_examples` is used instead;
+an explicit `maxExamples` in the config always wins. When the cap truncates
+the eval set, the runner draws a deterministic seeded random sample (not a
+prefix), so sorted or grouped eval files do not bias the subset. The seed
+defaults to a hash of the run id, can be pinned with `evaluation.sampleSeed`,
+and is recorded in each eval report as `eval_sample_seed`. Baseline and
+candidate evaluations always score the same sampled examples in the same
+order.
 
 If you want OpenRouter judging, set your key:
 
@@ -209,10 +227,30 @@ recorded as run events, so `tt-local runs watch` and per-run `progress.jsonl`
 show epoch, loss, step, percentage, and ETA updates when the trainer emits
 them.
 
+For spec-based runs (no `dataset_prebuilt`), the runner automatically holds
+out about 20% of the spec examples (at least 1 holdout and at least 1 training
+example) for evaluation, so baseline and candidate scores are not measured on
+the training data. The split is deterministic: it uses the per-run sample seed
+(a hash of the run id, or `evaluation.sampleSeed` when set), so re-running the
+same run id reproduces the same split and baseline/candidate always score the
+identical holdout. The training JSONL artifact contains only the training
+split, `run_metadata.training_example_count` records the training split size,
+and `eval_examples_total` records the holdout size. These runs report
+`eval_split: "spec_holdout"`. With only 1 spec example there is nothing to
+hold out, so evaluation runs on the training set and is reported as
+`eval_split: "spec_examples"` (training-set evaluation due to insufficient
+examples).
+
 For prebuilt datasets, `dataset_prebuilt.training` is always copied into the
 run artifact as the training set. Evaluation uses `dataset_prebuilt.test` when
-present, then `dataset_prebuilt.validation`, and otherwise falls back to the
-training file.
+present, then `dataset_prebuilt.validation`. If neither is provided, a real
+(non-dry) run fails with an error, because evaluating on the training split
+overstates improvement; set `evaluation.allowPrebuiltTrainingEval: true` to
+evaluate on the training file anyway. Dry runs are allowed to fall back to the
+training file without the override. Each eval report and the run's
+`run_metadata` record the split that was evaluated in `eval_split`
+(`spec_holdout`, `spec_examples`, `prebuilt_test`, `prebuilt_validation`, or
+`prebuilt_training`), so training-set evaluation is always visible.
 
 Multimodal runs use the same chat JSONL shape with structured user content.
 For `image_text_to_text` models such as `Qwen/Qwen3-VL-2B-Instruct`, image

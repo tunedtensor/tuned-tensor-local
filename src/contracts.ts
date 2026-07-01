@@ -115,6 +115,14 @@ export const jsonFieldMetricsSchema = z.object({
   })),
 });
 
+export const evalSplitSchema = z.enum([
+  "spec_examples",
+  "spec_holdout",
+  "prebuilt_test",
+  "prebuilt_validation",
+  "prebuilt_training",
+]);
+
 export const evalReportSchema = z.object({
   kind: z.enum(["baseline", "candidate"]),
   model_id: z.string(),
@@ -122,6 +130,8 @@ export const evalReportSchema = z.object({
   eval_examples_total: z.number().int().nonnegative(),
   eval_examples_used: z.number().int().nonnegative(),
   eval_truncated: z.boolean(),
+  eval_split: evalSplitSchema.optional(),
+  eval_sample_seed: z.number().int().nullable().optional(),
   avg_score: z.number().min(0).max(1),
   pass_rate: z.number().min(0).max(1),
   exact_match_rate: z.number().min(0).max(1),
@@ -188,6 +198,8 @@ export const runReportSchema = z.object({
     training_example_count: z.number().int().nonnegative().nullable(),
     eval_examples_total: z.number().int().nonnegative(),
     eval_examples_used: z.number().int().nonnegative(),
+    eval_split: evalSplitSchema.optional(),
+    eval_sample_seed: z.number().int().nullable().optional(),
     started_at: z.string(),
     completed_at: z.string(),
     elapsed_ms: z.number().int().nonnegative(),
@@ -259,6 +271,8 @@ export const localRunnerConfigSchema = z.object({
     }),
     timeoutMs: z.number().int().min(100).default(120_000),
     maxExamples: z.number().int().min(1).optional(),
+    sampleSeed: z.number().int().optional(),
+    allowPrebuiltTrainingEval: z.boolean().default(false),
   }).default({
     mode: "heuristic",
     inference: {
@@ -277,6 +291,7 @@ export const localRunnerConfigSchema = z.object({
       fallback: "exact_match",
     },
     timeoutMs: 120_000,
+    allowPrebuiltTrainingEval: false,
   }),
   llm: z.object({
     provider: z.literal("openrouter").default("openrouter"),
@@ -294,6 +309,7 @@ export type FineTuneHyperparameters = z.infer<typeof fineTuneHyperparametersSche
 export type FineTuneRunRequest = z.infer<typeof fineTuneRunRequestSchema>;
 export type LocalBehaviorSpecFile = z.infer<typeof localBehaviorSpecFileSchema>;
 export type EvalExampleResult = z.infer<typeof evalExampleResultSchema>;
+export type EvalSplit = z.infer<typeof evalSplitSchema>;
 export type EvalReport = z.infer<typeof evalReportSchema>;
 export type ComparisonReport = z.infer<typeof comparisonReportSchema>;
 export type TrainingReport = z.infer<typeof trainingReportSchema>;
