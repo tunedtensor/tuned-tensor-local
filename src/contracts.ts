@@ -100,6 +100,21 @@ export const evalExampleResultSchema = z.object({
   latency_ms: z.number().int().nonnegative(),
 });
 
+export const jsonFieldMetricsSchema = z.object({
+  fields: z.array(z.string()),
+  valid_json_count: z.number().int().nonnegative(),
+  valid_json_rate: z.number().min(0).max(1),
+  schema_match_count: z.number().int().nonnegative(),
+  schema_match_rate: z.number().min(0).max(1),
+  all_fields_match_count: z.number().int().nonnegative(),
+  all_fields_match_rate: z.number().min(0).max(1),
+  field_accuracy: z.record(z.string(), z.object({
+    correct: z.number().int().nonnegative(),
+    total: z.number().int().nonnegative(),
+    accuracy: z.number().min(0).max(1),
+  })),
+});
+
 export const evalReportSchema = z.object({
   kind: z.enum(["baseline", "candidate"]),
   model_id: z.string(),
@@ -113,10 +128,11 @@ export const evalReportSchema = z.object({
   avg_latency_ms: z.number().int().nonnegative(),
   results: z.array(evalExampleResultSchema),
   artifact_uri: z.string(),
-  scoring_method: z.enum(["heuristic", "command", "llm_judge", "exact_match"]),
+  scoring_method: z.enum(["heuristic", "command", "llm_judge", "exact_match", "json_fields"]),
   judge_model_id: z.string().nullable().optional(),
   inference_provider: z.enum(["none", "command", "transformers"]).optional(),
-  scoring_mode: z.enum(["exact_match", "llm_judge"]).optional(),
+  scoring_mode: z.enum(["exact_match", "llm_judge", "json_fields"]).optional(),
+  json_field_metrics: jsonFieldMetricsSchema.optional(),
   generation_config: z.record(z.string(), z.unknown()).optional(),
   log_uri: z.string().optional(),
 });
@@ -234,8 +250,9 @@ export const localRunnerConfigSchema = z.object({
       device: "auto",
     }),
     scoring: z.object({
-      mode: z.enum(["exact_match", "llm_judge"]).default("llm_judge"),
+      mode: z.enum(["exact_match", "llm_judge", "json_fields"]).default("llm_judge"),
       fallback: z.enum(["exact_match", "fail"]).default("exact_match"),
+      fields: z.array(z.string().min(1)).optional(),
     }).default({
       mode: "llm_judge",
       fallback: "exact_match",

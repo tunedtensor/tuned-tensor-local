@@ -59,6 +59,90 @@ function buildUvArgs(training: LocalRunnerConfig["training"]): string[] {
   return args;
 }
 
+export interface TrainingProgressSnapshot {
+  percent?: number;
+  step?: number;
+  total_steps?: number;
+  elapsed?: string;
+  eta?: string;
+  rate?: string;
+  loss?: number;
+  grad_norm?: number;
+  learning_rate?: number;
+  epoch?: number;
+}
+
+function numberFromMetric(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+export function parseTrainingProgressLine(line: string): TrainingProgressSnapshot | null {
+  const snapshot: TrainingProgressSnapshot = {};
+  const metricMatches = [...line.matchAll(/'([^']+)':\s*'([^']*)'/g)];
+  for (const match of metricMatches) {
+    const key = match[1];
+    const value = numberFromMetric(match[2]);
+    if (value === undefined) continue;
+    if (key === "loss") snapshot.loss = value;
+    if (key === "grad_norm") snapshot.grad_norm = value;
+    if (key === "learning_rate") snapshot.learning_rate = value;
+    if (key === "epoch") {
+      snapshot.epoch = value;
+      snapshot.percent = Math.max(0, Math.min(100, Math.round(value * 100)));
+    }
+  }
+
+  const progress = line.match(/(\d+)%\|[^|]*\|\s*(\d+)\/(\d+)\s*\[([^<,\]]+)(?:<([^,\]]+))?,\s*([^\]]+)\]/);
+  if (progress) {
+    snapshot.percent = Number(progress[1]);
+    snapshot.step = Number(progress[2]);
+    snapshot.total_steps = Number(progress[3]);
+    snapshot.elapsed = progress[4]?.trim();
+    snapshot.eta = progress[5]?.trim();
+    snapshot.rate = progress[6]?.trim();
+  }
+
+  return Object.keys(snapshot).length > 0 ? snapshot : null;
+}
+
+function createTrainingProgressForwarder(reporter?: LocalRunReporter): (line: string) => void {
+  let lastPercent = -1;
+  let lastStep = -1;
+  let lastEmittedAt = 0;
+  let latestMetrics: TrainingProgressSnapshot = {};
+
+  return (line: string) => {
+    const parsed = parseTrainingProgressLine(line);
+    if (!parsed) return;
+    latestMetrics = { ...latestMetrics, ...parsed };
+    const percent = latestMetrics.percent;
+    const step = latestMetrics.step;
+    const totalSteps = latestMetrics.total_steps;
+    const now = Date.now();
+    const shouldEmit = Boolean(reporter?.onEvent)
+      && (
+        (percent !== undefined && (percent >= lastPercent + 5 || percent === 100))
+        || (step !== undefined && totalSteps !== undefined && step === totalSteps && step !== lastStep)
+        || now - lastEmittedAt > 30_000
+      );
+    if (!shouldEmit) return;
+
+    lastEmittedAt = now;
+    if (percent !== undefined) lastPercent = percent;
+    if (step !== undefined) lastStep = step;
+    void reporter?.onEvent?.({
+      stage: "training",
+      status: "running",
+      message: step !== undefined && totalSteps !== undefined
+        ? `Training progress ${step}/${totalSteps}${percent !== undefined ? ` (${percent}%)` : ""}.`
+        : `Training progress${percent !== undefined ? ` ${percent}%` : ""}.`,
+      details: latestMetrics as Record<string, unknown>,
+    });
+  };
+}
+
 export async function launchProcessTraining(args: {
   request: FineTuneRunRequest;
   artifacts: RunArtifacts;
@@ -130,12 +214,15 @@ export async function launchProcessTraining(args: {
         stdio: ["ignore", "pipe", "pipe"],
         env: childEnv,
       });
+      const forwardTrainingProgress = createTrainingProgressForwarder(args.reporter);
       child.stdout.pipe(logStream, { end: false });
       child.stderr.pipe(logStream, { end: false });
       forwardStreamLines(child.stdout, (line) => {
+        forwardTrainingProgress(line);
         if (args.reporter?.verbose) void args.reporter.onLog?.({ stage: "training", stream: "stdout", message: line });
       });
       forwardStreamLines(child.stderr, (line) => {
+        forwardTrainingProgress(line);
         if (args.reporter?.verbose) void args.reporter.onLog?.({ stage: "training", stream: "stderr", message: line });
       });
       child.on("error", reject);

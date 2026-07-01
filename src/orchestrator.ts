@@ -92,6 +92,31 @@ export async function runLocalFineTune(input: {
       return state;
     }
 
+    function statusForProgressStage(stage: string): LocalRunStatus {
+      if (stage === "evaluating_baseline") return "evaluating_baseline";
+      if (stage === "evaluating_candidate") return "evaluating_candidate";
+      if (stage === "training") return "training";
+      if (stage === "preparing") return "preparing";
+      return "training";
+    }
+
+    const runReporter: LocalRunReporter = {
+      verbose: reporter?.verbose,
+      async onEvent(event) {
+        await store.updateRun({
+          runId: request.run_id,
+          status: statusForProgressStage(event.stage),
+          stage: event.stage,
+          message: event.message,
+          details: event.details,
+        });
+        await reporter?.onEvent?.(event);
+      },
+      async onLog(log) {
+        await reporter?.onLog?.(log);
+      },
+    };
+
     await reporter?.onEvent?.({
       stage: "queued",
       status: "queued",
@@ -137,7 +162,7 @@ export async function runLocalFineTune(input: {
       system,
       config,
       outputPath: artifacts.baselineEvalJson,
-      reporter,
+      reporter: runReporter,
     });
 
     await updateRun({
@@ -146,7 +171,7 @@ export async function runLocalFineTune(input: {
       message: config.dryRun ? "Recording dry-run training result." : "Launching local uv training process.",
       details: { training_backend: config.training.backend, dry_run: config.dryRun },
     });
-    const training = await launchProcessTraining({ request, artifacts, config, reporter });
+    const training = await launchProcessTraining({ request, artifacts, config, reporter: runReporter });
 
     await updateRun({
       status: "evaluating_candidate",
@@ -163,7 +188,7 @@ export async function runLocalFineTune(input: {
       system,
       config,
       outputPath: artifacts.candidateEvalJson,
-      reporter,
+      reporter: runReporter,
     });
     const comparison = compareEvalReports(baseline, candidate);
     const completedAt = new Date().toISOString();
