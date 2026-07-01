@@ -1,6 +1,7 @@
 # Tuned Tensor Local
 
 [![CI](https://github.com/tunedtensor/tuned-tensor-local/actions/workflows/ci.yml/badge.svg)](https://github.com/tunedtensor/tuned-tensor-local/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/@tuned-tensor/local)](https://www.npmjs.com/package/@tuned-tensor/local)
 
 Tuned Tensor Local is a standalone CLI for running Tuned Tensor-style fine-tuning
 jobs on a machine you control. It stores specs, datasets, model artifacts,
@@ -35,7 +36,8 @@ npm run build
 npm link
 ```
 
-After the package is published, you can install the CLI globally:
+You can install the published [@tuned-tensor/local npm package](https://www.npmjs.com/package/@tuned-tensor/local)
+globally:
 
 ```bash
 npm install -g @tuned-tensor/local
