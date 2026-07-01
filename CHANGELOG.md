@@ -2,6 +2,17 @@
 
 All notable changes to Tuned Tensor Local will be documented in this file.
 
+## 0.1.4 - 2026-07-01
+
+### Added
+
+- Added first-class `image_text_to_text` training and evaluation support for multimodal local runs, including Qwen3-VL style image+text SFT with TRL, PEFT LoRA, and processor-based generation.
+- Added multimodal chat JSONL asset handling for structured image parts, top-level `images`, relative prebuilt dataset paths, `file://` URIs, HTTP(S) URLs, and `data:` URIs.
+
+### Fixed
+
+- Corrected Qwen3.5 text model registry entries to use the CausalLM loader now that loader dispatch is active.
+
 ## 0.1.3 - 2026-07-01
 
 ### Added
