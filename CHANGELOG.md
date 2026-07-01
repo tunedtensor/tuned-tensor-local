@@ -2,6 +2,13 @@
 
 All notable changes to Tuned Tensor Local will be documented in this file.
 
+## 0.1.2 - 2026-07-01
+
+### Fixed
+
+- Evaluates prebuilt local runs against `dataset_prebuilt.test` when present, then `validation`, before falling back to `training`.
+- Keeps the copied run training artifact tied to `dataset_prebuilt.training` so held-out eval files are not mixed into training artifacts.
+
 ## 0.1.1 - 2026-06-30
 
 ### Added
