@@ -1,5 +1,3 @@
-import { spawn } from "node:child_process";
-import { createWriteStream } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
@@ -15,7 +13,8 @@ import {
 import { writeJson, fileUri } from "./artifacts.js";
 import { resolveTrainingModel } from "./model-registry.js";
 import { openRouterChat } from "./openrouter.js";
-import { forwardStreamLines, type LocalRunReporter } from "./run-reporter.js";
+import { buildUvPythonArgs, runJsonStdInCommand, runLoggedProcess } from "./process-runner.js";
+import type { LocalRunReporter } from "./run-reporter.js";
 import { defaultLocalHome } from "./store.js";
 
 function normalize(value: string): string {
@@ -267,49 +266,16 @@ async function runInferenceCommand(args: {
   expected: string;
   timeoutMs: number;
 }): Promise<string> {
-  const [cmd, ...cmdArgs] = args.command;
-  const payload = JSON.stringify({
-    system: args.system,
-    prompt: args.prompt,
-    expected: args.expected,
-  });
-
-  return await new Promise((resolve, reject) => {
-    const child = spawn(cmd, cmdArgs, {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
-    });
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error(`Inference command timed out after ${args.timeoutMs}ms`));
-    }, args.timeoutMs);
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (code !== 0) {
-        reject(new Error(`Inference command exited ${code}: ${stderr.slice(0, 1000)}`));
-        return;
-      }
-      const trimmed = stdout.trim();
-      try {
-        const parsed = JSON.parse(trimmed) as { content?: unknown; output?: unknown; actual?: unknown };
-        const content = parsed.content ?? parsed.output ?? parsed.actual;
-        resolve(typeof content === "string" ? content : trimmed);
-      } catch {
-        resolve(trimmed);
-      }
-    });
-    child.stdin.end(payload);
+  return runJsonStdInCommand({
+    command: args.command,
+    payload: {
+      system: args.system,
+      prompt: args.prompt,
+      expected: args.expected,
+    },
+    timeoutMs: args.timeoutMs,
+    timeoutMessage: `Inference command timed out after ${args.timeoutMs}ms`,
+    errorPrefix: "Inference command",
   });
 }
 
@@ -328,18 +294,9 @@ interface TransformersInferenceResult {
 }
 
 function buildUvInferenceArgs(config: LocalRunnerConfig, inputPath: string, outputPath: string): string[] {
-  const inference = config.evaluation.inference;
-  const args: string[] = ["run"];
-  if (inference.project) args.push("--project", inference.project);
-  for (const dependency of inference.with ?? []) args.push("--with", dependency);
-  args.push("python");
-  if (inference.module) {
-    args.push("-m", inference.module);
-  } else {
-    args.push(inference.script);
-  }
-  args.push("--input", inputPath, "--output", outputPath);
-  return args;
+  return buildUvPythonArgs(config.evaluation.inference, {
+    extraArgs: ["--input", inputPath, "--output", outputPath],
+  });
 }
 
 async function runTransformersInference(args: {
@@ -395,48 +352,22 @@ async function runTransformersInference(args: {
       log_path: logPath,
     },
   });
-  const logStream = createWriteStream(logPath, { flags: "w" });
-  try {
-    await new Promise<void>((resolvePromise, reject) => {
-      const child = spawn("uv", uvArgs, {
-        cwd: args.config.evaluation.inference.cwd ? resolve(args.config.evaluation.inference.cwd) : process.cwd(),
-        stdio: ["ignore", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          ...args.config.evaluation.inference.env,
-        },
-      });
-      let stderr = "";
-      const timer = setTimeout(() => {
-        child.kill("SIGTERM");
-        reject(new Error(`Transformers inference timed out after ${args.config.evaluation.timeoutMs}ms`));
-      }, args.config.evaluation.timeoutMs);
-      child.stdout.pipe(logStream, { end: false });
-      child.stderr.pipe(logStream, { end: false });
-      forwardStreamLines(child.stdout, (line) => {
-        if (args.reporter?.verbose) void args.reporter.onLog?.({ stage: `evaluating_${args.kind}`, stream: "stdout", message: line });
-      });
-      forwardStreamLines(child.stderr, (line) => {
-        stderr += `${line}\n`;
-        if (args.reporter?.verbose) void args.reporter.onLog?.({ stage: `evaluating_${args.kind}`, stream: "stderr", message: line });
-      });
-      child.on("error", (error) => {
-        clearTimeout(timer);
-        reject(error);
-      });
-      child.on("close", (code) => {
-        clearTimeout(timer);
-        if (code !== 0) {
-          reject(new Error(`Transformers inference exited ${code}: ${stderr.slice(0, 1000)}`));
-          return;
-        }
-        resolvePromise();
-      });
-    });
-  } finally {
-    await new Promise<void>((resolveEnd) => {
-      logStream.end(resolveEnd);
-    });
+  const result = await runLoggedProcess({
+    command: "uv",
+    commandArgs: uvArgs,
+    cwd: args.config.evaluation.inference.cwd,
+    env: {
+      ...process.env,
+      ...args.config.evaluation.inference.env,
+    },
+    logPath,
+    timeoutMs: args.config.evaluation.timeoutMs,
+    timeoutMessage: `Transformers inference timed out after ${args.config.evaluation.timeoutMs}ms`,
+    reporter: args.reporter,
+    stage: `evaluating_${args.kind}`,
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`Transformers inference exited ${result.exitCode}: ${result.stderr.slice(0, 1000)}`);
   }
   await args.reporter?.onEvent?.({
     stage: `evaluating_${args.kind}`,
@@ -491,7 +422,7 @@ async function judgeWithOpenRouter(args: {
   config: LocalRunnerConfig;
 }): Promise<{ score: number; passed: boolean; reasoning: string; model: string | null }> {
   if (!args.config.llm) {
-    throw new Error("evaluation.mode=llm_judge requires llm OpenRouter config");
+    throw new Error("evaluation.scoring.mode=llm_judge requires llm OpenRouter config");
   }
   const result = await openRouterChat(buildJudgeMessages(args), {
     model: args.config.llm.model,
@@ -573,7 +504,6 @@ export function baselineCacheKey(args: {
     scoring: {
       mode: args.config.evaluation.scoring.mode,
       fields: args.config.evaluation.scoring.fields ?? null,
-      evaluationMode: args.config.evaluation.mode,
       judgeModel: args.config.llm?.model ?? null,
     },
   };
@@ -607,6 +537,36 @@ async function packageVersion(): Promise<string> {
   return cachedPackageVersion;
 }
 
+function resolveEvaluationRuntime(args: {
+  kind: "baseline" | "candidate";
+  config: LocalRunnerConfig;
+}): {
+  command?: string[];
+  inferenceProvider: "none" | "command" | "transformers";
+  scoringMode: "exact_match" | "llm_judge" | "json_fields";
+} {
+  const command = args.kind === "baseline"
+    ? args.config.evaluation.baselineCommand
+    : args.config.evaluation.candidateCommand;
+  const provider = args.config.evaluation.inference.provider;
+  const inferenceProvider: "none" | "command" | "transformers" =
+    args.config.dryRun
+      ? "none"
+      : provider === "command"
+        ? "command"
+        : provider;
+  if (inferenceProvider === "command" && !command) {
+    throw new Error(`evaluation.inference.provider=command requires evaluation.${args.kind}Command`);
+  }
+  const configuredScoringMode: "exact_match" | "llm_judge" | "json_fields" =
+    args.config.evaluation.scoring.mode;
+  const scoringMode: "exact_match" | "llm_judge" | "json_fields" =
+    (args.config.dryRun || inferenceProvider === "none") && configuredScoringMode === "llm_judge"
+      ? "exact_match"
+      : configuredScoringMode;
+  return { command, inferenceProvider, scoringMode };
+}
+
 export async function evaluateExamples(args: {
   kind: "baseline" | "candidate";
   modelId: string;
@@ -634,23 +594,10 @@ export async function evaluateExamples(args: {
   const selected = truncated
     ? sampleExamples(args.examples, maxExamples, sampleSeed)
     : args.examples;
-  const command = args.kind === "baseline"
-    ? args.config.evaluation.baselineCommand
-    : args.config.evaluation.candidateCommand;
-  const inferenceProvider: "none" | "command" | "transformers" =
-    args.config.dryRun
-      ? "none"
-      : args.config.evaluation.mode === "command" && command
-        ? "command"
-        : args.config.evaluation.inference.provider;
-  const configuredScoringMode: "exact_match" | "llm_judge" | "json_fields" =
-    args.config.evaluation.mode === "llm_judge"
-      ? "llm_judge"
-      : args.config.evaluation.scoring.mode;
-  const scoringMode: "exact_match" | "llm_judge" | "json_fields" =
-    (args.config.dryRun || inferenceProvider === "none") && configuredScoringMode === "llm_judge"
-      ? "exact_match"
-      : configuredScoringMode;
+  const { command, inferenceProvider, scoringMode } = resolveEvaluationRuntime({
+    kind: args.kind,
+    config: args.config,
+  });
   const results: EvalExampleResult[] = [];
   const jsonFieldScores: JsonFieldScore[] = [];
   let judgeModelId: string | null = null;

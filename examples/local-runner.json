@@ -8,7 +8,12 @@
     "script": "training/sft-local/src/train.py"
   },
   "evaluation": {
-    "mode": "heuristic",
+    "inference": {
+      "provider": "none"
+    },
+    "scoring": {
+      "mode": "exact_match"
+    },
     "maxExamples": 2
   }
 }

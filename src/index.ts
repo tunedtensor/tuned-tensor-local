@@ -323,7 +323,7 @@ async function main(argv: string[]): Promise<void> {
     const host = readOption(argv, "--host") ?? "127.0.0.1";
     const port = Number(readOption(argv, "--port") ?? "8787");
     const dashboard = await serveLocalDashboard({ host, port, config });
-    console.log(`Tuned Tensor Local dashboard: ${dashboard.url}`);
+    console.log(`TT Local dashboard: ${dashboard.url}`);
     await new Promise<void>((resolveStop) => {
       const stop = () => {
         dashboard.close().then(resolveStop, resolveStop);

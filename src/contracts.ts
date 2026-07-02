@@ -248,11 +248,10 @@ export const localRunnerConfigSchema = z.object({
     modelCache: z.string().optional(),
   }).default({}),
   evaluation: z.object({
-    mode: z.enum(["heuristic", "command", "llm_judge"]).default("heuristic"),
     baselineCommand: commandSchema.optional(),
     candidateCommand: commandSchema.optional(),
     inference: z.object({
-      provider: z.enum(["transformers", "none"]).default("transformers"),
+      provider: z.enum(["transformers", "command", "none"]).default("transformers"),
       project: z.string().optional(),
       cwd: z.string().optional(),
       module: z.string().optional(),
@@ -290,7 +289,6 @@ export const localRunnerConfigSchema = z.object({
     allowPrebuiltTrainingEval: z.boolean().default(false),
     baselineCache: z.boolean().default(true),
   }).default({
-    mode: "heuristic",
     inference: {
       provider: "transformers",
       script: "training/sft-local/src/evaluate.py",

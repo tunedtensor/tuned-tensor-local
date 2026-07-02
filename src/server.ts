@@ -33,7 +33,7 @@ const DASHBOARD_HTML = `<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Tuned Tensor Local</title>
+  <title>TT Local</title>
   <style>
     body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f7f7f4; color: #1e2320; }
     header { display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; border-bottom: 1px solid #d9ddd6; background: #ffffff; position: sticky; top: 0; }
@@ -52,7 +52,7 @@ const DASHBOARD_HTML = `<!doctype html>
 </head>
 <body>
   <header>
-    <strong>Tuned Tensor Local</strong>
+    <strong>TT Local</strong>
     <button id="refresh">Refresh</button>
   </header>
   <main>

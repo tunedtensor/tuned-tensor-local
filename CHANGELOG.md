@@ -1,6 +1,27 @@
 # Changelog
 
-All notable changes to Tuned Tensor Local will be documented in this file.
+All notable changes to TT Local will be documented in this file.
+
+## 0.1.8 - 2026-07-02
+
+### Changed
+
+- Renamed the user-facing project language to TT Local with the tagline
+  "Tuning tensors locally", while keeping the `tt-local` CLI, npm package, repo,
+  and filesystem identifiers unchanged.
+- Reworked the README around a first-time user flow: install, safe dry run,
+  real training, config basics, evaluation behavior, artifacts, Spark notes,
+  and common commands.
+- Simplified evaluation configuration by removing `evaluation.mode`. Inference
+  is now selected with `evaluation.inference.provider`, and scoring is selected
+  with `evaluation.scoring.mode`.
+- Shared the uv/subprocess execution helper between training and evaluation so
+  logging, timeout, and stderr handling are consistent.
+
+### Added
+
+- Added direct support for `evaluation.inference.provider: "command"` with
+  `baselineCommand` and `candidateCommand` for custom inference adapters.
 
 ## 0.1.7 - 2026-07-02
 
