@@ -3,8 +3,8 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { localRunnerConfigSchema } from "../src/contracts.js";
-import { buildJudgeMessages, classifyJudgeReasoning, deriveSampleSeed, evaluateExamples, sampleExamples, splitSpecExamples, tokenF1 } from "../src/evaluation.js";
+import { comparisonReportSchema, localRunnerConfigSchema } from "../src/contracts.js";
+import { buildJudgeMessages, classifyJudgeReasoning, compareEvalReports, deriveSampleSeed, evaluateExamples, sampleExamples, splitSpecExamples, tokenF1 } from "../src/evaluation.js";
 
 async function writeFakeEvaluator(root: string, actual: string): Promise<string> {
   const path = join(root, "fake-evaluate.py");
@@ -648,4 +648,50 @@ test("classifyJudgeReasoning categorizes regression reasonings", () => {
   assert.equal(classifyJudgeReasoning(null), "other");
   // Factual signals dominate omission signals when both appear.
   assert.equal(classifyJudgeReasoning("It omits a detail and misstates the outcome."), "factual");
+});
+
+test("comparison with partial-category regressions passes schema validation", () => {
+  // Regression test: zod v4 enum-keyed records are exhaustive, so a taxonomy
+  // containing only the categories that occurred failed runReportSchema
+  // validation at the end of an otherwise-successful run.
+  const baseline = {
+    kind: "baseline" as const,
+    model_id: "m",
+    total: 1,
+    eval_examples_total: 1,
+    eval_examples_used: 1,
+    eval_truncated: false,
+    avg_score: 0.9,
+    pass_rate: 1,
+    exact_match_rate: 0,
+    avg_latency_ms: 10,
+    results: [{
+      prompt: "p1",
+      expected: "e",
+      actual: "a",
+      passed: true,
+      score: 0.9,
+      reasoning: "good",
+      latency_ms: 10,
+      scored_by: "llm_judge" as const,
+    }],
+    artifact_uri: "file:///tmp/b.json",
+    scoring_method: "llm_judge" as const,
+  };
+  const candidate = {
+    ...baseline,
+    kind: "candidate" as const,
+    avg_score: 0.4,
+    results: [{
+      ...baseline.results[0],
+      score: 0.4,
+      reasoning: "The summary omits the key detail.",
+    }],
+  };
+  const comparison = compareEvalReports(baseline, candidate);
+  assert.equal(comparison.regressions, 1);
+  assert.equal(comparison.regression_taxonomy?.omission, 1);
+  assert.equal(comparison.regression_taxonomy?.factual, 0);
+  const parsed = comparisonReportSchema.parse(comparison);
+  assert.equal(parsed.regression_taxonomy?.omission, 1);
 });

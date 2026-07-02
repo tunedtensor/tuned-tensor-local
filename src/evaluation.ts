@@ -374,6 +374,7 @@ async function runTransformersInference(args: {
     model_cache: args.config.paths.modelCache ? resolve(args.config.paths.modelCache) : undefined,
     trust_remote_code: args.config.evaluation.inference.trustRemoteCode,
     device: args.config.evaluation.inference.device,
+    chat_template_kwargs: args.config.evaluation.inference.chatTemplateKwargs,
     generation: {
       max_new_tokens: args.config.evaluation.inference.maxNewTokens,
       temperature: args.config.evaluation.inference.temperature,
@@ -866,7 +867,15 @@ export function compareEvalReports(baseline: EvalReport, candidate: EvalReport) 
   let regressions = 0;
   let improvements = 0;
   const regressedExamples = [];
-  const taxonomy: Partial<Record<RegressionCategory, number>> = {};
+  // All categories are always present: zod v4 enum-keyed records are
+  // exhaustive, so a partial taxonomy fails runReportSchema validation.
+  const taxonomy: Record<RegressionCategory, number> = {
+    factual: 0,
+    omission: 0,
+    style: 0,
+    fallback: 0,
+    other: 0,
+  };
   const count = Math.min(baseline.results.length, candidate.results.length);
   for (let index = 0; index < count; index += 1) {
     const oldScore = baseline.results[index]?.score ?? 0;

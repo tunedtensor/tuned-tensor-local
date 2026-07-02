@@ -98,6 +98,22 @@ def resolve_model_source() -> str:
     return hp("base_model") or "Qwen/Qwen3.5-2B"
 
 
+def chat_template_kwargs() -> dict[str, Any]:
+    """Optional kwargs forwarded to apply_chat_template (for example
+    {"enable_thinking": false} for thinking-mode models), passed by the
+    runner as a JSON hyperparameter so training text matches inference."""
+    raw = hp("chat_template_kwargs")
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(str(raw))
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
 def row_to_text(tokenizer: Any, row: dict[str, Any]) -> str:
     messages = row["messages"]
     try:
@@ -105,6 +121,7 @@ def row_to_text(tokenizer: Any, row: dict[str, Any]) -> str:
             messages,
             tokenize=False,
             add_generation_prompt=False,
+            **chat_template_kwargs(),
         )
     except Exception:
         parts: list[str] = []

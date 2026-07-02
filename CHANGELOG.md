@@ -2,6 +2,16 @@
 
 All notable changes to Tuned Tensor Local will be documented in this file.
 
+## 0.1.7 - 2026-07-02
+
+### Added
+
+- Added chat-template kwargs plumbing for thinking-mode models: `evaluation.inference.chatTemplateKwargs` (runner config) and the `chat_template_kwargs` hyperparameter (spec) are forwarded to `apply_chat_template` in the local evaluator and SFT trainer. Setting `{"enable_thinking": false}` stops models like `Qwen/Qwen3.5-4B` from opening a `<think>` block that consumes the whole `maxNewTokens` budget and truncates every output.
+
+### Fixed
+
+- Fixed a run-fatal report validation error when a comparison had regressions in only some taxonomy categories: zod v4 enum-keyed records are exhaustive, so the partial `regression_taxonomy` failed `runReportSchema` at the end of an otherwise-successful run. The taxonomy now always contains all categories with zero defaults.
+
 ## 0.1.6 - 2026-07-02
 
 ### Added
