@@ -135,6 +135,7 @@ export const evalReportSchema = z.object({
   avg_score: z.number().min(0).max(1),
   pass_rate: z.number().min(0).max(1),
   exact_match_rate: z.number().min(0).max(1),
+  avg_token_f1: z.number().min(0).max(1).optional(),
   avg_latency_ms: z.number().int().nonnegative(),
   results: z.array(evalExampleResultSchema),
   artifact_uri: z.string(),
@@ -151,6 +152,7 @@ export const comparisonReportSchema = z.object({
   avg_score_delta: z.number(),
   pass_rate_delta: z.number(),
   exact_match_rate_delta: z.number(),
+  token_f1_delta: z.number().optional(),
   regressions: z.number().int().nonnegative(),
   improvements: z.number().int().nonnegative(),
   regressed_examples: z.array(z.object({

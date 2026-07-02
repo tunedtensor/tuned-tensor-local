@@ -23,6 +23,35 @@ function scoreActual(expected: string, actual: string): number {
   return normalize(expected) === normalize(actual) ? 1 : 0;
 }
 
+/**
+ * Token-overlap F1 between expected and actual output (bag-of-words, case and
+ * whitespace insensitive). This is a cheap deterministic reference-similarity
+ * signal for free-text tasks where exact match is always 0 and an LLM judge
+ * can be noisy; both scoring paths keep working unchanged alongside it.
+ */
+export function tokenF1(expected: string, actual: string): number {
+  const tokenize = (value: string): string[] => normalize(value).match(/[\p{L}\p{N}]+/gu) ?? [];
+  const expectedTokens = tokenize(expected);
+  const actualTokens = tokenize(actual);
+  if (expectedTokens.length === 0 || actualTokens.length === 0) {
+    return expectedTokens.length === actualTokens.length ? 1 : 0;
+  }
+  const counts = new Map<string, number>();
+  for (const token of expectedTokens) counts.set(token, (counts.get(token) ?? 0) + 1);
+  let overlap = 0;
+  for (const token of actualTokens) {
+    const remaining = counts.get(token) ?? 0;
+    if (remaining > 0) {
+      overlap += 1;
+      counts.set(token, remaining - 1);
+    }
+  }
+  if (overlap === 0) return 0;
+  const precision = overlap / actualTokens.length;
+  const recall = overlap / expectedTokens.length;
+  return (2 * precision * recall) / (precision + recall);
+}
+
 /** Derives a deterministic 32-bit seed from an arbitrary string (FNV-1a). */
 export function deriveSampleSeed(value: string): number {
   let hash = 0x811c9dc5;
@@ -414,29 +443,53 @@ async function runTransformersInference(args: {
   return JSON.parse(await readFile(outputPath, "utf8")) as TransformersInferenceResult;
 }
 
-async function judgeWithOpenRouter(args: {
+/**
+ * Builds the judge messages. The spec's compiled system message (system
+ * prompt, guidelines, and constraints) is forwarded as task_instructions so
+ * the judge scores conformance to the task, not just similarity to the
+ * reference. Without it, a judge treats `expected` as a fact checklist and
+ * systematically penalizes outputs trained toward a different style (for
+ * example concise summaries) even when they follow the spec.
+ */
+export function buildJudgeMessages(args: {
   prompt: string;
   expected: string;
   actual: string;
-  config: LocalRunnerConfig;
-}): Promise<{ score: number; passed: boolean; reasoning: string; model: string | null }> {
-  if (!args.config.llm) {
-    throw new Error("evaluation.mode=llm_judge requires llm OpenRouter config");
-  }
-  const result = await openRouterChat([
+  taskInstructions?: string;
+}): Array<{ role: "system" | "user"; content: string }> {
+  return [
     {
       role: "system",
-      content: "You are a strict evaluator. Return JSON only with keys score (0 to 1), passed (boolean), and reasoning (string).",
+      content: "You are a strict evaluator. Score how well the actual output fulfills the task instructions "
+        + "for the given prompt. The expected output is a reference answer showing the desired style, length, "
+        + "and content; treat it as one correct answer, not an exhaustive checklist. Penalize factual errors, "
+        + "contradictions of the prompt, and violations of the task instructions. Do not penalize an output "
+        + "merely for omitting secondary reference details when the task instructions call for that brevity. "
+        + "Return JSON only with keys score (0 to 1), passed (boolean), and reasoning (string).",
     },
     {
       role: "user",
       content: JSON.stringify({
+        ...(args.taskInstructions ? { task_instructions: args.taskInstructions } : {}),
         prompt: args.prompt,
         expected: args.expected,
         actual: args.actual,
       }),
     },
-  ], {
+  ];
+}
+
+async function judgeWithOpenRouter(args: {
+  prompt: string;
+  expected: string;
+  actual: string;
+  taskInstructions?: string;
+  config: LocalRunnerConfig;
+}): Promise<{ score: number; passed: boolean; reasoning: string; model: string | null }> {
+  if (!args.config.llm) {
+    throw new Error("evaluation.mode=llm_judge requires llm OpenRouter config");
+  }
+  const result = await openRouterChat(buildJudgeMessages(args), {
     model: args.config.llm.model,
     apiKeyEnv: args.config.llm.apiKeyEnv,
     appName: args.config.llm.appName,
@@ -560,6 +613,7 @@ export async function evaluateExamples(args: {
           prompt: example.input,
           expected: example.output,
           actual,
+          taskInstructions: args.system.trim() || undefined,
           config: args.config,
         });
       } catch (error) {
@@ -608,6 +662,9 @@ export async function evaluateExamples(args: {
   const exactMatchRate = total > 0
     ? results.filter((result) => scoreActual(result.expected, result.actual) === 1).length / total
     : 0;
+  const avgTokenF1 = total > 0
+    ? results.reduce((sum, result) => sum + tokenF1(result.expected, result.actual), 0) / total
+    : 0;
   const avgLatency = total > 0
     ? Math.round(results.reduce((sum, result) => sum + result.latency_ms, 0) / total)
     : 0;
@@ -632,6 +689,7 @@ export async function evaluateExamples(args: {
     avg_score: avgScore,
     pass_rate: passRate,
     exact_match_rate: exactMatchRate,
+    avg_token_f1: avgTokenF1,
     avg_latency_ms: avgLatency,
     results,
     artifact_uri: fileUri(args.outputPath),
@@ -672,6 +730,7 @@ export function compareEvalReports(baseline: EvalReport, candidate: EvalReport) 
     avg_score_delta: candidate.avg_score - baseline.avg_score,
     pass_rate_delta: candidate.pass_rate - baseline.pass_rate,
     exact_match_rate_delta: candidate.exact_match_rate - baseline.exact_match_rate,
+    token_f1_delta: (candidate.avg_token_f1 ?? 0) - (baseline.avg_token_f1 ?? 0),
     regressions,
     improvements,
     regressed_examples: regressedExamples,

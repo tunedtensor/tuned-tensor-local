@@ -2,6 +2,22 @@
 
 All notable changes to Tuned Tensor Local will be documented in this file.
 
+## 0.1.5 - 2026-07-02
+
+### Added
+
+- Added `avg_token_f1` to eval reports and `token_f1_delta` to the comparison report: a cheap deterministic token-overlap reference-similarity metric for free-text tasks where exact match is always 0 and an LLM judge can be noisy.
+- The OpenRouter judge now receives the spec's compiled system message (system prompt, guidelines, constraints) as `task_instructions` and scores conformance to the task instead of treating the expected output as a fact checklist. Previously a model fine-tuned toward a concise style was penalized for omitting reference details even when the spec asked for brevity.
+- `tt-local` now loads `.env` from the working directory (without overriding already-set variables), so `OPENROUTER_API_KEY` works without manual sourcing.
+- `validate` and `run` now warn about unknown hyperparameter keys (for example `per_device_train_batch_size` instead of `batch_size`), which were previously stripped silently and trained with defaults.
+
+### Fixed
+
+- Judge scoring with `scoring.fallback: "exact_match"` no longer fails the whole run when a judge request fails transiently; the affected example falls back to normalized exact match and records the judge failure in its reasoning.
+- Fixed a crash-level race in atomic store writes: concurrent run-state updates in the same millisecond (typical when tqdm flushes several progress lines at training completion) collided on the same temp filename and killed the run with `ENOENT: rename` after training had succeeded. Temp filenames now include a UUID.
+- The local evaluator no longer passes `temperature`/`top_p` to `model.generate` when decoding greedily, silencing the spurious transformers "generation flags are not valid" warning at `temperature: 0`.
+- `--verbose` no longer prints consecutive duplicate subprocess log lines (tqdm redraws the same progress line several times per step).
+
 ## 0.1.4 - 2026-07-01
 
 ### Added

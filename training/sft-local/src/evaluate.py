@@ -189,6 +189,19 @@ def load_multimodal_model(payload: dict[str, Any], adapter_path: str | None):
     return model, processor, device
 
 
+def sampling_kwargs(generation: dict[str, Any]) -> dict[str, Any]:
+    """Greedy decoding must not pass sampling flags: transformers warns that
+    temperature/top_p are ignored when do_sample=False."""
+    temperature = float(generation.get("temperature", 0))
+    if temperature <= 0:
+        return {"do_sample": False}
+    return {
+        "do_sample": True,
+        "temperature": temperature,
+        "top_p": float(generation.get("top_p", 1)),
+    }
+
+
 def generate_text_one(
     model: Any,
     tokenizer: Any,
@@ -207,10 +220,8 @@ def generate_text_one(
         generated = model.generate(
             **inputs,
             max_new_tokens=int(generation.get("max_new_tokens", 256)),
-            do_sample=float(generation.get("temperature", 0)) > 0,
-            temperature=max(float(generation.get("temperature", 0)), 1e-5),
-            top_p=float(generation.get("top_p", 1)),
             pad_token_id=tokenizer.eos_token_id,
+            **sampling_kwargs(generation),
         )
     latency_ms = max(0, round((time.perf_counter() - started) * 1000))
     input_length = int(inputs["input_ids"].shape[-1])
@@ -262,10 +273,8 @@ def generate_multimodal_one(
         generated = model.generate(
             **inputs,
             max_new_tokens=int(generation.get("max_new_tokens", 256)),
-            do_sample=float(generation.get("temperature", 0)) > 0,
-            temperature=max(float(generation.get("temperature", 0)), 1e-5),
-            top_p=float(generation.get("top_p", 1)),
             pad_token_id=processor.tokenizer.eos_token_id,
+            **sampling_kwargs(generation),
         )
     latency_ms = max(0, round((time.perf_counter() - started) * 1000))
     input_length = int(inputs["input_ids"].shape[-1])

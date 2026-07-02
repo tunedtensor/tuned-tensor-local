@@ -3,6 +3,7 @@
 import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { cwd } from "node:process";
 import { fileURLToPath } from "node:url";
 import { fineTuneRunRequestSchema, localBehaviorSpecFileSchema, localRunnerConfigSchema, specSnapshotSchema, type LocalRunnerConfig } from "./contracts.js";
 import {
@@ -41,6 +42,49 @@ export function getLocalRunnerInfo(): LocalRunnerInfo {
     status: "local-runner-preview",
     description: "Local fine-tuning runner for single-GPU uv/Python hosts.",
   };
+}
+
+/**
+ * Parses simple KEY=VALUE lines from .env content. Supports comments, blank
+ * lines, an optional `export ` prefix, and single/double quoted values. Does
+ * not support multiline values or variable expansion.
+ */
+export function parseDotEnv(content: string): Record<string, string> {
+  const values: Record<string, string> = {};
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) continue;
+    let value = match[2].trim();
+    if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    values[match[1]] = value;
+  }
+  return values;
+}
+
+/**
+ * Loads .env from the working directory into process.env without overriding
+ * variables that are already set, so `OPENROUTER_API_KEY` and friends work
+ * out of the box in project directories. Returns the names that were loaded.
+ */
+async function loadDotEnvFromCwd(): Promise<string[]> {
+  let content: string;
+  try {
+    content = await readFile(resolve(cwd(), ".env"), "utf8");
+  } catch {
+    return [];
+  }
+  const loaded: string[] = [];
+  for (const [key, value] of Object.entries(parseDotEnv(content))) {
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+      loaded.push(key);
+    }
+  }
+  return loaded;
 }
 
 function readOption(argv: string[], name: string): string | undefined {
@@ -140,13 +184,19 @@ function formatEvent(event: LocalRunProgressEvent): string {
 
 function createConsoleReporter(options: { verbose: boolean; quiet: boolean }): LocalRunReporter | undefined {
   if (options.quiet) return undefined;
+  let lastLogLine = "";
   return {
     verbose: options.verbose,
     onEvent(event) {
       process.stderr.write(`${formatEvent(event)}\n`);
     },
     onLog(log) {
-      process.stderr.write(sanitizeLogLine(`[tt-local] ${log.stage}${log.stream ? ` ${log.stream}` : ""}: ${log.message}`) + "\n");
+      const line = sanitizeLogLine(`[tt-local] ${log.stage}${log.stream ? ` ${log.stream}` : ""}: ${log.message}`);
+      // tqdm redraws the same progress line several times per step; collapse
+      // consecutive duplicates so --verbose output stays readable.
+      if (line === lastLogLine) return;
+      lastLogLine = line;
+      process.stderr.write(`${line}\n`);
     },
   };
 }
@@ -161,6 +211,10 @@ function isTerminalStatus(status: string): boolean {
 
 async function main(argv: string[]): Promise<void> {
   const command = argv[2] ?? "info";
+  const loadedEnv = await loadDotEnvFromCwd();
+  if (loadedEnv.length > 0 && !hasFlag(argv, "--quiet")) {
+    process.stderr.write(`[tt-local] loaded ${loadedEnv.join(", ")} from .env\n`);
+  }
 
   if (command === "info" || command === "--help" || command === "-h") {
     const info = getLocalRunnerInfo();
@@ -215,6 +269,7 @@ async function main(argv: string[]): Promise<void> {
       artifact_root: config.artifactRoot,
       store_root: config.storeRoot,
       dry_run: config.dryRun,
+      ...(input.warnings.length > 0 ? { warnings: input.warnings } : {}),
     });
     return;
   }
@@ -230,6 +285,11 @@ async function main(argv: string[]): Promise<void> {
       userId: readOption(argv, "--user-id"),
       runNumber: readNumberOption(argv, "--run-number"),
     });
+    if (!hasFlag(argv, "--quiet")) {
+      for (const warning of input.warnings) {
+        process.stderr.write(`[tt-local] warning: ${warning}\n`);
+      }
+    }
     const request = input.request;
     const result = await runLocalFineTune({
       request,
