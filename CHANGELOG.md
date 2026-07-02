@@ -2,7 +2,7 @@
 
 All notable changes to Tuned Tensor Local will be documented in this file.
 
-## Unreleased
+## 0.1.6 - 2026-07-02
 
 ### Added
 
