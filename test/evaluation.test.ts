@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { localRunnerConfigSchema } from "../src/contracts.js";
-import { buildJudgeMessages, deriveSampleSeed, evaluateExamples, sampleExamples, splitSpecExamples, tokenF1 } from "../src/evaluation.js";
+import { buildJudgeMessages, classifyJudgeReasoning, deriveSampleSeed, evaluateExamples, sampleExamples, splitSpecExamples, tokenF1 } from "../src/evaluation.js";
 
 async function writeFakeEvaluator(root: string, actual: string): Promise<string> {
   const path = join(root, "fake-evaluate.py");
@@ -44,6 +44,7 @@ test("transformers evaluation adapter records generated outputs and exact-match 
     const script = await writeFakeEvaluator(root, "positive");
     const config = localRunnerConfigSchema.parse({
       dryRun: false,
+      storeRoot: join(root, "store"),
       evaluation: {
         inference: {
           provider: "transformers",
@@ -86,6 +87,7 @@ test("transformers evaluation payload includes image-text loader for multimodal 
     const script = await writeFakeEvaluator(root, "42");
     const config = localRunnerConfigSchema.parse({
       dryRun: false,
+      storeRoot: join(root, "store"),
       evaluation: {
         inference: {
           provider: "transformers",
@@ -128,6 +130,7 @@ test("transformers evaluation can score structured JSON fields", async () => {
     );
     const config = localRunnerConfigSchema.parse({
       dryRun: false,
+      storeRoot: join(root, "store"),
       evaluation: {
         inference: {
           provider: "transformers",
@@ -298,6 +301,7 @@ test("json_fields scoring does not credit configured fields missing from expecte
     const script = await writeFakeEvaluator(root, "{\"triage\":\"reply\"}");
     const config = localRunnerConfigSchema.parse({
       dryRun: false,
+      storeRoot: join(root, "store"),
       evaluation: {
         inference: { provider: "transformers", script },
         scoring: {
@@ -342,6 +346,7 @@ test("malformed judge output falls back to exact match without failing the run",
 
     const config = localRunnerConfigSchema.parse({
       dryRun: false,
+      storeRoot: join(root, "store"),
       evaluation: {
         inference: { provider: "transformers", script },
         scoring: { mode: "llm_judge", fallback: "exact_match" },
@@ -386,6 +391,7 @@ test("judge request failure falls back to exact match with fallback=exact_match"
 
     const config = localRunnerConfigSchema.parse({
       dryRun: false,
+      storeRoot: join(root, "store"),
       evaluation: {
         inference: { provider: "transformers", script },
         scoring: { mode: "llm_judge", fallback: "exact_match" },
@@ -405,6 +411,10 @@ test("judge request failure falls back to exact match with fallback=exact_match"
     assert.equal(report.results[0]?.score, 0);
     assert.equal(report.results[0]?.passed, false);
     assert.match(report.results[0]?.reasoning ?? "", /LLM judge failed/);
+    assert.equal(report.results[0]?.scored_by, "exact_match_fallback");
+    assert.equal(report.fallback_scored_count, 1);
+    assert.equal(report.judge_scored_count, 0);
+    assert.equal(report.judge_only_avg_score, null);
   } finally {
     globalThis.fetch = originalFetch;
     if (originalKey === undefined) {
@@ -433,6 +443,7 @@ test("malformed judge output fails the run when fallback=fail", async () => {
 
     const config = localRunnerConfigSchema.parse({
       dryRun: false,
+      storeRoot: join(root, "store"),
       evaluation: {
         inference: { provider: "transformers", script },
         scoring: { mode: "llm_judge", fallback: "fail" },
@@ -476,6 +487,7 @@ test("transformers evaluation can score generated outputs with OpenRouter judge"
 
     const config = localRunnerConfigSchema.parse({
       dryRun: false,
+      storeRoot: join(root, "store"),
       evaluation: {
         inference: {
           provider: "transformers",
@@ -552,4 +564,88 @@ test("buildJudgeMessages forwards task instructions to the judge", () => {
   });
   const bare = JSON.parse(withoutInstructions[1].content) as Record<string, unknown>;
   assert.equal("task_instructions" in bare, false);
+});
+
+async function writeCountingEvaluator(root: string, actual: string): Promise<{ script: string; countPath: string }> {
+  const script = join(root, "counting-evaluate.py");
+  const countPath = join(root, "invocations.txt");
+  await writeFile(script, `
+import argparse, json
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--output", required=True)
+args = parser.parse_args()
+payload = json.load(open(args.input))
+with open(${JSON.stringify("COUNT_PATH")}, "a") as fh:
+    fh.write("x")
+json.dump({
+  "provider": "transformers",
+  "model_id": payload["model_id"],
+  "results": [
+    {"prompt": e["input"], "expected": e["output"], "actual": ${JSON.stringify("ACTUAL")}, "latency_ms": 5}
+    for e in payload["examples"]
+  ]
+}, open(args.output, "w"))
+`.replace('"COUNT_PATH"', JSON.stringify(countPath)).replace('"ACTUAL"', JSON.stringify(actual)), "utf8");
+  return { script, countPath };
+}
+
+test("baseline evaluation cache reuses the prior report for identical inputs", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-cache-test-"));
+  try {
+    const { script, countPath } = await writeCountingEvaluator(root, "positive");
+    const config = localRunnerConfigSchema.parse({
+      dryRun: false,
+      storeRoot: join(root, "store"),
+      evaluation: {
+        inference: { provider: "transformers", script },
+        scoring: { mode: "exact_match" },
+      },
+    });
+    const args = {
+      kind: "baseline" as const,
+      modelId: "Qwen/Qwen3.5-2B",
+      baseModelId: "Qwen/Qwen3.5-2B",
+      examples: [{ input: "Classify: good", output: "positive" }],
+      system: "Return labels.",
+      config,
+    };
+    const first = await evaluateExamples({ ...args, outputPath: join(root, "baseline-1.json") });
+    assert.notEqual(first.cached, true);
+    assert.equal(first.avg_score, 1);
+
+    const second = await evaluateExamples({ ...args, outputPath: join(root, "baseline-2.json") });
+    assert.equal(second.cached, true);
+    assert.equal(second.avg_score, first.avg_score);
+    assert.deepEqual(second.results, first.results);
+    assert.ok(second.cache_key);
+    assert.equal((await readFile(countPath, "utf8")).length, 1, "evaluator must run only once");
+
+    // The candidate kind and disabled cache both bypass the cache.
+    const noCacheConfig = localRunnerConfigSchema.parse({
+      dryRun: false,
+      storeRoot: join(root, "store"),
+      evaluation: {
+        inference: { provider: "transformers", script },
+        scoring: { mode: "exact_match" },
+        baselineCache: false,
+      },
+    });
+    const third = await evaluateExamples({ ...args, config: noCacheConfig, outputPath: join(root, "baseline-3.json") });
+    assert.notEqual(third.cached, true);
+    assert.equal((await readFile(countPath, "utf8")).length, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("classifyJudgeReasoning categorizes regression reasonings", () => {
+  assert.equal(classifyJudgeReasoning("It incorrectly states that Meghan will wear a dress."), "factual");
+  assert.equal(classifyJudgeReasoning("The summary omits the PDF detail."), "omission");
+  assert.equal(classifyJudgeReasoning("The answer is too verbose for the requested style."), "style");
+  assert.equal(classifyJudgeReasoning("LLM judge failed (fetch failed); scored by normalized exact match."), "fallback");
+  assert.equal(classifyJudgeReasoning("Close but imperfect.", "exact_match_fallback"), "fallback");
+  assert.equal(classifyJudgeReasoning(null), "other");
+  // Factual signals dominate omission signals when both appear.
+  assert.equal(classifyJudgeReasoning("It omits a detail and misstates the outcome."), "factual");
 });

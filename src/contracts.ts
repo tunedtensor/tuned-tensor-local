@@ -98,6 +98,7 @@ export const evalExampleResultSchema = z.object({
   score: z.number().min(0).max(1),
   reasoning: z.string().nullable(),
   latency_ms: z.number().int().nonnegative(),
+  scored_by: z.enum(["llm_judge", "exact_match", "json_fields", "heuristic", "exact_match_fallback"]).optional(),
 });
 
 export const jsonFieldMetricsSchema = z.object({
@@ -137,6 +138,11 @@ export const evalReportSchema = z.object({
   exact_match_rate: z.number().min(0).max(1),
   avg_token_f1: z.number().min(0).max(1).optional(),
   avg_latency_ms: z.number().int().nonnegative(),
+  judge_scored_count: z.number().int().nonnegative().optional(),
+  fallback_scored_count: z.number().int().nonnegative().optional(),
+  judge_only_avg_score: z.number().min(0).max(1).nullable().optional(),
+  cached: z.boolean().optional(),
+  cache_key: z.string().optional(),
   results: z.array(evalExampleResultSchema),
   artifact_uri: z.string(),
   scoring_method: z.enum(["heuristic", "command", "llm_judge", "exact_match", "json_fields"]),
@@ -148,17 +154,22 @@ export const evalReportSchema = z.object({
   log_uri: z.string().optional(),
 });
 
+export const regressionCategorySchema = z.enum(["factual", "omission", "style", "fallback", "other"]);
+
 export const comparisonReportSchema = z.object({
   avg_score_delta: z.number(),
   pass_rate_delta: z.number(),
   exact_match_rate_delta: z.number(),
   token_f1_delta: z.number().optional(),
+  judge_only_avg_score_delta: z.number().nullable().optional(),
   regressions: z.number().int().nonnegative(),
   improvements: z.number().int().nonnegative(),
+  regression_taxonomy: z.record(regressionCategorySchema, z.number().int().nonnegative()).optional(),
   regressed_examples: z.array(z.object({
     prompt: z.string(),
     old_score: z.number(),
     new_score: z.number(),
+    category: regressionCategorySchema.optional(),
   })),
 });
 
@@ -275,6 +286,7 @@ export const localRunnerConfigSchema = z.object({
     maxExamples: z.number().int().min(1).optional(),
     sampleSeed: z.number().int().optional(),
     allowPrebuiltTrainingEval: z.boolean().default(false),
+    baselineCache: z.boolean().default(true),
   }).default({
     mode: "heuristic",
     inference: {
@@ -294,6 +306,7 @@ export const localRunnerConfigSchema = z.object({
     },
     timeoutMs: 120_000,
     allowPrebuiltTrainingEval: false,
+    baselineCache: true,
   }),
   llm: z.object({
     provider: z.literal("openrouter").default("openrouter"),

@@ -1,19 +1,22 @@
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { dirname, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
-import type {
-  BehaviorSpecExample,
-  EvalExampleResult,
-  EvalReport,
-  EvalSplit,
-  LocalRunnerConfig,
+import {
+  evalReportSchema,
+  type BehaviorSpecExample,
+  type EvalExampleResult,
+  type EvalReport,
+  type EvalSplit,
+  type LocalRunnerConfig,
 } from "./contracts.js";
 import { writeJson, fileUri } from "./artifacts.js";
 import { resolveTrainingModel } from "./model-registry.js";
 import { openRouterChat } from "./openrouter.js";
 import { forwardStreamLines, type LocalRunReporter } from "./run-reporter.js";
+import { defaultLocalHome } from "./store.js";
 
 function normalize(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLowerCase();
@@ -515,6 +518,94 @@ function canUseOpenRouterJudge(config: LocalRunnerConfig): boolean {
   return Boolean(config.llm && process.env[config.llm.apiKeyEnv]);
 }
 
+export type RegressionCategory = "factual" | "omission" | "style" | "fallback" | "other";
+
+const FACTUAL_REASONING = /incorrect|error|misstate|mis-state|contradict|wrong|inaccurate|not supported|misattribut|invent|fabricat|halluc/i;
+const OMISSION_REASONING = /omit|missing|leaves out|leave out|lacks|does not (?:mention|include|cover)|fails to (?:mention|include|cover)/i;
+const STYLE_REASONING = /verbose|too long|too short|format|style|tone|first person|markdown|preamble/i;
+
+/**
+ * Coarse category for a judge reasoning string so comparison reports can
+ * answer "what kind of worse?" without re-reading every example. Factual
+ * problems dominate omissions, which dominate style notes; fallback marks
+ * examples that were never judge-scored (their score is not comparable to
+ * judged ones).
+ */
+export function classifyJudgeReasoning(reasoning: string | null, scoredBy?: string): RegressionCategory {
+  if (scoredBy === "exact_match_fallback") return "fallback";
+  if (!reasoning) return "other";
+  if (reasoning.startsWith("LLM judge failed")) return "fallback";
+  if (FACTUAL_REASONING.test(reasoning)) return "factual";
+  if (OMISSION_REASONING.test(reasoning)) return "omission";
+  if (STYLE_REASONING.test(reasoning)) return "style";
+  return "other";
+}
+
+/**
+ * Cache key for a baseline evaluation. Baseline outputs are deterministic for
+ * a given model, example set, and generation settings, and judge scores only
+ * depend on those plus the scoring configuration, so re-running a spec with
+ * an unchanged baseline can reuse the previous report instead of paying for
+ * inference and judge calls again. The package version participates so rubric
+ * or evaluator changes invalidate old entries.
+ */
+export function baselineCacheKey(args: {
+  modelId: string;
+  system: string;
+  examples: BehaviorSpecExample[];
+  config: LocalRunnerConfig;
+  packageVersion: string;
+}): string {
+  const payload = {
+    v: 1,
+    package_version: args.packageVersion,
+    model_id: args.modelId,
+    system: args.system,
+    examples: args.examples.map((example) => ({
+      input: example.input,
+      output: example.output,
+      assets: example.input_assets ?? null,
+    })),
+    // The full inference config participates: a different evaluator script,
+    // project, or generation setting must produce a different cache entry.
+    inference: args.config.evaluation.inference,
+    scoring: {
+      mode: args.config.evaluation.scoring.mode,
+      fields: args.config.evaluation.scoring.fields ?? null,
+      evaluationMode: args.config.evaluation.mode,
+      judgeModel: args.config.llm?.model ?? null,
+    },
+  };
+  return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+}
+
+function baselineCachePath(config: LocalRunnerConfig, key: string): string {
+  const root = config.storeRoot ? resolve(config.storeRoot) : defaultLocalHome();
+  return join(root, "cache", "baseline-evals", `${key}.json`);
+}
+
+async function readBaselineCache(path: string): Promise<EvalReport | null> {
+  try {
+    return evalReportSchema.parse(JSON.parse(await readFile(path, "utf8")));
+  } catch {
+    return null;
+  }
+}
+
+let cachedPackageVersion: string | null = null;
+
+async function packageVersion(): Promise<string> {
+  if (cachedPackageVersion === null) {
+    try {
+      const raw = await readFile(new URL("../package.json", import.meta.url), "utf8");
+      cachedPackageVersion = String((JSON.parse(raw) as { version?: unknown }).version ?? "unknown");
+    } catch {
+      cachedPackageVersion = "unknown";
+    }
+  }
+  return cachedPackageVersion;
+}
+
 export async function evaluateExamples(args: {
   kind: "baseline" | "candidate";
   modelId: string;
@@ -564,6 +655,43 @@ export async function evaluateExamples(args: {
   let judgeModelId: string | null = null;
   let generationConfig: Record<string, unknown> | undefined;
 
+  // Baseline outputs and scores are fully determined by the cache key inputs,
+  // so an unchanged baseline can reuse the previous report instead of paying
+  // for inference and judge calls on every run of the same spec.
+  const cacheEligible = args.kind === "baseline"
+    && args.config.evaluation.baselineCache
+    && !args.config.dryRun
+    && inferenceProvider === "transformers";
+  const cacheKey = cacheEligible
+    ? baselineCacheKey({
+        modelId: args.modelId,
+        system: args.system,
+        examples: selected,
+        config: args.config,
+        packageVersion: await packageVersion(),
+      })
+    : null;
+  if (cacheKey) {
+    const cached = await readBaselineCache(baselineCachePath(args.config, cacheKey));
+    if (cached) {
+      const report: EvalReport = {
+        ...cached,
+        cached: true,
+        cache_key: cacheKey,
+        artifact_uri: fileUri(args.outputPath),
+        eval_split: args.evalSplit ?? cached.eval_split,
+      };
+      await writeJson(args.outputPath, report);
+      await args.reporter?.onEvent?.({
+        stage: `evaluating_${args.kind}`,
+        status: "running",
+        message: "Reusing cached baseline evaluation (identical model, examples, and scoring).",
+        details: { cache_key: cacheKey, examples: report.total },
+      });
+      return report;
+    }
+  }
+
   const inferred = inferenceProvider === "transformers"
     ? await runTransformersInference({
         kind: args.kind,
@@ -607,6 +735,7 @@ export async function evaluateExamples(args: {
       });
     }
     let judged: { score: number; passed: boolean; reasoning: string; model: string | null } | null = null;
+    let judgeFellBack = false;
     if (shouldJudge) {
       try {
         judged = await judgeWithOpenRouter({
@@ -622,6 +751,7 @@ export async function evaluateExamples(args: {
         // failing the whole run; with fallback=fail, surface the error.
         if (args.config.evaluation.scoring.fallback === "fail") throw error;
         const message = error instanceof Error ? error.message : String(error);
+        judgeFellBack = true;
         judged = {
           score: exactScore,
           passed: exactScore === 1,
@@ -637,6 +767,13 @@ export async function evaluateExamples(args: {
       : null;
     if (jsonFieldScore) jsonFieldScores.push(jsonFieldScore);
     const score = judged?.score ?? jsonFieldScore?.score ?? exactScore;
+    const scoredBy: EvalExampleResult["scored_by"] = judged
+      ? (judgeFellBack ? "exact_match_fallback" : "llm_judge")
+      : jsonFieldScore
+        ? "json_fields"
+        : inferenceProvider === "none"
+          ? "heuristic"
+          : "exact_match";
     results.push({
       prompt: example.input,
       expected: example.output,
@@ -649,6 +786,7 @@ export async function evaluateExamples(args: {
           ? "OpenRouter judge unavailable; fell back to normalized exact match."
           : "Scored by normalized exact match."),
       latency_ms: latencyMs,
+      scored_by: scoredBy,
     });
   }
 
@@ -665,6 +803,13 @@ export async function evaluateExamples(args: {
   const avgTokenF1 = total > 0
     ? results.reduce((sum, result) => sum + tokenF1(result.expected, result.actual), 0) / total
     : 0;
+  const judgeScored = results.filter((result) => result.scored_by === "llm_judge");
+  const fallbackScoredCount = results.filter((result) => result.scored_by === "exact_match_fallback").length;
+  // Fallback-scored examples mix a different metric into avg_score, so also
+  // report the average over judge-scored examples only.
+  const judgeOnlyAvgScore = judgeScored.length > 0
+    ? judgeScored.reduce((sum, result) => sum + result.score, 0) / judgeScored.length
+    : null;
   const avgLatency = total > 0
     ? Math.round(results.reduce((sum, result) => sum + result.latency_ms, 0) / total)
     : 0;
@@ -691,6 +836,9 @@ export async function evaluateExamples(args: {
     exact_match_rate: exactMatchRate,
     avg_token_f1: avgTokenF1,
     avg_latency_ms: avgLatency,
+    judge_scored_count: judgeScored.length,
+    fallback_scored_count: fallbackScoredCount,
+    judge_only_avg_score: judgeOnlyAvgScore,
     results,
     artifact_uri: fileUri(args.outputPath),
     scoring_method: scoringMethod,
@@ -704,6 +852,13 @@ export async function evaluateExamples(args: {
     log_uri: inferenceProvider === "transformers" ? fileUri(`${args.outputPath}.inference.log`) : undefined,
   };
   await writeJson(args.outputPath, report);
+  if (cacheKey) {
+    // Do not cache reports with fallback-scored examples: a transient judge
+    // failure would otherwise be replayed into every future run.
+    if (fallbackScoredCount === 0) {
+      await writeJson(baselineCachePath(args.config, cacheKey), { ...report, cache_key: cacheKey });
+    }
+  }
   return report;
 }
 
@@ -711,28 +866,39 @@ export function compareEvalReports(baseline: EvalReport, candidate: EvalReport) 
   let regressions = 0;
   let improvements = 0;
   const regressedExamples = [];
+  const taxonomy: Partial<Record<RegressionCategory, number>> = {};
   const count = Math.min(baseline.results.length, candidate.results.length);
   for (let index = 0; index < count; index += 1) {
     const oldScore = baseline.results[index]?.score ?? 0;
-    const newScore = candidate.results[index]?.score ?? 0;
+    const newResult = candidate.results[index];
+    const newScore = newResult?.score ?? 0;
     if (newScore < oldScore) {
       regressions += 1;
+      const category = classifyJudgeReasoning(newResult?.reasoning ?? null, newResult?.scored_by);
+      taxonomy[category] = (taxonomy[category] ?? 0) + 1;
       regressedExamples.push({
         prompt: baseline.results[index]?.prompt ?? "",
         old_score: oldScore,
         new_score: newScore,
+        category,
       });
     } else if (newScore > oldScore) {
       improvements += 1;
     }
   }
+  const judgeOnlyDelta = typeof baseline.judge_only_avg_score === "number"
+    && typeof candidate.judge_only_avg_score === "number"
+    ? candidate.judge_only_avg_score - baseline.judge_only_avg_score
+    : null;
   return {
     avg_score_delta: candidate.avg_score - baseline.avg_score,
     pass_rate_delta: candidate.pass_rate - baseline.pass_rate,
     exact_match_rate_delta: candidate.exact_match_rate - baseline.exact_match_rate,
     token_f1_delta: (candidate.avg_token_f1 ?? 0) - (baseline.avg_token_f1 ?? 0),
+    judge_only_avg_score_delta: judgeOnlyDelta,
     regressions,
     improvements,
+    regression_taxonomy: regressions > 0 ? taxonomy : undefined,
     regressed_examples: regressedExamples,
   };
 }

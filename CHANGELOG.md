@@ -2,6 +2,15 @@
 
 All notable changes to Tuned Tensor Local will be documented in this file.
 
+## 0.1.6 - 2026-07-02
+
+### Added
+
+- Added `tt-local runs compare <run-id-a> <run-id-b>`: aligns two runs on their shared eval prompts and reports per-subset baseline/candidate averages, shared-subset deltas, new-example effects, and judge score noise measured on identical baseline outputs. Headline `avg_score_delta` values are not comparable across different eval subsets; the shared subset is.
+- Added a baseline evaluation cache (default on, `evaluation.baselineCache: false` to disable): re-running a spec with an unchanged base model, eval examples, generation settings, and scoring config reuses the previous baseline report from `<storeRoot>/cache/baseline-evals/` instead of re-running inference and judge calls. Reports served from cache carry `cached: true` and a `cache_key`. Reports containing fallback-scored examples are never cached.
+- Eval reports now record how each example was scored (`results[].scored_by`) and aggregate it as `judge_scored_count`, `fallback_scored_count`, and `judge_only_avg_score`, so transient judge failures that fall back to exact match can no longer silently skew `avg_score` without a trace. The comparison report includes `judge_only_avg_score_delta`.
+- Comparison reports now classify each regressed example's judge reasoning into a coarse category (`factual`, `omission`, `style`, `fallback`, `other`) and aggregate counts as `regression_taxonomy`, answering "what kind of worse?" at a glance.
+
 ## 0.1.5 - 2026-07-02
 
 ### Added
