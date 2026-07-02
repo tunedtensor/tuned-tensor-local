@@ -190,6 +190,15 @@ object for each example. A configured field that is missing from the expected
 JSON is always scored as incorrect (with a reasoning note), so misconfigured
 field lists cannot inflate scores.
 
+The judge receives the spec's compiled system message (system prompt,
+guidelines, and constraints) as task instructions and scores how well each
+output fulfills the task; the expected output is treated as a reference
+answer, not a fact checklist. Every eval report also includes `avg_token_f1`
+(and the comparison includes `token_f1_delta`), a deterministic token-overlap
+similarity against the reference outputs that is useful for free-text tasks
+such as summarization, where exact match is always 0 and judge scores can be
+noisy.
+
 With `"mode": "llm_judge"`, `scoring.fallback` controls what happens when the
 judge is unavailable, a judge request fails, or the judge returns malformed
 JSON. With `"fallback": "exact_match"` (the default), the affected example is
@@ -211,6 +220,14 @@ If you want OpenRouter judging, set your key:
 ```bash
 export OPENROUTER_API_KEY="your_openrouter_key"
 ```
+
+`tt-local` also loads a `.env` file from the working directory (existing
+environment variables win), so the key can live in the project's `.env`
+instead.
+
+`validate` and `run` warn about hyperparameter keys the schema does not
+recognize (for example `per_device_train_batch_size` instead of
+`batch_size`); unknown keys are ignored rather than passed to training.
 
 Run the job:
 

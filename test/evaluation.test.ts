@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { localRunnerConfigSchema } from "../src/contracts.js";
-import { deriveSampleSeed, evaluateExamples, sampleExamples, splitSpecExamples } from "../src/evaluation.js";
+import { buildJudgeMessages, deriveSampleSeed, evaluateExamples, sampleExamples, splitSpecExamples, tokenF1 } from "../src/evaluation.js";
 
 async function writeFakeEvaluator(root: string, actual: string): Promise<string> {
   const path = join(root, "fake-evaluate.py");
@@ -517,4 +517,39 @@ test("transformers evaluation can score generated outputs with OpenRouter judge"
     }
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("tokenF1 scores bag-of-words overlap", () => {
+  assert.equal(tokenF1("Kelly and Mary will wear red dresses.", "Kelly and Mary will wear red dresses."), 1);
+  assert.equal(tokenF1("alpha beta", "gamma delta"), 0);
+  assert.equal(tokenF1("", ""), 1);
+  assert.equal(tokenF1("alpha", ""), 0);
+  // 2-token overlap of 4 expected + 2 actual tokens: p=1, r=0.5, f1=2/3.
+  const partial = tokenF1("alpha beta gamma delta", "Alpha beta");
+  assert.ok(Math.abs(partial - 2 / 3) < 1e-9);
+  // Repeated tokens only match as often as they appear in the expected text.
+  assert.ok(tokenF1("alpha beta", "alpha alpha alpha") < 1);
+});
+
+test("buildJudgeMessages forwards task instructions to the judge", () => {
+  const messages = buildJudgeMessages({
+    prompt: "Summarize this conversation.",
+    expected: "A short summary.",
+    actual: "Another summary.",
+    taskInstructions: "Write one concise sentence.",
+  });
+  assert.equal(messages.length, 2);
+  const payload = JSON.parse(messages[1].content) as Record<string, unknown>;
+  assert.equal(payload.task_instructions, "Write one concise sentence.");
+  assert.equal(payload.prompt, "Summarize this conversation.");
+  assert.equal(payload.expected, "A short summary.");
+  assert.equal(payload.actual, "Another summary.");
+
+  const withoutInstructions = buildJudgeMessages({
+    prompt: "p",
+    expected: "e",
+    actual: "a",
+  });
+  const bare = JSON.parse(withoutInstructions[1].content) as Record<string, unknown>;
+  assert.equal("task_instructions" in bare, false);
 });

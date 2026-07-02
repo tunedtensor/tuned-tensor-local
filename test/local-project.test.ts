@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -7,7 +7,9 @@ import {
   initLocalSpecFile,
   loadLocalRunInput,
   runRequestFromLocalSpec,
+  unknownHyperparameterWarnings,
 } from "../src/local-project.js";
+import { parseDotEnv } from "../src/index.js";
 
 test("initializes a standalone local spec file and converts it to a run request", async () => {
   const root = await mkdtemp(join(tmpdir(), "tt-local-project-test-"));
@@ -62,4 +64,60 @@ test("runRequestFromLocalSpec preserves local spec metadata", () => {
   assert.equal(request.behavior_spec_id, "77777777-7777-4777-8777-777777777777");
   assert.equal(request.run_number, 3);
   assert.equal(request.hyperparameters.n_epochs, 2);
+});
+
+test("unknownHyperparameterWarnings flags stripped keys", () => {
+  const warnings = unknownHyperparameterWarnings({
+    hyperparameters: {
+      n_epochs: 1,
+      per_device_train_batch_size: 2,
+    },
+  });
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /per_device_train_batch_size/);
+  assert.match(warnings[0], /batch_size/);
+
+  assert.deepEqual(unknownHyperparameterWarnings({ hyperparameters: { n_epochs: 1 } }), []);
+  assert.deepEqual(unknownHyperparameterWarnings({}), []);
+  assert.deepEqual(unknownHyperparameterWarnings(null), []);
+});
+
+test("loadLocalRunInput surfaces unknown hyperparameter warnings", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-warnings-"));
+  try {
+    const path = join(root, "tunedtensor.json");
+    await writeFile(path, JSON.stringify({
+      name: "Warning Spec",
+      base_model: "Qwen/Qwen3.5-2B",
+      examples: [{ input: "in", output: "out" }],
+      hyperparameters: {
+        n_epochs: 1,
+        per_device_train_batch_size: 2,
+      },
+    }), "utf8");
+    const input = await loadLocalRunInput(path);
+    assert.equal(input.kind, "spec");
+    assert.equal(input.warnings.length, 1);
+    assert.match(input.warnings[0], /per_device_train_batch_size/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("parseDotEnv parses simple KEY=VALUE lines", () => {
+  const values = parseDotEnv([
+    "# comment",
+    "",
+    "OPENROUTER_API_KEY=sk-test-123",
+    "export QUOTED=\"hello world\"",
+    "SINGLE='one'",
+    "not a valid line",
+    "TRAILING = spaced value ",
+  ].join("\n"));
+  assert.deepEqual(values, {
+    OPENROUTER_API_KEY: "sk-test-123",
+    QUOTED: "hello world",
+    SINGLE: "one",
+    TRAILING: "spaced value",
+  });
 });
