@@ -7,6 +7,7 @@ import type {
   BehaviorSpecExample,
   EvalExampleResult,
   EvalReport,
+  EvalSplit,
   LocalRunnerConfig,
 } from "./contracts.js";
 import { writeJson, fileUri } from "./artifacts.js";
@@ -20,6 +21,74 @@ function normalize(value: string): string {
 
 function scoreActual(expected: string, actual: string): number {
   return normalize(expected) === normalize(actual) ? 1 : 0;
+}
+
+/** Derives a deterministic 32-bit seed from an arbitrary string (FNV-1a). */
+export function deriveSampleSeed(value: string): number {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function mulberry32(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) | 0;
+    let t = Math.imul(state ^ (state >>> 15), 1 | state);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * Selects `count` examples with a seeded shuffle so that truncated evaluation
+ * is a deterministic random sample instead of a dataset-order prefix. The
+ * selected examples keep their original relative order, so baseline and
+ * candidate evaluations that use the same seed score identical examples.
+ */
+export function sampleExamples<T>(examples: T[], count: number, seed: number): T[] {
+  if (count >= examples.length) return examples;
+  const indices = examples.map((_, index) => index);
+  const random = mulberry32(seed);
+  for (let index = indices.length - 1; index > 0; index -= 1) {
+    const swap = Math.floor(random() * (index + 1));
+    [indices[index], indices[swap]] = [indices[swap], indices[index]];
+  }
+  return indices.slice(0, count).sort((left, right) => left - right).map((index) => examples[index]);
+}
+
+/**
+ * Deterministically splits spec examples into a training split and an eval
+ * holdout so that default spec runs do not evaluate on their own training
+ * data. The holdout is a seeded random sample of about `holdoutRatio` of the
+ * examples, with at least 1 holdout and at least 1 training example. Both
+ * splits preserve the original example order. With fewer than 2 examples the
+ * holdout is empty and callers should fall back to training-set evaluation.
+ */
+export function splitSpecExamples<T>(
+  examples: T[],
+  seed: number,
+  holdoutRatio = 0.2,
+): { train: T[]; holdout: T[] } {
+  if (examples.length < 2) return { train: examples, holdout: [] };
+  const holdoutCount = Math.min(
+    examples.length - 1,
+    Math.max(1, Math.round(examples.length * holdoutRatio)),
+  );
+  const indices = examples.map((_, index) => index);
+  const random = mulberry32(seed);
+  for (let index = indices.length - 1; index > 0; index -= 1) {
+    const swap = Math.floor(random() * (index + 1));
+    [indices[index], indices[swap]] = [indices[swap], indices[index]];
+  }
+  const holdoutIndices = new Set(indices.slice(0, holdoutCount));
+  return {
+    train: examples.filter((_, index) => !holdoutIndices.has(index)),
+    holdout: examples.filter((_, index) => holdoutIndices.has(index)),
+  };
 }
 
 function extractJsonObject(value: string): Record<string, unknown> | null {
@@ -94,20 +163,31 @@ function scoreJsonFields(expected: string, actual: string, configuredFields?: st
     && expectedKeys.length === actualKeys.length
     && expectedKeys.every((key, index) => key === actualKeys[index]);
   const fieldResults: Record<string, boolean> = {};
+  const missingExpectedFields: string[] = [];
 
   for (const field of fields) {
+    // A configured field that the expected output does not define cannot be
+    // verified, so it must never count as correct.
+    if (!Object.prototype.hasOwnProperty.call(expectedJson, field)) {
+      missingExpectedFields.push(field);
+      fieldResults[field] = false;
+      continue;
+    }
     fieldResults[field] = actualJson ? jsonValuesEqual(expectedJson[field], actualJson[field]) : false;
   }
 
   const correct = Object.values(fieldResults).filter(Boolean).length;
   const score = fields.length > 0 ? correct / fields.length : 0;
   const passed = fields.length > 0 && correct === fields.length;
+  const missingNote = missingExpectedFields.length > 0
+    ? ` Configured fields missing from expected output scored as incorrect: ${missingExpectedFields.join(", ")}.`
+    : "";
   return {
     score,
     passed,
-    reasoning: actualJson
+    reasoning: (actualJson
       ? `JSON field score: ${correct}/${fields.length} configured fields matched.`
-      : "Actual output is not a JSON object.",
+      : "Actual output is not a JSON object.") + missingNote,
     actualJsonValid: Boolean(actualJson),
     schemaMatch,
     fields,
@@ -363,7 +443,10 @@ async function judgeWithOpenRouter(args: {
     siteUrl: args.config.llm.siteUrl,
     timeoutMs: args.config.evaluation.timeoutMs,
   });
-  const parsed = JSON.parse(result.content) as { score?: unknown; passed?: unknown; reasoning?: unknown };
+  const parsed = extractJsonObject(result.content) as { score?: unknown; passed?: unknown; reasoning?: unknown } | null;
+  if (!parsed) {
+    throw new Error(`OpenRouter judge returned malformed JSON: ${result.content.slice(0, 200)}`);
+  }
   const score = typeof parsed.score === "number"
     ? Math.max(0, Math.min(1, parsed.score))
     : 0;
@@ -389,9 +472,23 @@ export async function evaluateExamples(args: {
   config: LocalRunnerConfig;
   outputPath: string;
   reporter?: LocalRunReporter;
+  maxExamples?: number;
+  evalSplit?: EvalSplit;
+  sampleSeed?: number;
 }): Promise<EvalReport> {
-  const maxExamples = args.config.evaluation.maxExamples ?? args.examples.length;
-  const selected = args.examples.slice(0, maxExamples);
+  // Explicit config takes precedence over the per-run request hyperparameter
+  // (passed by the orchestrator via args.maxExamples).
+  const maxExamples = args.config.evaluation.maxExamples
+    ?? args.maxExamples
+    ?? args.examples.length;
+  const truncated = args.examples.length > maxExamples;
+  // When truncating, take a deterministic seeded sample (not a prefix) so a
+  // sorted or grouped eval file does not bias the evaluated subset. Baseline
+  // and candidate runs receive the same seed and therefore identical examples.
+  const sampleSeed = args.config.evaluation.sampleSeed ?? args.sampleSeed ?? 0;
+  const selected = truncated
+    ? sampleExamples(args.examples, maxExamples, sampleSeed)
+    : args.examples;
   const command = args.kind === "baseline"
     ? args.config.evaluation.baselineCommand
     : args.config.evaluation.candidateCommand;
@@ -456,14 +553,29 @@ export async function evaluateExamples(args: {
         details: { model: args.config.llm?.model, examples: selected.length },
       });
     }
-    const judged = shouldJudge
-      ? await judgeWithOpenRouter({
+    let judged: { score: number; passed: boolean; reasoning: string; model: string | null } | null = null;
+    if (shouldJudge) {
+      try {
+        judged = await judgeWithOpenRouter({
           prompt: example.input,
           expected: example.output,
           actual,
           config: args.config,
-        })
-      : null;
+        });
+      } catch (error) {
+        // Judge request failed or returned malformed output. With
+        // fallback=exact_match, score this example by exact match instead of
+        // failing the whole run; with fallback=fail, surface the error.
+        if (args.config.evaluation.scoring.fallback === "fail") throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        judged = {
+          score: exactScore,
+          passed: exactScore === 1,
+          reasoning: `LLM judge failed (${message.slice(0, 300)}); scored by normalized exact match.`,
+          model: null,
+        };
+      }
+    }
     if (judged?.model) judgeModelId = judged.model;
     const latencyMs = inferredResult?.latency_ms ?? Math.max(0, Math.round(performance.now() - started));
     const jsonFieldScore = scoringMode === "json_fields"
@@ -515,6 +627,8 @@ export async function evaluateExamples(args: {
     eval_examples_total: args.examples.length,
     eval_examples_used: total,
     eval_truncated: args.examples.length > total,
+    eval_split: args.evalSplit,
+    eval_sample_seed: truncated ? sampleSeed : null,
     avg_score: avgScore,
     pass_rate: passRate,
     exact_match_rate: exactMatchRate,

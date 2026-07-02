@@ -12,12 +12,13 @@ import {
   fineTuneRunRequestSchema,
   localRunnerConfigSchema,
   runReportSchema,
+  type EvalSplit,
   type FineTuneRunRequest,
   type LocalRunnerConfig,
   type RunReport,
 } from "./contracts.js";
 import { buildSystemMessage, compileSpecToJsonl, examplesFromChatJsonl, examplesFromSpec } from "./dataset.js";
-import { compareEvalReports, evaluateExamples } from "./evaluation.js";
+import { compareEvalReports, deriveSampleSeed, evaluateExamples, splitSpecExamples } from "./evaluation.js";
 import { launchProcessTraining } from "./process-training.js";
 import type { LocalRunReporter } from "./run-reporter.js";
 import { createLocalStore, type LocalRunStatus } from "./store.js";
@@ -51,9 +52,14 @@ function stripFileUri(path: string): string {
   return path.replace(/^file:\/\//, "");
 }
 
-function selectPrebuiltEvaluationPath(dataset: FineTuneRunRequest["dataset_prebuilt"]): string {
+function selectPrebuiltEvaluation(dataset: FineTuneRunRequest["dataset_prebuilt"]): {
+  path: string;
+  split: EvalSplit;
+} {
   if (!dataset) throw new Error("dataset_prebuilt is required");
-  return stripFileUri(dataset.test ?? dataset.validation ?? dataset.training);
+  if (dataset.test) return { path: stripFileUri(dataset.test), split: "prebuilt_test" };
+  if (dataset.validation) return { path: stripFileUri(dataset.validation), split: "prebuilt_validation" };
+  return { path: stripFileUri(dataset.training), split: "prebuilt_training" };
 }
 
 export async function runLocalFineTune(input: {
@@ -131,26 +137,56 @@ export async function runLocalFineTune(input: {
       details: { artifact_dir: artifacts.runDir },
     });
 
+    // Deterministic per-run seed so the spec holdout split and truncated
+    // sampling are reproducible and identical for baseline and candidate.
+    const evalSampleSeed = config.evaluation.sampleSeed ?? deriveSampleSeed(request.run_id);
     let examples = examplesFromSpec(request.spec_snapshot);
+    // With a single spec example there is nothing to hold out, so evaluation
+    // runs on the training set; eval_split=spec_examples records that.
+    let evalSplit: EvalSplit = "spec_examples";
+    let trainingExampleCount: number | null = examples.length;
     if (request.dataset_prebuilt) {
       const trainingPath = stripFileUri(request.dataset_prebuilt.training);
-      const evaluationPath = selectPrebuiltEvaluationPath(request.dataset_prebuilt);
+      const evaluation = selectPrebuiltEvaluation(request.dataset_prebuilt);
+      evalSplit = evaluation.split;
+      if (evalSplit === "prebuilt_training" && !config.dryRun && !config.evaluation.allowPrebuiltTrainingEval) {
+        throw new Error(
+          "dataset_prebuilt has no test or validation split, so evaluation would run on the training data and "
+          + "overstate improvement. Provide dataset_prebuilt.test or dataset_prebuilt.validation, or set "
+          + "evaluation.allowPrebuiltTrainingEval=true to evaluate on the training split anyway.",
+        );
+      }
       await copyFile(trainingPath, artifacts.trainingJsonl);
-      examples = await examplesFromChatJsonl(evaluationPath);
+      examples = await examplesFromChatJsonl(evaluation.path);
+      trainingExampleCount = null;
     } else {
-      const jsonl = compileSpecToJsonl(request.spec_snapshot);
+      // Split spec examples into train/holdout so evaluation does not score
+      // the same examples the adapter was trained on.
+      const split = splitSpecExamples(request.spec_snapshot.examples, evalSampleSeed);
+      let trainingExamples = request.spec_snapshot.examples;
+      if (split.holdout.length > 0) {
+        trainingExamples = split.train;
+        examples = split.holdout;
+        evalSplit = "spec_holdout";
+      }
+      trainingExampleCount = trainingExamples.length;
+      const jsonl = compileSpecToJsonl({ ...request.spec_snapshot, examples: trainingExamples });
       await writeFile(artifacts.trainingJsonl, `${jsonl}\n`, "utf8");
     }
 
     const system = buildSystemMessage(request.spec_snapshot);
     const baseModelForEvaluation = config.paths.baseModel ?? request.spec_snapshot.base_model;
+    // Explicit config wins; the request hyperparameter fills in when unset.
+    const maxEvalExamples = config.evaluation.maxExamples
+      ?? request.hyperparameters.max_eval_examples;
     await updateRun({
       status: "evaluating_baseline",
       stage: "evaluating_baseline",
       message: "Running baseline evaluation.",
       details: {
         examples: examples.length,
-        eval_examples_used: config.evaluation.maxExamples ?? examples.length,
+        eval_examples_used: Math.min(maxEvalExamples ?? examples.length, examples.length),
+        eval_split: evalSplit,
         model_id: baseModelForEvaluation,
       },
     });
@@ -163,6 +199,9 @@ export async function runLocalFineTune(input: {
       config,
       outputPath: artifacts.baselineEvalJson,
       reporter: runReporter,
+      maxExamples: maxEvalExamples,
+      evalSplit,
+      sampleSeed: evalSampleSeed,
     });
 
     await updateRun({
@@ -189,6 +228,9 @@ export async function runLocalFineTune(input: {
       config,
       outputPath: artifacts.candidateEvalJson,
       reporter: runReporter,
+      maxExamples: maxEvalExamples,
+      evalSplit,
+      sampleSeed: evalSampleSeed,
     });
     const comparison = compareEvalReports(baseline, candidate);
     const completedAt = new Date().toISOString();
@@ -217,9 +259,11 @@ export async function runLocalFineTune(input: {
         dataset_prebuilt: Boolean(request.dataset_prebuilt),
         dataset_uri: fileUri(artifacts.trainingJsonl),
         spec_example_count: request.spec_snapshot.examples.length,
-        training_example_count: request.dataset_prebuilt ? null : request.spec_snapshot.examples.length,
+        training_example_count: trainingExampleCount,
         eval_examples_total: baseline.eval_examples_total,
         eval_examples_used: baseline.eval_examples_used,
+        eval_split: baseline.eval_split,
+        eval_sample_seed: baseline.eval_sample_seed ?? null,
         started_at: startedAt,
         completed_at: completedAt,
         elapsed_ms: duration.ms,
