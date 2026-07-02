@@ -81,6 +81,42 @@ test("transformers evaluation adapter records generated outputs and exact-match 
   }
 });
 
+test("command inference provider runs configured evaluator commands", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-command-eval-test-"));
+  try {
+    const command = [
+      process.execPath,
+      "-e",
+      "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const p=JSON.parse(d);process.stdout.write(JSON.stringify({actual:p.expected}))})",
+    ];
+    const config = localRunnerConfigSchema.parse({
+      dryRun: false,
+      storeRoot: join(root, "store"),
+      evaluation: {
+        inference: { provider: "command" },
+        candidateCommand: command,
+        scoring: { mode: "exact_match" },
+      },
+    });
+    const report = await evaluateExamples({
+      kind: "candidate",
+      modelId: "local-command-model",
+      examples: [{ input: "Classify: good", output: "positive" }],
+      system: "Return labels.",
+      config,
+      outputPath: join(root, "candidate-eval.json"),
+    });
+
+    assert.equal(report.inference_provider, "command");
+    assert.equal(report.scoring_method, "command");
+    assert.equal(report.results[0]?.actual, "positive");
+    assert.equal(report.results[0]?.scored_by, "exact_match");
+    assert.equal(report.avg_score, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("transformers evaluation payload includes image-text loader for multimodal models", async () => {
   const root = await mkdtemp(join(tmpdir(), "tt-local-eval-mm-test-"));
   try {
@@ -227,7 +263,6 @@ test("evaluation records eval split and seeded sample when maxExamples truncates
     const config = localRunnerConfigSchema.parse({
       dryRun: true,
       evaluation: {
-        mode: "heuristic",
         scoring: { mode: "exact_match" },
         maxExamples: 2,
       },
@@ -275,7 +310,7 @@ test("evaluation reports no sample seed when all examples are used", async () =>
   try {
     const config = localRunnerConfigSchema.parse({
       dryRun: true,
-      evaluation: { mode: "heuristic", scoring: { mode: "exact_match" } },
+      evaluation: { scoring: { mode: "exact_match" } },
     });
     const report = await evaluateExamples({
       kind: "baseline",

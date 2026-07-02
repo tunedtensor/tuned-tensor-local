@@ -1,6 +1,6 @@
 # Running On DGX Spark
 
-Tuned Tensor Local expects the Spark to behave like a single Linux GPU host:
+TT Local expects the Spark to behave like a single Linux GPU host:
 uv must be installed, Python dependencies must resolve, and CUDA/PyTorch must be
 able to see the GPU.
 

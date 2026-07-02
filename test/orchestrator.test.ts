@@ -47,7 +47,6 @@ test("runs a dry local workflow and writes compatible artifacts", async () => {
       artifactRoot: join(root, "artifacts"),
       storeRoot: join(root, "store"),
       dryRun: true,
-      evaluation: { mode: "heuristic" },
     });
     const events: Array<{ stage: string; message: string }> = [];
 
@@ -114,7 +113,6 @@ test("spec run with a single example evaluates the training set as spec_examples
       artifactRoot: join(root, "artifacts"),
       storeRoot: join(root, "store"),
       dryRun: true,
-      evaluation: { mode: "heuristic" },
     });
 
     const result = await runLocalFineTune({ request, config });
@@ -154,7 +152,6 @@ test("spec runs hold out ~20% of examples for evaluation deterministically", asy
       artifactRoot: join(root, `artifacts-${suffix}`),
       storeRoot: join(root, `store-${suffix}`),
       dryRun: true,
-      evaluation: { mode: "heuristic" },
     });
 
     const first = await runLocalFineTune({ request: makeRequest(), config: makeConfig("a") });
@@ -231,7 +228,6 @@ test("fails a real run when prebuilt dataset has no test or validation split", a
       artifactRoot: join(root, "artifacts"),
       storeRoot: join(root, "store"),
       dryRun: false,
-      evaluation: { mode: "heuristic" },
     });
 
     await assert.rejects(
@@ -256,7 +252,6 @@ test("dry run evaluates prebuilt training split and records provenance", async (
       artifactRoot: join(root, "artifacts"),
       storeRoot: join(root, "store"),
       dryRun: true,
-      evaluation: { mode: "heuristic" },
     });
 
     const result = await runLocalFineTune({ request, config });
@@ -284,7 +279,6 @@ test("uses request max_eval_examples when config maxExamples is unset", async ()
       artifactRoot: join(root, "artifacts"),
       storeRoot: join(root, "store"),
       dryRun: true,
-      evaluation: { mode: "heuristic" },
     });
 
     const result = await runLocalFineTune({ request, config });
@@ -319,7 +313,7 @@ test("config maxExamples overrides request max_eval_examples", async () => {
       artifactRoot: join(root, "artifacts"),
       storeRoot: join(root, "store"),
       dryRun: true,
-      evaluation: { mode: "heuristic", maxExamples: 3 },
+      evaluation: { maxExamples: 3 },
     });
 
     const result = await runLocalFineTune({ request, config });
@@ -361,7 +355,6 @@ test("uses prebuilt test split for evaluation while preserving training artifact
       artifactRoot: join(root, "artifacts"),
       storeRoot: join(root, "store"),
       dryRun: true,
-      evaluation: { mode: "heuristic" },
     });
 
     const result = await runLocalFineTune({ request, config });

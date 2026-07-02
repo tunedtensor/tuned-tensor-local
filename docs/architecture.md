@@ -1,6 +1,6 @@
 # Architecture
 
-Tuned Tensor Local is organized around a small set of replaceable local
+TT Local is organized around a small set of replaceable local
 adapters. The first implementation targets a single Linux GPU host and is
 packaged as a standalone CLI.
 
