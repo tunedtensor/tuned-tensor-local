@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { cwd } from "node:process";
 import { fileURLToPath } from "node:url";
+import { compareRuns } from "./compare.js";
 import { fineTuneRunRequestSchema, localBehaviorSpecFileSchema, localRunnerConfigSchema, specSnapshotSchema, type LocalRunnerConfig } from "./contracts.js";
 import {
   loadLocalRunnerConfig,
@@ -21,6 +22,7 @@ import {
 } from "./local-project.js";
 import { sanitizeLogLine, type LocalRunProgressEvent, type LocalRunReporter } from "./run-reporter.js";
 
+export * from "./compare.js";
 export * from "./contracts.js";
 export * from "./dataset.js";
 export * from "./orchestrator.js";
@@ -107,7 +109,7 @@ Commands:
   validate [tunedtensor.json|request.json] [--config local-runner.json]
   run [tunedtensor.json|request.json] [--config local-runner.json] [--dry-run] [--verbose] [--quiet]
   serve [--config local-runner.json] [--host 127.0.0.1] [--port 8787]
-  runs list|get|events|watch|report|cancel|reconcile [args] [--config local-runner.json]
+  runs list|get|events|watch|report|compare|cancel|reconcile [args] [--config local-runner.json]
   models list|get [args] [--config local-runner.json]
   specs list|get|import [args] [--config local-runner.json]
   store rebuild-index [--config local-runner.json]
@@ -351,6 +353,16 @@ async function main(argv: string[]): Promise<void> {
       const id = argv[4];
       if (!id) throw new Error("runs report requires <run-id>");
       return printJson(await store.getRunReport(id));
+    }
+    if (subcommand === "compare") {
+      const idA = argv[4];
+      const idB = argv[5];
+      if (!idA || !idB) throw new Error("runs compare requires <run-id-a> <run-id-b>");
+      const [reportA, reportB] = await Promise.all([
+        store.getRunReport(idA),
+        store.getRunReport(idB),
+      ]);
+      return printJson(compareRuns(reportA, reportB));
     }
     if (subcommand === "cancel") {
       const id = argv[4];

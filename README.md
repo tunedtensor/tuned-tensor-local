@@ -199,6 +199,35 @@ similarity against the reference outputs that is useful for free-text tasks
 such as summarization, where exact match is always 0 and judge scores can be
 noisy.
 
+Each eval example records how it was scored (`results[].scored_by`), and the
+report aggregates `judge_scored_count`, `fallback_scored_count`, and
+`judge_only_avg_score`. When a judge request fails transiently and the
+example falls back to exact match, `avg_score` mixes two metrics; use
+`judge_only_avg_score` (and the comparison's `judge_only_avg_score_delta`)
+when comparing judge quality. The comparison also classifies each regressed
+example's judge reasoning as `factual`, `omission`, `style`, `fallback`, or
+`other` and reports the counts in `regression_taxonomy`.
+
+Baseline evaluations are cached under `<storeRoot>/cache/baseline-evals/`:
+re-running a spec with an unchanged base model, eval examples, generation
+settings, and scoring config reuses the previous baseline report instead of
+re-running inference and judge calls. Cached reports carry `cached: true`.
+Set `evaluation.baselineCache: false` to disable. Reports containing
+fallback-scored examples are never cached, so a transient judge failure is
+not replayed into future runs.
+
+To compare two runs whose eval sets may differ (for example after raising
+`evaluation.maxExamples`), use:
+
+```bash
+tt-local runs compare <run-id-a> <run-id-b> --config spark-runner.json
+```
+
+It aligns the runs on their shared eval prompts, reports both runs' averages
+on that shared subset plus the new-example subset separately, and measures
+judge score noise on baseline outputs that are byte-identical across the two
+runs.
+
 With `"mode": "llm_judge"`, `scoring.fallback` controls what happens when the
 judge is unavailable, a judge request fails, or the judge returns malformed
 JSON. With `"fallback": "exact_match"` (the default), the affected example is
@@ -336,6 +365,7 @@ tt-local runs list --config spark-runner.json
 tt-local runs get <run-id> --config spark-runner.json
 tt-local runs events <run-id> --config spark-runner.json
 tt-local runs report <run-id> --config spark-runner.json
+tt-local runs compare <run-id-a> <run-id-b> --config spark-runner.json
 tt-local models list --config spark-runner.json
 tt-local serve --config spark-runner.json
 ```
