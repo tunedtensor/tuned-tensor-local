@@ -51,6 +51,7 @@ export const fineTuneHyperparametersSchema = z.object({
   augment: z.boolean().default(false),
   use_llm_judge: z.boolean().default(false),
   max_eval_examples: z.number().int().min(1).optional(),
+  chat_template_kwargs: z.record(z.string(), z.unknown()).optional(),
 });
 
 export const localArtifactsSchema = z.object({
@@ -263,6 +264,7 @@ export const localRunnerConfigSchema = z.object({
       topP: z.number().min(0).max(1).default(1),
       trustRemoteCode: z.boolean().default(true),
       device: z.enum(["auto", "cpu", "cuda", "mps"]).default("auto"),
+      chatTemplateKwargs: z.record(z.string(), z.unknown()).optional(),
     }).default({
       provider: "transformers",
       script: "training/sft-local/src/evaluate.py",

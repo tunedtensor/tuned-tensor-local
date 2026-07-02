@@ -216,6 +216,25 @@ Set `evaluation.baselineCache: false` to disable. Reports containing
 fallback-scored examples are never cached, so a transient judge failure is
 not replayed into future runs.
 
+For thinking-mode base models (for example `Qwen/Qwen3.5-4B`, whose chat
+template opens a `<think>` block by default and can consume the entire
+`maxNewTokens` budget before any visible answer), forward template kwargs to
+both evaluation and training:
+
+```json
+{
+  "evaluation": {
+    "inference": { "chatTemplateKwargs": { "enable_thinking": false } }
+  }
+}
+```
+
+and in the spec's hyperparameters:
+
+```json
+{ "chat_template_kwargs": { "enable_thinking": false } }
+```
+
 To compare two runs whose eval sets may differ (for example after raising
 `evaluation.maxExamples`), use:
 

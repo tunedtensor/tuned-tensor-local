@@ -29,6 +29,9 @@ export function buildTrainingHyperparameters(request: FineTuneRunRequest): Recor
     save_adapter_only: String(hyper.save_adapter_only),
     requires_hf_token: String(model.requiresHfToken),
     trust_remote_code: String(model.trustRemoteCode),
+    ...(hyper.chat_template_kwargs
+      ? { chat_template_kwargs: JSON.stringify(hyper.chat_template_kwargs) }
+      : {}),
   };
 }
 

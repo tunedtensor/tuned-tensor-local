@@ -56,7 +56,12 @@ def fallback_prompt(system: str, prompt: str) -> str:
     return f"system: {system}\nuser: {prompt}\nassistant:"
 
 
-def format_prompt(tokenizer: Any, system: str, prompt: str) -> str:
+def format_prompt(
+    tokenizer: Any,
+    system: str,
+    prompt: str,
+    chat_template_kwargs: dict[str, Any] | None = None,
+) -> str:
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": prompt},
@@ -66,6 +71,7 @@ def format_prompt(tokenizer: Any, system: str, prompt: str) -> str:
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            **(chat_template_kwargs or {}),
         )
     except Exception:
         return fallback_prompt(system, prompt)
@@ -208,10 +214,11 @@ def generate_text_one(
     system: str,
     example: dict[str, Any],
     generation: dict[str, Any],
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prompt = str(example["input"])
     expected = str(example["output"])
-    formatted = format_prompt(tokenizer, system, prompt)
+    formatted = format_prompt(tokenizer, system, prompt, chat_template_kwargs)
     inputs = tokenizer(formatted, return_tensors="pt")
     target_device = next(model.parameters()).device
     inputs = {key: value.to(target_device) for key, value in inputs.items()}
@@ -242,6 +249,7 @@ def generate_multimodal_one(
     example: dict[str, Any],
     generation: dict[str, Any],
     base_dir: Path,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prompt = str(example["input"])
     expected = str(example["output"])
@@ -257,6 +265,7 @@ def generate_multimodal_one(
         messages,
         tokenize=False,
         add_generation_prompt=True,
+        **(chat_template_kwargs or {}),
     )
     inputs = processor(
         text=[text],
@@ -304,6 +313,7 @@ def main() -> None:
     with TemporaryDirectory() as tmp_dir:
         adapter_path = resolve_adapter_path(payload.get("adapter_path"), Path(tmp_dir))
         generation = payload.get("generation", {})
+        chat_template_kwargs = payload.get("chat_template_kwargs") or None
         base_dir = Path(args.input).parent
         if should_use_multimodal(payload):
             model, processor, _device = load_multimodal_model(payload, adapter_path)
@@ -315,13 +325,21 @@ def main() -> None:
                     example,
                     generation,
                     base_dir,
+                    chat_template_kwargs,
                 )
                 for example in payload.get("examples", [])
             ]
         else:
             model, tokenizer, _device = load_text_model(payload, adapter_path)
             results = [
-                generate_text_one(model, tokenizer, str(payload.get("system", "")), example, generation)
+                generate_text_one(
+                    model,
+                    tokenizer,
+                    str(payload.get("system", "")),
+                    example,
+                    generation,
+                    chat_template_kwargs,
+                )
                 for example in payload.get("examples", [])
             ]
 
