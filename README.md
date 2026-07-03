@@ -263,6 +263,47 @@ incorrect, so a misconfigured field list cannot inflate scores.
 Reports still include `exact_match_rate`, but `avg_score`, `pass_rate`, and
 `json_field_metrics` are based on the selected JSON fields.
 
+## Labeling Data With A Teacher Model
+
+`tt-local label` turns unlabeled inputs into training examples by asking a
+stronger teacher model on OpenRouter to answer each row under your spec's
+system message — the same instructions the fine-tuned model will see at
+inference:
+
+```bash
+export OPENROUTER_API_KEY=...   # or put it in .env
+tt-local label rows.jsonl --output labeled.jsonl
+tt-local label rows.csv --input-column text --model anthropic/claude-fable-5
+```
+
+Sources are JSONL (`{"input": "..."}` per line; rows that already carry an
+`"output"` skip the teacher) or CSV with a header row and `--input-column`.
+The system message comes from `tunedtensor.json` (or `--spec <path>`);
+pass `--system-prompt "..."` to override it. Use `--dry-run` to parse,
+sanitize, and estimate without calling the teacher.
+
+Because rows are sent to OpenRouter, each row is sanitized first:
+secret-like content (API keys, private keys, connection strings) blocks the
+row, and PII (emails, phone numbers, SSNs, card numbers) is redacted before
+sending. The labeled `{"input", "output"}` JSONL, a full per-row
+`rows.jsonl` (including failures for review), and a job report are written
+under `<artifactRoot>/labeling/<job-id>/`.
+
+Teacher behavior is configured in the runner config; the model falls back to
+`llm.model`:
+
+```json
+{
+  "labeling": {
+    "model": "anthropic/claude-fable-5",
+    "maxTokens": 2048,
+    "temperature": 0.2,
+    "concurrency": 4,
+    "maxAttempts": 3
+  }
+}
+```
+
 ## Thinking-Mode Models
 
 Some models, such as `Qwen/Qwen3.5-4B`, may open a hidden thinking block by
@@ -338,6 +379,7 @@ tt-local doctor --config spark-runner.json
 tt-local validate --config spark-runner.json
 tt-local run --config spark-runner.json
 tt-local run --config spark-runner.json --verbose
+tt-local label rows.jsonl --output labeled.jsonl
 tt-local runs list --config spark-runner.json
 tt-local runs get <run-id> --config spark-runner.json
 tt-local runs events <run-id> --config spark-runner.json

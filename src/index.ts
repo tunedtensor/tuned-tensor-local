@@ -7,6 +7,8 @@ import { cwd } from "node:process";
 import { fileURLToPath } from "node:url";
 import { compareRuns } from "./compare.js";
 import { fineTuneRunRequestSchema, localBehaviorSpecFileSchema, localRunnerConfigSchema, specSnapshotSchema, type LocalRunnerConfig } from "./contracts.js";
+import { buildSystemMessage } from "./dataset.js";
+import { runLocalLabelingJob } from "./labeling.js";
 import {
   loadLocalRunnerConfig,
   runLocalFineTune,
@@ -25,6 +27,8 @@ import { sanitizeLogLine, type LocalRunProgressEvent, type LocalRunReporter } fr
 export * from "./compare.js";
 export * from "./contracts.js";
 export * from "./dataset.js";
+export * from "./labeling.js";
+export * from "./labeling-sanitize.js";
 export * from "./orchestrator.js";
 export * from "./local-project.js";
 export * from "./openrouter.js";
@@ -108,6 +112,8 @@ Commands:
   doctor [--config local-runner.json]
   validate [tunedtensor.json|request.json] [--config local-runner.json]
   run [tunedtensor.json|request.json] [--config local-runner.json] [--dry-run] [--verbose] [--quiet]
+  label <input.jsonl|input.csv> [--input-column col] [--spec tunedtensor.json] [--system-prompt "..."]
+        [--model teacher-model] [--output labeled.jsonl] [--config local-runner.json] [--dry-run]
   serve [--config local-runner.json] [--host 127.0.0.1] [--port 8787]
   runs list|get|events|watch|report|compare|cancel|reconcile [args] [--config local-runner.json]
   models list|get [args] [--config local-runner.json]
@@ -129,6 +135,10 @@ const optionNamesWithValues = new Set([
   "--id",
   "--user-id",
   "--run-number",
+  "--input-column",
+  "--system-prompt",
+  "--spec",
+  "--format",
 ]);
 
 function readPositionals(argv: string[], startIndex = 3): string[] {
@@ -315,6 +325,47 @@ async function main(argv: string[]): Promise<void> {
       candidate_eval: result.report.artifact_uris.candidate_eval,
       comparison: result.report.comparison,
     });
+    return;
+  }
+
+  if (command === "label") {
+    const sourcePath = readPositionals(argv)[0];
+    if (!sourcePath) throw new Error("label requires <input.jsonl|input.csv>");
+    const configInput = await configFromArgv(argv);
+    const config = localRunnerConfigSchema.parse({
+      ...configInput,
+      dryRun: hasFlag(argv, "--dry-run") ? true : configInput.dryRun,
+    });
+    const format = readOption(argv, "--format");
+    if (format !== undefined && format !== "jsonl" && format !== "csv") {
+      throw new Error(`--format must be jsonl or csv, got: ${format}`);
+    }
+    let systemMessage = readOption(argv, "--system-prompt");
+    if (!systemMessage) {
+      const specPath = resolve(readOption(argv, "--spec") ?? DEFAULT_LOCAL_SPEC_PATH);
+      let raw: string;
+      try {
+        raw = await readFile(specPath, "utf8");
+      } catch {
+        throw new Error(`Cannot read spec at ${specPath}. Pass --spec <tunedtensor.json> or --system-prompt "..." so the teacher labels under the model's instructions.`);
+      }
+      systemMessage = buildSystemMessage(localBehaviorSpecFileSchema.parse(JSON.parse(raw)));
+    }
+    const result = await runLocalLabelingJob({
+      sourcePath: resolve(sourcePath),
+      format,
+      inputColumn: readOption(argv, "--input-column"),
+      systemMessage,
+      config,
+      outputPath: readOption(argv, "--output"),
+      model: readOption(argv, "--model"),
+      reporter: createConsoleReporter({
+        verbose: hasFlag(argv, "--verbose"),
+        quiet: hasFlag(argv, "--quiet"),
+      }),
+    });
+    printJson(result.report);
+    if (result.report.status === "failed") process.exitCode = 1;
     return;
   }
 
