@@ -2,6 +2,33 @@
 
 All notable changes to TT Local will be documented in this file.
 
+## 0.1.9 - 2026-07-03
+
+### Added
+
+- Added a `tt-local label` command, porting the tuned-tensor-runs teacher
+  labeling job to the local runner. It reads unlabeled JSONL
+  (`{"input": "..."}` rows, optionally pre-labeled with `"output"`) or CSV
+  (`--input-column`) sources, labels pending rows with an OpenRouter teacher
+  model under the spec's system message, and writes a labeled
+  `{"input", "output"}` JSONL, a per-row review file, and a job report under
+  `<artifactRoot>/labeling/<job-id>/`. Supports `--dry-run`, `--output`,
+  `--model`, `--spec`, and `--system-prompt`.
+- Rows are sanitized before leaving the machine: secret-like content (API
+  keys, private keys, connection strings, passwords) blocks the row; PII
+  (emails, phones, SSNs, card numbers) is redacted.
+- Added a `labeling` runner-config block (`model`, `maxTokens`, `temperature`,
+  `concurrency`, `minIntervalMs`, `maxAttempts`, `maxRows`, `timeoutMs`); the
+  teacher model falls back to `llm.model`.
+
+### Changed
+
+- `openRouterChat` now supports free-text responses (`responseFormat:
+  "text"`), `temperature`/`maxTokens` overrides, and returns prompt/completion
+  token usage; it throws a typed `OpenRouterHttpError` so callers can retry
+  retryable statuses. Judge behavior (JSON object output, temperature 0) is
+  unchanged by default.
+
 ## 0.1.8 - 2026-07-02
 
 ### Changed

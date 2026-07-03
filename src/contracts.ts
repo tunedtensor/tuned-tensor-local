@@ -224,6 +224,19 @@ export const runReportSchema = z.object({
 
 export const commandSchema = z.array(z.string().min(1)).min(1);
 
+export const labelingConfigSchema = z.object({
+  /** Teacher model id; falls back to llm.model when unset. */
+  model: z.string().min(1).optional(),
+  maxTokens: z.number().int().min(64).default(2048),
+  /** Low temperature: we want the teacher's best label, not its creativity. */
+  temperature: z.number().min(0).default(0.2),
+  concurrency: z.number().int().min(1).max(32).default(4),
+  minIntervalMs: z.number().int().min(0).default(0),
+  maxAttempts: z.number().int().min(1).max(10).default(3),
+  maxRows: z.number().int().min(1).max(500_000).default(50_000),
+  timeoutMs: z.number().int().min(100).default(120_000),
+});
+
 export const localRunnerConfigSchema = z.object({
   storeRoot: z.string().optional(),
   artifactRoot: z.string().default(".tt-local/artifacts"),
@@ -315,6 +328,15 @@ export const localRunnerConfigSchema = z.object({
     appName: z.string().optional(),
     siteUrl: z.string().url().optional(),
   }).optional(),
+  labeling: labelingConfigSchema.default({
+    maxTokens: 2048,
+    temperature: 0.2,
+    concurrency: 4,
+    minIntervalMs: 0,
+    maxAttempts: 3,
+    maxRows: 50_000,
+    timeoutMs: 120_000,
+  }),
 });
 
 export type DocumentInputAsset = z.infer<typeof documentInputAssetSchema>;
@@ -329,4 +351,5 @@ export type EvalReport = z.infer<typeof evalReportSchema>;
 export type ComparisonReport = z.infer<typeof comparisonReportSchema>;
 export type TrainingReport = z.infer<typeof trainingReportSchema>;
 export type RunReport = z.infer<typeof runReportSchema>;
+export type LocalLabelingConfig = z.infer<typeof labelingConfigSchema>;
 export type LocalRunnerConfig = z.infer<typeof localRunnerConfigSchema>;
