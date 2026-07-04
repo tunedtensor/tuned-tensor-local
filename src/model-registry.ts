@@ -152,6 +152,13 @@ export const TRAINING_MODELS: TrainingModel[] = [
   },
 ];
 
+const EXTERNAL_MODEL_PREFIXES = ["external:", "command:"];
+
+export function isExternalTrainingModel(modelId: string): boolean {
+  const normalized = modelId.trim().toLowerCase();
+  return EXTERNAL_MODEL_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+}
+
 export function resolveTrainingModel(modelId: string): TrainingModel {
   const normalized = modelId.trim().toLowerCase();
   const model = TRAINING_MODELS.find((candidate) =>
@@ -166,5 +173,12 @@ export function resolveTrainingModel(modelId: string): TrainingModel {
 }
 
 export function canonicalizeTrainingModel(modelId: string): string {
+  if (isExternalTrainingModel(modelId)) {
+    const trimmed = modelId.trim();
+    const [prefix, ...rest] = trimmed.split(":");
+    const id = rest.join(":").trim();
+    if (!id) throw new Error(`External model "${modelId}" must include an id after "${prefix}:".`);
+    return `${prefix.toLowerCase()}:${id}`;
+  }
   return resolveTrainingModel(modelId).id;
 }

@@ -401,6 +401,9 @@ writeFileSync(join(process.env.SM_MODEL_DIR, "model.json"), JSON.stringify({
 writeFileSync(join(process.env.SM_MODEL_DIR, "training-metrics.json"), JSON.stringify({
   examples: rows.length,
   n_epochs: Number(hyperparameters.n_epochs),
+  model_mode: hyperparameters.model_mode,
+  model_family: hyperparameters.model_family ?? null,
+  custom_context: hyperparameters.custom_context,
 }, null, 2));
 console.error("{'loss': '0.01', 'epoch': '1.0'}");
 `, "utf8");
@@ -450,10 +453,10 @@ writeFileSync(outputPath, JSON.stringify({
         system_prompt: "Predict the next token.",
         guidelines: [],
         constraints: [],
-        base_model: "Qwen/Qwen3.5-2B",
+        base_model: "external:karpathy/nanogpt",
         examples: [{ input: "spec input", output: "spec output" }],
       },
-      hyperparameters: { n_epochs: 1 },
+      hyperparameters: { n_epochs: 1, custom_context: "tiny" },
       dataset_prebuilt: {
         training: `file://${trainingPath}`,
         test: `file://${testPath}`,
@@ -467,6 +470,12 @@ writeFileSync(outputPath, JSON.stringify({
       training: {
         backend: "command",
         command: [process.execPath, trainer],
+        artifact: {
+          framework: "nanogpt",
+          format: "custom-directory",
+          entrypoint: "batch_command",
+          servable: false,
+        },
       },
       evaluation: {
         inference: {
@@ -483,6 +492,16 @@ writeFileSync(outputPath, JSON.stringify({
     assert.equal(result.report.training.provider, "local-command");
     assert.equal(result.report.training.exit_code, 0);
     assert.equal(result.report.training.metrics?.examples, 2);
+    assert.equal(result.report.training.metrics?.model_mode, "external");
+    assert.equal(result.report.training.metrics?.model_family, null);
+    assert.equal(result.report.training.metrics?.custom_context, "tiny");
+    assert.deepEqual(result.report.training.artifact_metadata, {
+      framework: "nanogpt",
+      format: "custom-directory",
+      entrypoint: "batch_command",
+      servable: false,
+    });
+    assert.equal(result.report.base_model, "external:karpathy/nanogpt");
     assert.equal(result.report.baseline.avg_score, 0);
     assert.equal(result.report.candidate.avg_score, 1);
     assert.equal(result.report.candidate.inference_provider, "batch_command");

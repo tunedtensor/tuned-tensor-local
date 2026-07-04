@@ -52,7 +52,15 @@ export const fineTuneHyperparametersSchema = z.object({
   use_llm_judge: z.boolean().default(false),
   max_eval_examples: z.number().int().min(1).optional(),
   chat_template_kwargs: z.record(z.string(), z.unknown()).optional(),
-});
+}).passthrough();
+
+export const modelArtifactMetadataSchema = z.object({
+  framework: z.string().min(1).optional(),
+  format: z.string().min(1).optional(),
+  entrypoint: z.string().min(1).optional(),
+  servable: z.boolean().optional(),
+  notes: z.string().min(1).optional(),
+}).passthrough();
 
 export const localArtifactsSchema = z.object({
   prefix: z.string().min(1).optional(),
@@ -179,6 +187,7 @@ export const trainingReportSchema = z.object({
   training_job_name: z.string(),
   model_artifact_uri: z.string().optional(),
   base_model_artifact_uri: z.string().optional(),
+  artifact_metadata: modelArtifactMetadataSchema.optional(),
   metrics: z.record(z.string(), z.unknown()).nullable(),
   exit_code: z.number().int().nullable(),
   log_uri: z.string(),
@@ -244,6 +253,7 @@ export const localRunnerConfigSchema = z.object({
   training: z.object({
     backend: z.enum(["uv", "command"]).default("uv"),
     command: commandSchema.optional(),
+    artifact: modelArtifactMetadataSchema.optional(),
     project: z.string().optional(),
     cwd: z.string().optional(),
     module: z.string().optional(),
