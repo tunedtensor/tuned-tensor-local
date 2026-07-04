@@ -55,3 +55,55 @@ test("builds text and multimodal model loader hyperparameters", () => {
   });
   assert.equal(buildTrainingHyperparameters(multimodalRequest).model_loader, "image_text_to_text");
 });
+
+test("command training hyperparameters allow external models and avoid bundled model defaults", () => {
+  const request = fineTuneRunRequestSchema.parse({
+    run_id: "33333333-3333-4333-8333-333333333333",
+    user_id: "user",
+    behavior_spec_id: "44444444-4444-4444-8444-444444444444",
+    run_number: 1,
+    spec_snapshot: {
+      name: "External",
+      description: "",
+      system_prompt: "",
+      base_model: "external:karpathy/nanochat",
+      examples: [{ input: "hello", output: "greeting" }],
+    },
+    hyperparameters: {
+      n_epochs: 1,
+      nanochat_depth: 1,
+      custom_options: { compile: false },
+    },
+  });
+
+  const hyperparameters = buildTrainingHyperparameters(request, { backend: "command" });
+  assert.equal(hyperparameters.base_model, "external:karpathy/nanochat");
+  assert.equal(hyperparameters.model_mode, "external");
+  assert.equal(hyperparameters.nanochat_depth, "1");
+  assert.equal(hyperparameters.custom_options, "{\"compile\":false}");
+  assert.equal(hyperparameters.n_epochs, "1");
+  assert.equal(hyperparameters.model_family, undefined);
+  assert.equal(hyperparameters.model_loader, undefined);
+  assert.equal(hyperparameters.lora_rank, undefined);
+});
+
+test("uv training still rejects external models", () => {
+  const request = fineTuneRunRequestSchema.parse({
+    run_id: "55555555-5555-4555-8555-555555555555",
+    user_id: "user",
+    behavior_spec_id: "66666666-6666-4666-8666-666666666666",
+    run_number: 1,
+    spec_snapshot: {
+      name: "External",
+      description: "",
+      system_prompt: "",
+      base_model: "external:karpathy/nanochat",
+      examples: [{ input: "hello", output: "greeting" }],
+    },
+  });
+
+  assert.throws(
+    () => buildTrainingHyperparameters(request),
+    /Unsupported base model/,
+  );
+});

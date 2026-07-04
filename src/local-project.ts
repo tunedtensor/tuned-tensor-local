@@ -34,10 +34,10 @@ export interface LocalRunInput {
 }
 
 /**
- * Zod strips unrecognized hyperparameter keys, so a typo like
- * `per_device_train_batch_size` (instead of `batch_size`) is silently ignored
- * and the run trains with defaults. Surface those keys as warnings so
- * `validate` and `run` can flag them instead of dropping them without a trace.
+ * Custom command workflows may pass arbitrary hyperparameter keys through to
+ * their adapter. Still surface unfamiliar keys because the bundled trainer
+ * ignores them, and a typo like `per_device_train_batch_size` can otherwise
+ * look valid while the run trains with defaults.
  */
 export function unknownHyperparameterWarnings(raw: unknown): string[] {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
@@ -46,7 +46,7 @@ export function unknownHyperparameterWarnings(raw: unknown): string[] {
   const knownKeys = new Set(Object.keys(fineTuneHyperparametersSchema.shape));
   return Object.keys(hyperparameters as Record<string, unknown>)
     .filter((key) => !knownKeys.has(key))
-    .map((key) => `Unknown hyperparameter "${key}" is ignored. Known keys: ${[...knownKeys].join(", ")}.`);
+    .map((key) => `Unknown hyperparameter "${key}" will be passed through but may be ignored by the default trainer. Known keys: ${[...knownKeys].join(", ")}.`);
 }
 
 async function exists(path: string): Promise<boolean> {

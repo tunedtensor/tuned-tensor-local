@@ -3,11 +3,37 @@ import { join, resolve } from "node:path";
 import type { FineTuneRunRequest, LocalRunnerConfig, TrainingReport } from "./contracts.js";
 import type { RunArtifacts } from "./artifacts.js";
 import { copyDatasetToTrainingChannel, fileUri, writeJson } from "./artifacts.js";
-import { resolveTrainingModel } from "./model-registry.js";
+import { isExternalTrainingModel, resolveTrainingModel } from "./model-registry.js";
 import { buildEntrypointCommand, runLoggedProcess } from "./process-runner.js";
 import type { LocalRunReporter } from "./run-reporter.js";
 
-export function buildTrainingHyperparameters(request: FineTuneRunRequest): Record<string, string> {
+function serializeHyperparameter(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (value === null || value === undefined) return "";
+  return JSON.stringify(value);
+}
+
+function buildCommandTrainingHyperparameters(request: FineTuneRunRequest): Record<string, string> {
+  const hyperparameters = Object.fromEntries(
+    Object.entries(request.hyperparameters)
+      .filter(([, value]) => value !== undefined)
+      .map(([key, value]) => [key, serializeHyperparameter(value)]),
+  );
+  return {
+    ...hyperparameters,
+    run_id: request.run_id,
+    base_model: request.spec_snapshot.base_model,
+    model_mode: isExternalTrainingModel(request.spec_snapshot.base_model) ? "external" : "supported",
+  };
+}
+
+export function buildTrainingHyperparameters(
+  request: FineTuneRunRequest,
+  options: { backend?: LocalRunnerConfig["training"]["backend"] } = {},
+): Record<string, string> {
+  if (options.backend === "command") return buildCommandTrainingHyperparameters(request);
+
   const model = resolveTrainingModel(request.spec_snapshot.base_model);
   const hyper = request.hyperparameters;
   return {
@@ -137,7 +163,7 @@ export async function launchProcessTraining(args: {
   const jobName = `tt-local-${request.run_id}`;
   await mkdir(artifacts.trainingDir, { recursive: true });
   await copyDatasetToTrainingChannel(artifacts);
-  const hyperparameters = buildTrainingHyperparameters(request);
+  const hyperparameters = buildTrainingHyperparameters(request, { backend: config.training.backend });
   await writeJson(join(artifacts.trainingConfigDir, "hyperparameters.json"), hyperparameters);
 
   if (config.dryRun) {
@@ -154,6 +180,7 @@ export async function launchProcessTraining(args: {
       training_job_name: jobName,
       model_artifact_uri: fileUri(artifacts.trainingModelDir),
       base_model_artifact_uri: config.paths.baseModel ? fileUri(config.paths.baseModel) : undefined,
+      artifact_metadata: config.training.artifact,
       metrics: { dry_run: true },
       exit_code: 0,
       log_uri: fileUri(artifacts.trainingLog),
@@ -239,6 +266,7 @@ export async function launchProcessTraining(args: {
     training_job_name: jobName,
     model_artifact_uri: modelUri,
     base_model_artifact_uri: config.paths.baseModel ? fileUri(config.paths.baseModel) : undefined,
+    artifact_metadata: config.training.artifact,
     metrics,
     exit_code: exitCode,
     log_uri: fileUri(artifacts.trainingLog),

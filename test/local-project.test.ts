@@ -66,7 +66,7 @@ test("runRequestFromLocalSpec preserves local spec metadata", () => {
   assert.equal(request.hyperparameters.n_epochs, 2);
 });
 
-test("unknownHyperparameterWarnings flags stripped keys", () => {
+test("unknownHyperparameterWarnings flags pass-through keys that the default trainer may ignore", () => {
   const warnings = unknownHyperparameterWarnings({
     hyperparameters: {
       n_epochs: 1,
@@ -75,6 +75,7 @@ test("unknownHyperparameterWarnings flags stripped keys", () => {
   });
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /per_device_train_batch_size/);
+  assert.match(warnings[0], /passed through/);
   assert.match(warnings[0], /batch_size/);
 
   assert.deepEqual(unknownHyperparameterWarnings({ hyperparameters: { n_epochs: 1 } }), []);
