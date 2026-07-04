@@ -84,13 +84,11 @@ The local store is intentionally transparent and easy to back up:
 - `runs/<run-id>/progress.jsonl`
 - `runs/<run-id>/run-report.json`
 - `models/<model-id>/model.json`
-- `catalog/*.jsonl`
 
 SQLite is the primary metadata index for CLI and dashboard listings. The
 per-object JSON files remain the recoverable source for artifacts and
-human-readable inspection, and catalog JSONL files are retained as a
-compatibility/export layer. `tt-local store rebuild-index` can reconstruct the
-SQLite index and catalog files from the canonical per-object files.
+human-readable inspection. `tt-local store rebuild-index` can reconstruct the
+SQLite index from the canonical per-object files.
 
 ## Dashboard API
 

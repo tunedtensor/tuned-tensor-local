@@ -52,10 +52,6 @@ export interface LocalRunEvent {
   occurred_at: string;
 }
 
-export interface LocalRunIndexRecord extends LocalRunState {
-  catalog_updated_at: string;
-}
-
 export interface LocalModelRecord {
   id: string;
   run_id: string;
@@ -96,7 +92,7 @@ export interface LocalStore {
   completeRun(report: RunReport, artifactDir: string, reportPath: string): Promise<LocalRunState>;
   failRun(runId: string, error: string): Promise<LocalRunState>;
   cancelRun(runId: string): Promise<void>;
-  listRuns(): Promise<LocalRunIndexRecord[]>;
+  listRuns(): Promise<LocalRunState[]>;
   getRun(id: string): Promise<LocalRunState>;
   getRunEvents(id: string): Promise<LocalRunEvent[]>;
   getRunReport(id: string): Promise<RunReport>;
@@ -116,12 +112,7 @@ export function localStorePaths(root: string) {
     runsDir: join(root, "runs"),
     modelsDir: join(root, "models"),
     datasetsDir: join(root, "datasets"),
-    catalogDir: join(root, "catalog"),
     metadataDb: join(root, "metadata.sqlite"),
-    runsCatalog: join(root, "catalog", "runs.jsonl"),
-    specsCatalog: join(root, "catalog", "specs.jsonl"),
-    modelsCatalog: join(root, "catalog", "models.jsonl"),
-    datasetsCatalog: join(root, "catalog", "datasets.jsonl"),
   };
 }
 
@@ -148,15 +139,6 @@ async function readJson<T>(path: string): Promise<T> {
 async function appendJsonl(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await appendFile(path, `${JSON.stringify(value)}\n`, "utf8");
-}
-
-async function readJsonlLatestById<T extends { id: string }>(path: string): Promise<T[]> {
-  if (!(await exists(path))) return [];
-  const rows = (await readFile(path, "utf8"))
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as T);
-  return [...new Map(rows.map((row) => [row.id, row])).values()];
 }
 
 async function readJsonl<T>(path: string): Promise<T[]> {
@@ -191,7 +173,6 @@ type RunRow = {
   updated_at: string;
   started_at: string | null;
   completed_at: string | null;
-  catalog_updated_at: string;
 };
 
 type SpecRow = {
@@ -232,11 +213,6 @@ function initMetadataDb(db: MetadataDb): void {
     PRAGMA foreign_keys = ON;
     PRAGMA busy_timeout = 5000;
 
-    CREATE TABLE IF NOT EXISTS store_meta (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-
     CREATE TABLE IF NOT EXISTS specs (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -263,8 +239,7 @@ function initMetadataDb(db: MetadataDb): void {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       started_at TEXT,
-      completed_at TEXT,
-      catalog_updated_at TEXT NOT NULL
+      completed_at TEXT
     );
 
     CREATE TABLE IF NOT EXISTS run_events (
@@ -317,10 +292,6 @@ function rowToRunState(row: RunRow): LocalRunState {
     ...(row.started_at ? { started_at: row.started_at } : {}),
     ...(row.completed_at ? { completed_at: row.completed_at } : {}),
   };
-}
-
-function rowToRunIndex(row: RunRow): LocalRunIndexRecord {
-  return { ...rowToRunState(row), catalog_updated_at: row.catalog_updated_at };
 }
 
 function rowToSpec(row: SpecRow): LocalSpecRecord {
@@ -383,7 +354,7 @@ function runTransaction<T>(db: MetadataDb, fn: () => T): T {
   }
 }
 
-function bindRunState(stmt: MetadataStatement, state: LocalRunState, catalogUpdatedAt: string): void {
+function bindRunState(stmt: MetadataStatement, state: LocalRunState): void {
   stmt.run(
     state.id,
     state.behavior_spec_id,
@@ -402,17 +373,16 @@ function bindRunState(stmt: MetadataStatement, state: LocalRunState, catalogUpda
     state.updated_at,
     state.started_at ?? null,
     state.completed_at ?? null,
-    catalogUpdatedAt,
   );
 }
 
-function upsertRun(db: MetadataDb, state: LocalRunState, catalogUpdatedAt = new Date().toISOString()): void {
+function upsertRun(db: MetadataDb, state: LocalRunState): void {
   bindRunState(db.prepare(`
     INSERT INTO runs (
       id, behavior_spec_id, user_id, run_number, status, current_stage,
       status_message, artifact_dir, report_path, model_id, error, base_model,
-      spec_name, created_at, updated_at, started_at, completed_at, catalog_updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      spec_name, created_at, updated_at, started_at, completed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       behavior_spec_id = excluded.behavior_spec_id,
       user_id = excluded.user_id,
@@ -429,9 +399,8 @@ function upsertRun(db: MetadataDb, state: LocalRunState, catalogUpdatedAt = new 
       created_at = excluded.created_at,
       updated_at = excluded.updated_at,
       started_at = excluded.started_at,
-      completed_at = excluded.completed_at,
-      catalog_updated_at = excluded.catalog_updated_at
-  `), state, catalogUpdatedAt);
+      completed_at = excluded.completed_at
+  `), state);
 }
 
 function upsertSpec(db: MetadataDb, record: LocalSpecRecord): void {
@@ -505,43 +474,19 @@ export function createLocalStore(root = defaultLocalHome()): LocalStore {
   const specPath = (id: string) => join(specDir(id), "spec.json");
   const modelPath = (id: string) => join(paths.modelsDir, id, "model.json");
 
-  async function importLegacyCatalogsIfNeeded() {
-    const imported = withMetadataDb(paths, (db) =>
-      (db.prepare("SELECT value FROM store_meta WHERE key = ?").get("legacy_catalogs_imported") as { value?: string } | undefined)?.value
-    );
-    if (imported === "true") return;
-
-    const [runs, specs, models] = await Promise.all([
-      readJsonlLatestById<LocalRunIndexRecord>(paths.runsCatalog),
-      readJsonlLatestById<LocalSpecRecord>(paths.specsCatalog),
-      readJsonlLatestById<LocalModelRecord>(paths.modelsCatalog),
-    ]);
-
-    withMetadataDb(paths, (db) => runTransaction(db, () => {
-      for (const run of runs) upsertRun(db, run, run.catalog_updated_at);
-      for (const spec of specs) upsertSpec(db, spec);
-      for (const model of models) upsertModel(db, model);
-      db.prepare("INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)").run("legacy_catalogs_imported", "true");
-    }));
-  }
-
   async function ensure() {
     await Promise.all([
       mkdir(paths.specsDir, { recursive: true }),
       mkdir(paths.runsDir, { recursive: true }),
       mkdir(paths.modelsDir, { recursive: true }),
       mkdir(paths.datasetsDir, { recursive: true }),
-      mkdir(paths.catalogDir, { recursive: true }),
     ]);
     withMetadataDb(paths, () => undefined);
-    await importLegacyCatalogsIfNeeded();
   }
 
   async function writeRunState(state: LocalRunState): Promise<LocalRunState> {
-    const catalogUpdatedAt = new Date().toISOString();
     await writeJsonAtomic(runStatePath(state.id), state);
-    await appendJsonl(paths.runsCatalog, { ...state, catalog_updated_at: catalogUpdatedAt });
-    withMetadataDb(paths, (db) => upsertRun(db, state, catalogUpdatedAt));
+    withMetadataDb(paths, (db) => upsertRun(db, state));
     return state;
   }
 
@@ -568,7 +513,7 @@ export function createLocalStore(root = defaultLocalHome()): LocalStore {
     if (await exists(runStatePath(id))) return id;
     const records = withMetadataDb(paths, (db) => db.prepare(`
       SELECT * FROM runs WHERE id = ? OR id LIKE ? ORDER BY updated_at DESC
-    `).all(id, `${id}%`) as RunRow[]).map(rowToRunIndex);
+    `).all(id, `${id}%`) as RunRow[]).map(rowToRunState);
     const record = records.find((row) => row.id === id || row.id.startsWith(id));
     if (!record) throw new Error(`Run not found: ${id}`);
     return record.id;
@@ -598,7 +543,6 @@ export function createLocalStore(root = defaultLocalHome()): LocalStore {
         updated_at: now,
       };
       await writeJsonAtomic(specPath(specId), spec);
-      await appendJsonl(paths.specsCatalog, record);
       withMetadataDb(paths, (db) => upsertSpec(db, record));
       return record;
     },
@@ -692,7 +636,6 @@ export function createLocalStore(root = defaultLocalHome()): LocalStore {
         created_at: completedAt,
       };
       await writeJsonAtomic(modelPath(model.id), model);
-      await appendJsonl(paths.modelsCatalog, model);
       withMetadataDb(paths, (db) => upsertModel(db, model));
       return state;
     },
@@ -731,7 +674,7 @@ export function createLocalStore(root = defaultLocalHome()): LocalStore {
     async listRuns() {
       await ensure();
       return withMetadataDb(paths, (db) =>
-        (db.prepare("SELECT * FROM runs ORDER BY updated_at DESC").all() as RunRow[]).map(rowToRunIndex)
+        (db.prepare("SELECT * FROM runs ORDER BY updated_at DESC").all() as RunRow[]).map(rowToRunState)
       );
     },
 
@@ -772,14 +715,14 @@ export function createLocalStore(root = defaultLocalHome()): LocalStore {
 
     async rebuildIndexes() {
       await ensure();
-      const runRecords: LocalRunIndexRecord[] = [];
+      const runRecords: LocalRunState[] = [];
       const eventRecords: LocalRunEvent[] = [];
       for (const entry of await readdir(paths.runsDir, { withFileTypes: true }).catch(() => [])) {
         if (!entry.isDirectory()) continue;
         const statePath = runStatePath(entry.name);
         if (await exists(statePath)) {
           const state = await readJson<LocalRunState>(statePath);
-          runRecords.push({ ...state, catalog_updated_at: new Date().toISOString() });
+          runRecords.push(state);
         }
         eventRecords.push(...await readJsonl<LocalRunEvent>(runEventsPath(entry.name)));
       }
@@ -799,17 +742,12 @@ export function createLocalStore(root = defaultLocalHome()): LocalStore {
         const path = modelPath(entry.name);
         if (await exists(path)) modelRecords.push(await readJson<LocalModelRecord>(path));
       }
-      await writeFile(paths.runsCatalog, runRecords.map((row) => JSON.stringify(row)).join("\n") + (runRecords.length ? "\n" : ""), "utf8");
-      await writeFile(paths.specsCatalog, specRecords.map((row) => JSON.stringify(row)).join("\n") + (specRecords.length ? "\n" : ""), "utf8");
-      await writeFile(paths.modelsCatalog, modelRecords.map((row) => JSON.stringify(row)).join("\n") + (modelRecords.length ? "\n" : ""), "utf8");
-      await writeFile(paths.datasetsCatalog, "", "utf8");
       withMetadataDb(paths, (db) => runTransaction(db, () => {
         db.exec("DELETE FROM run_events; DELETE FROM runs; DELETE FROM specs; DELETE FROM models;");
-        for (const run of runRecords) upsertRun(db, run, run.catalog_updated_at);
+        for (const run of runRecords) upsertRun(db, run);
         for (const spec of specRecords) upsertSpec(db, spec);
         for (const model of modelRecords) upsertModel(db, model);
         for (const event of eventRecords) insertEvent(db, event);
-        db.prepare("INSERT OR REPLACE INTO store_meta (key, value) VALUES (?, ?)").run("legacy_catalogs_imported", "true");
       }));
     },
   };
