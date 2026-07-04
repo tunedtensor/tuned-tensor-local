@@ -2,7 +2,7 @@
 
 All notable changes to TT Local will be documented in this file.
 
-## 0.1.9 - 2026-07-03
+## 0.2.0 - 2026-07-04
 
 ### Added
 
@@ -12,6 +12,11 @@ All notable changes to TT Local will be documented in this file.
   rebuilds SQLite metadata from canonical per-object files. The SQLite index
   uses `better-sqlite3` instead of Node's experimental built-in SQLite API,
   avoiding runtime experimental warnings on Node 22.
+
+## 0.1.9 - 2026-07-03
+
+### Added
+
 - Added a `tt-local label` command, porting the tuned-tensor-runs teacher
   labeling job to the local runner. It reads unlabeled JSONL
   (`{"input": "..."}` rows, optionally pre-labeled with `"output"`) or CSV
