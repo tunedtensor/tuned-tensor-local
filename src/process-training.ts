@@ -4,7 +4,7 @@ import type { FineTuneRunRequest, LocalRunnerConfig, TrainingReport } from "./co
 import type { RunArtifacts } from "./artifacts.js";
 import { copyDatasetToTrainingChannel, fileUri, writeJson } from "./artifacts.js";
 import { resolveTrainingModel } from "./model-registry.js";
-import { buildUvPythonArgs, runLoggedProcess } from "./process-runner.js";
+import { buildEntrypointCommand, runLoggedProcess } from "./process-runner.js";
 import type { LocalRunReporter } from "./run-reporter.js";
 
 export function buildTrainingHyperparameters(request: FineTuneRunRequest): Record<string, string> {
@@ -41,10 +41,6 @@ async function pathExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-function buildUvArgs(training: LocalRunnerConfig["training"]): string[] {
-  return buildUvPythonArgs(training, { defaultScript: "training/sft-local/src/train.py" });
 }
 
 export interface TrainingProgressSnapshot {
@@ -145,25 +141,29 @@ export async function launchProcessTraining(args: {
   await writeJson(join(artifacts.trainingConfigDir, "hyperparameters.json"), hyperparameters);
 
   if (config.dryRun) {
+    const dryCommand = config.training.backend === "command" && !config.training.command
+      ? null
+      : buildEntrypointCommand(config.training, { defaultScript: "training/sft-local/src/train.py" });
     await writeFile(
       artifacts.trainingLog,
-      "Dry run enabled. uv training process was not launched.\n",
+      "Dry run enabled. Training process was not launched.\n",
       "utf8",
     );
     return {
-      provider: "local-uv",
+      provider: config.training.backend === "command" ? "local-command" : "local-uv",
       training_job_name: jobName,
       model_artifact_uri: fileUri(artifacts.trainingModelDir),
       base_model_artifact_uri: config.paths.baseModel ? fileUri(config.paths.baseModel) : undefined,
       metrics: { dry_run: true },
       exit_code: 0,
       log_uri: fileUri(artifacts.trainingLog),
-      command: ["uv", ...buildUvArgs(config.training)],
+      command: dryCommand?.displayCommand,
     };
   }
 
-  const uvArgs = buildUvArgs(config.training);
-  const command = ["uv", ...uvArgs];
+  const entrypoint = buildEntrypointCommand(config.training, { defaultScript: "training/sft-local/src/train.py" });
+  const command = entrypoint.displayCommand;
+  const provider = entrypoint.kind === "uv" ? "local-uv" : "local-command";
   const childEnv: NodeJS.ProcessEnv = {
     ...process.env,
     ...config.training.env,
@@ -184,7 +184,7 @@ export async function launchProcessTraining(args: {
   await args.reporter?.onEvent?.({
     stage: "training",
     status: "running",
-    message: "Starting uv training process.",
+    message: "Starting local training process.",
     details: {
       command,
       log_path: artifacts.trainingLog,
@@ -195,8 +195,8 @@ export async function launchProcessTraining(args: {
 
   const forwardTrainingProgress = createTrainingProgressForwarder(args.reporter);
   const { exitCode } = await runLoggedProcess({
-    command: "uv",
-    commandArgs: uvArgs,
+    command: entrypoint.command,
+    commandArgs: entrypoint.commandArgs,
     cwd: config.training.cwd,
     env: childEnv,
     logPath: artifacts.trainingLog,
@@ -211,7 +211,7 @@ export async function launchProcessTraining(args: {
     : null;
 
   if (exitCode !== 0) {
-    throw new Error(`uv training exited with code ${exitCode}. See ${artifacts.trainingLog}.`);
+    throw new Error(`Training process exited with code ${exitCode}. See ${artifacts.trainingLog}.`);
   }
 
   const modelTarPath = join(artifacts.trainingOutputDir, "model.tar.gz");
@@ -225,7 +225,7 @@ export async function launchProcessTraining(args: {
   await args.reporter?.onEvent?.({
     stage: "training",
     status: "running",
-    message: "uv training process completed.",
+    message: "Training process completed.",
     details: {
       exit_code: exitCode,
       model_artifact_uri: modelUri,
@@ -235,7 +235,7 @@ export async function launchProcessTraining(args: {
   });
 
   return {
-    provider: "local-uv",
+    provider,
     training_job_name: jobName,
     model_artifact_uri: modelUri,
     base_model_artifact_uri: config.paths.baseModel ? fileUri(config.paths.baseModel) : undefined,

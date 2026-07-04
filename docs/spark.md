@@ -41,7 +41,8 @@ tt-local run examples/smoke-run-request.json --config examples/local-runner.json
 
 ## Real Training
 
-For real training, set `dryRun: false` and configure the uv training entrypoint:
+For real training with the bundled SFT workflow, set `dryRun: false` and
+configure the uv training entrypoint:
 
 ```json
 {
@@ -72,6 +73,33 @@ evaluation loads the original Hugging Face model, and candidate evaluation loads
 that same base model plus the fine-tuned artifact from the run directory. Set
 `paths.modelCache` to a persistent Spark-local cache so training and evaluation
 reuse downloads.
+
+Custom workflows such as a from-scratch nanoGPT trainer can use command
+entrypoints instead:
+
+```json
+{
+  "artifactRoot": "/home/eve/tt-local-artifacts",
+  "dryRun": false,
+  "training": {
+    "backend": "command",
+    "command": ["python", "nanogpt/train.py"]
+  },
+  "evaluation": {
+    "inference": {
+      "provider": "batch_command",
+      "command": ["python", "nanogpt/evaluate.py"]
+    },
+    "scoring": {
+      "mode": "exact_match"
+    }
+  }
+}
+```
+
+The training command receives the same environment variables listed above. The
+batch evaluator is called with `--input <path> --output <path>` and should write
+the same results JSON shape as the bundled evaluator.
 
 The included first-pass SFT script can be run by the local runner through uv:
 

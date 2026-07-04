@@ -2,6 +2,16 @@
 
 All notable changes to TT Local will be documented in this file.
 
+## 0.2.1 - 2026-07-04
+
+### Added
+
+- Added command-based local training with `training.backend: "command"` and
+  `training.command`, while preserving the existing uv script/module path.
+- Added `evaluation.inference.provider: "batch_command"` with
+  `evaluation.inference.command` for custom batch evaluators that consume the
+  same `--input`/`--output` JSON files as the bundled Transformers evaluator.
+
 ## 0.2.0 - 2026-07-04
 
 ### Added

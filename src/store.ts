@@ -57,7 +57,7 @@ export interface LocalModelRecord {
   run_id: string;
   behavior_spec_id: string;
   name: string;
-  provider: "local-uv";
+  provider: "local-uv" | "local-command";
   base_model: string;
   artifact_uri: string;
   artifact_dir: string;
@@ -189,7 +189,7 @@ type ModelRow = {
   run_id: string;
   behavior_spec_id: string;
   name: string;
-  provider: "local-uv";
+  provider: "local-uv" | "local-command";
   base_model: string;
   artifact_uri: string;
   artifact_dir: string;
@@ -628,7 +628,7 @@ export function createLocalStore(root = defaultLocalHome()): LocalStore {
         run_id: report.run_id,
         behavior_spec_id: report.behavior_spec_id,
         name: `${report.run_metadata?.base_model ?? report.base_model} (${report.run_id.slice(0, 8)})`,
-        provider: "local-uv",
+        provider: report.training.provider,
         base_model: report.base_model,
         artifact_uri: report.fine_tuned_model_id,
         artifact_dir: artifactDir,
