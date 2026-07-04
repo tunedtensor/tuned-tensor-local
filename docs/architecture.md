@@ -13,8 +13,9 @@ packaged as a standalone CLI.
   compatible hosted exports.
 - Artifact store: writes datasets, logs, model outputs, and reports beneath a
   configured local artifact root.
-- Local state store: persists specs, runs, progress events, reports, and model
-  records as JSON/JSONL under a configured `storeRoot` for the dashboard and CLI.
+- Local state store: keeps a SQLite metadata index for specs, runs, progress
+  events, and model records while preserving JSON/JSONL files under a
+  configured `storeRoot` for portable artifacts, recovery, and inspection.
 - Training adapter: launches a uv-managed Python process with local input,
   model cache, and output directories passed through environment variables.
 - Evaluation adapter: runs local Hugging Face/PEFT inference for baseline and
@@ -43,7 +44,7 @@ The first runnable milestone should support:
 - one local run at a time;
 - one GPU device;
 - local filesystem artifacts;
-- local file-backed run/model/spec tracking;
+- SQLite-backed run/model/spec tracking with recoverable JSON files;
 - standalone `tt-local init`, `validate`, `run`, `serve`, and inspection
   commands;
 - uv-based training;
@@ -76,21 +77,23 @@ comparison less direct.
 
 The local store is intentionally transparent and easy to back up:
 
+- `metadata.sqlite`
 - `specs/<spec-id>/spec.json`
 - `runs/<run-id>/request.json`
 - `runs/<run-id>/state.json`
 - `runs/<run-id>/progress.jsonl`
 - `runs/<run-id>/run-report.json`
 - `models/<model-id>/model.json`
-- `catalog/*.jsonl`
 
-Catalog files are append-only indexes for fast listing. `tt-local store
-rebuild-index` can reconstruct them from the canonical per-object files.
+SQLite is the primary metadata index for CLI and dashboard listings. The
+per-object JSON files remain the recoverable source for artifacts and
+human-readable inspection. `tt-local store rebuild-index` can reconstruct the
+SQLite index from the canonical per-object files.
 
 ## Dashboard API
 
-The local server is a lightweight Node HTTP server, not a separate database.
-Current endpoints include:
+The local server is a lightweight Node HTTP server backed by the local state
+store. Current endpoints include:
 
 - `GET /api/health`
 - `GET /api/runs`, `GET /api/runs/:id`, `GET /api/runs/:id/events`

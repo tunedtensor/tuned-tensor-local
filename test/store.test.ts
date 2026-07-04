@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fineTuneRunRequestSchema, runReportSchema } from "../src/contracts.js";
-import { createLocalStore } from "../src/store.js";
+import { createLocalStore, type LocalStore } from "../src/store.js";
 
 const runId = "33333333-3333-4333-8333-333333333333";
 const specId = "44444444-4444-4444-8444-444444444444";
@@ -107,6 +107,23 @@ function reportFixture(reportPath: string) {
   });
 }
 
+async function exists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function removeMetadataDb(store: LocalStore): Promise<void> {
+  await Promise.all([
+    rm(store.paths.metadataDb, { force: true }),
+    rm(`${store.paths.metadataDb}-shm`, { force: true }),
+    rm(`${store.paths.metadataDb}-wal`, { force: true }),
+  ]);
+}
+
 test("local store persists runs, events, reports, specs, and model records", async () => {
   const root = await mkdtemp(join(tmpdir(), "tt-local-store-test-"));
   try {
@@ -134,10 +151,46 @@ test("local store persists runs, events, reports, specs, and model records", asy
     assert.equal((await store.getRunReport(runId)).run_id, runId);
     assert.equal((await store.listModels())[0]?.run_id, runId);
     assert.equal((await store.getSpec(specId.slice(0, 8))).spec.name, "Local Store Spec");
+    assert.equal(await exists(join(store.root, "catalog")), false);
 
     await store.rebuildIndexes();
     assert.equal((await store.listRuns())[0]?.id, runId);
     assert.match(await readFile(join(artifactDir, "progress.jsonl"), "utf8"), /Training/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("local store rebuilds SQLite metadata from canonical files", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-store-rebuild-test-"));
+  try {
+    const store = createLocalStore(join(root, "store"));
+    const artifactDir = join(root, "artifacts", runId);
+    const request = requestFixture();
+    const reportPath = join(artifactDir, "run-report.json");
+    await store.startRun({ request, artifactDir });
+    await store.updateRun({
+      runId,
+      status: "training",
+      stage: "training",
+      message: "Training.",
+      details: { dry_run: true },
+    });
+
+    const report = reportFixture(reportPath);
+    await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+    await store.completeRun(report, artifactDir, reportPath);
+
+    await removeMetadataDb(store);
+    assert.equal((await store.listRuns()).length, 0);
+    assert.equal((await store.getRunEvents(runId)).length, 3);
+
+    await store.rebuildIndexes();
+    assert.equal((await store.listRuns())[0]?.id, runId);
+    assert.equal((await store.getRunEvents(runId)).length, 3);
+    assert.equal((await store.listSpecs())[0]?.id, specId);
+    assert.equal((await store.listModels())[0]?.id, `local-${runId}`);
+    assert.equal(await exists(join(store.root, "catalog")), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

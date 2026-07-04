@@ -1,6 +1,6 @@
 {
   "name": "@tuned-tensor/local",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "TT Local: tuning tensors locally on hardware you control.",
   "license": "Apache-2.0",
   "private": false,
@@ -34,11 +34,13 @@
     "node": ">=22"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.0.0",
     "tsx": "^4.22.4",
     "typescript": "^6.0.0"
   },
   "dependencies": {
+    "better-sqlite3": "^12.11.1",
     "zod": "^4.4.3"
   }
 }
