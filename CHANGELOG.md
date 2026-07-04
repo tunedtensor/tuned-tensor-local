@@ -6,6 +6,11 @@ All notable changes to TT Local will be documented in this file.
 
 ### Added
 
+- Added a hybrid local state store: `metadata.sqlite` now indexes specs, runs,
+  run events, and models for CLI/dashboard queries while preserving the
+  transparent JSON/JSONL artifact layout. `tt-local store rebuild-index`
+  rebuilds both SQLite metadata and legacy catalog files from canonical
+  per-object files.
 - Added a `tt-local label` command, porting the tuned-tensor-runs teacher
   labeling job to the local runner. It reads unlabeled JSONL
   (`{"input": "..."}` rows, optionally pre-labeled with `"output"`) or CSV

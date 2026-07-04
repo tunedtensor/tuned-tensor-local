@@ -135,6 +135,15 @@ test("local store persists runs, events, reports, specs, and model records", asy
     assert.equal((await store.listModels())[0]?.run_id, runId);
     assert.equal((await store.getSpec(specId.slice(0, 8))).spec.name, "Local Store Spec");
 
+    await Promise.all([
+      rm(store.paths.runsCatalog, { force: true }),
+      rm(store.paths.specsCatalog, { force: true }),
+      rm(store.paths.modelsCatalog, { force: true }),
+    ]);
+    assert.equal((await store.listRuns())[0]?.id, runId);
+    assert.equal((await store.listSpecs())[0]?.id, specId);
+    assert.equal((await store.listModels())[0]?.id, `local-${runId}`);
+
     await store.rebuildIndexes();
     assert.equal((await store.listRuns())[0]?.id, runId);
     assert.match(await readFile(join(artifactDir, "progress.jsonl"), "utf8"), /Training/);
