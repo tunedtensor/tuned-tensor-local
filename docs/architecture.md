@@ -16,11 +16,13 @@ packaged as a standalone CLI.
 - Local state store: keeps a SQLite metadata index for specs, runs, progress
   events, and model records while preserving JSON/JSONL files under a
   configured `storeRoot` for portable artifacts, recovery, and inspection.
-- Training adapter: launches a uv-managed Python process with local input,
-  model cache, and output directories passed through environment variables.
-- Evaluation adapter: runs local Hugging Face/PEFT inference for baseline and
-  candidate evaluation. Evaluation can also use an OpenRouter LLM judge to score
-  locally generated outputs.
+- Training adapter: launches either a uv-managed Python process or an arbitrary
+  command with local input, model cache, and output directories passed through
+  environment variables.
+- Evaluation adapter: runs local Hugging Face/PEFT inference, an arbitrary
+  batch command, or per-example commands for baseline and candidate evaluation.
+  Evaluation can also use an OpenRouter LLM judge to score locally generated
+  outputs.
 - Report writer: emits structured JSON reports that are portable across local
   and hosted environments.
 - Dashboard/API server: serves local run/model/spec metadata from the local
@@ -47,8 +49,9 @@ The first runnable milestone should support:
 - SQLite-backed run/model/spec tracking with recoverable JSON files;
 - standalone `tt-local init`, `validate`, `run`, `serve`, and inspection
   commands;
-- uv-based training;
-- native Transformers/PEFT evaluation with optional OpenRouter judge scoring;
+- uv-based or command-based training;
+- native Transformers/PEFT, batch-command, or per-example command evaluation
+  with optional OpenRouter judge scoring;
 - local dashboard and CLI inspection commands;
 - a tiny smoke-run fixture that finishes quickly.
 
@@ -57,12 +60,12 @@ The first runnable milestone should support:
 The public runner should accept a plain JSON run request and a local runner
 configuration. The run request describes the behavior spec, base model,
 examples, and hyperparameters. The local runner configuration describes artifact
-paths, store paths, uv entrypoint settings, model cache paths, OpenRouter judge
-settings, and timeout limits.
+paths, store paths, uv or command entrypoint settings, model cache paths,
+OpenRouter judge settings, and timeout limits.
 
 ## Evaluation Loop
 
-The local loop intentionally compares like-for-like model artifacts:
+The default Transformers loop intentionally compares like-for-like model artifacts:
 
 - baseline loads the original Hugging Face base model from the behavior spec;
 - training writes a Hugging Face/PEFT artifact under the run directory;
@@ -72,6 +75,12 @@ The local loop intentionally compares like-for-like model artifacts:
 The first native backend is `transformers`. `llama.cpp`/GGUF conversion is not
 part of the default path because conversion would make the baseline/candidate
 comparison less direct.
+
+Custom model families can use `training.backend: "command"` and
+`evaluation.inference.provider: "batch_command"`. Batch evaluators receive the
+same `--input`/`--output` JSON files as the bundled Transformers evaluator, so a
+custom workflow can load any artifact format as long as it writes compatible
+evaluation results.
 
 ## Local State Layout
 

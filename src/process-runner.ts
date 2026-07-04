@@ -5,6 +5,8 @@ import { dirname, resolve } from "node:path";
 import { forwardStreamLines, type LocalRunReporter } from "./run-reporter.js";
 
 export interface UvPythonEntrypointConfig {
+  backend?: "uv" | "command";
+  command?: string[];
   project?: string;
   cwd?: string;
   module?: string;
@@ -32,6 +34,33 @@ export function buildUvPythonArgs(
   }
   args.push(...(entrypoint.args ?? []), ...(options.extraArgs ?? []));
   return args;
+}
+
+export function buildEntrypointCommand(
+  entrypoint: UvPythonEntrypointConfig,
+  options: { defaultScript?: string; extraArgs?: string[] } = {},
+): { command: string; commandArgs: string[]; displayCommand: string[]; kind: "uv" | "command" } {
+  if (entrypoint.backend === "command") {
+    const [command, ...baseArgs] = entrypoint.command ?? [];
+    if (!command) {
+      throw new Error("command entrypoint requires command");
+    }
+    const commandArgs = [...baseArgs, ...(entrypoint.args ?? []), ...(options.extraArgs ?? [])];
+    return {
+      command,
+      commandArgs,
+      displayCommand: [command, ...commandArgs],
+      kind: "command",
+    };
+  }
+
+  const commandArgs = buildUvPythonArgs(entrypoint, options);
+  return {
+    command: "uv",
+    commandArgs,
+    displayCommand: ["uv", ...commandArgs],
+    kind: "uv",
+  };
 }
 
 export interface LoggedProcessResult {

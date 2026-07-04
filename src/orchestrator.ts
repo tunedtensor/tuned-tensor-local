@@ -207,7 +207,7 @@ export async function runLocalFineTune(input: {
     await updateRun({
       status: "training",
       stage: "training",
-      message: config.dryRun ? "Recording dry-run training result." : "Launching local uv training process.",
+      message: config.dryRun ? "Recording dry-run training result." : "Launching local training process.",
       details: { training_backend: config.training.backend, dry_run: config.dryRun },
     });
     const training = await launchProcessTraining({ request, artifacts, config, reporter: runReporter });

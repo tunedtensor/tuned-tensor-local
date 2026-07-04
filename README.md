@@ -18,11 +18,14 @@ npm install -g @tuned-tensor/local
 tt-local info
 ```
 
-Real training also needs `uv`:
+The bundled SFT and Transformers evaluator path also needs `uv`:
 
 ```bash
 uv --version
 ```
+
+Custom training or evaluation workflows can use command entrypoints instead of
+`uv`.
 
 ## Local Development
 

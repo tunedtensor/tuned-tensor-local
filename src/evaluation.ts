@@ -13,7 +13,7 @@ import {
 import { writeJson, fileUri } from "./artifacts.js";
 import { resolveTrainingModel } from "./model-registry.js";
 import { openRouterChat } from "./openrouter.js";
-import { buildUvPythonArgs, runJsonStdInCommand, runLoggedProcess } from "./process-runner.js";
+import { buildEntrypointCommand, runJsonStdInCommand, runLoggedProcess } from "./process-runner.js";
 import type { LocalRunReporter } from "./run-reporter.js";
 import { defaultLocalHome } from "./store.js";
 
@@ -279,8 +279,8 @@ async function runInferenceCommand(args: {
   });
 }
 
-interface TransformersInferenceResult {
-  provider: "transformers";
+interface BatchInferenceResult {
+  provider: "transformers" | "batch_command";
   model_id?: string;
   base_model?: string;
   adapter_path?: string;
@@ -293,13 +293,20 @@ interface TransformersInferenceResult {
   }>;
 }
 
-function buildUvInferenceArgs(config: LocalRunnerConfig, inputPath: string, outputPath: string): string[] {
-  return buildUvPythonArgs(config.evaluation.inference, {
+function buildBatchInferenceCommand(config: LocalRunnerConfig, inputPath: string, outputPath: string) {
+  if (config.evaluation.inference.provider === "batch_command") {
+    return buildEntrypointCommand(
+      { ...config.evaluation.inference, backend: "command" },
+      { extraArgs: ["--input", inputPath, "--output", outputPath] },
+    );
+  }
+  return buildEntrypointCommand(config.evaluation.inference, {
+    defaultScript: "training/sft-local/src/evaluate.py",
     extraArgs: ["--input", inputPath, "--output", outputPath],
   });
 }
 
-async function runTransformersInference(args: {
+async function runBatchInference(args: {
   kind: "baseline" | "candidate";
   modelId: string;
   baseModelId: string;
@@ -309,7 +316,9 @@ async function runTransformersInference(args: {
   config: LocalRunnerConfig;
   outputPath: string;
   reporter?: LocalRunReporter;
-}): Promise<TransformersInferenceResult> {
+}): Promise<BatchInferenceResult> {
+  const provider = args.config.evaluation.inference.provider === "batch_command" ? "batch_command" : "transformers";
+  const label = provider === "batch_command" ? "batch command" : "Transformers";
   const inputPath = `${args.outputPath}.inference-input.json`;
   const outputPath = `${args.outputPath}.inference-output.json`;
   const logPath = `${args.outputPath}.inference.log`;
@@ -339,12 +348,12 @@ async function runTransformersInference(args: {
     },
   }, null, 2)}\n`, "utf8");
 
-  const uvArgs = buildUvInferenceArgs(args.config, inputPath, outputPath);
-  const command = ["uv", ...uvArgs];
+  const entrypoint = buildBatchInferenceCommand(args.config, inputPath, outputPath);
+  const command = entrypoint.displayCommand;
   await args.reporter?.onEvent?.({
     stage: `evaluating_${args.kind}`,
     status: "running",
-    message: `Starting ${args.kind} Transformers inference.`,
+    message: `Starting ${args.kind} ${label} inference.`,
     details: {
       model_id: args.modelId,
       examples: args.examples.length,
@@ -353,8 +362,8 @@ async function runTransformersInference(args: {
     },
   });
   const result = await runLoggedProcess({
-    command: "uv",
-    commandArgs: uvArgs,
+    command: entrypoint.command,
+    commandArgs: entrypoint.commandArgs,
     cwd: args.config.evaluation.inference.cwd,
     env: {
       ...process.env,
@@ -362,20 +371,23 @@ async function runTransformersInference(args: {
     },
     logPath,
     timeoutMs: args.config.evaluation.timeoutMs,
-    timeoutMessage: `Transformers inference timed out after ${args.config.evaluation.timeoutMs}ms`,
+    timeoutMessage: `${label} inference timed out after ${args.config.evaluation.timeoutMs}ms`,
     reporter: args.reporter,
     stage: `evaluating_${args.kind}`,
   });
   if (result.exitCode !== 0) {
-    throw new Error(`Transformers inference exited ${result.exitCode}: ${result.stderr.slice(0, 1000)}`);
+    throw new Error(`${label} inference exited ${result.exitCode}: ${result.stderr.slice(0, 1000)}`);
   }
   await args.reporter?.onEvent?.({
     stage: `evaluating_${args.kind}`,
     status: "running",
-    message: `Finished ${args.kind} Transformers inference.`,
+    message: `Finished ${args.kind} ${label} inference.`,
     details: { output_path: outputPath, log_path: logPath },
   });
-  return JSON.parse(await readFile(outputPath, "utf8")) as TransformersInferenceResult;
+  return {
+    ...JSON.parse(await readFile(outputPath, "utf8")) as Omit<BatchInferenceResult, "provider">,
+    provider,
+  };
 }
 
 /**
@@ -542,14 +554,14 @@ function resolveEvaluationRuntime(args: {
   config: LocalRunnerConfig;
 }): {
   command?: string[];
-  inferenceProvider: "none" | "command" | "transformers";
+  inferenceProvider: "none" | "command" | "batch_command" | "transformers";
   scoringMode: "exact_match" | "llm_judge" | "json_fields";
 } {
   const command = args.kind === "baseline"
     ? args.config.evaluation.baselineCommand
     : args.config.evaluation.candidateCommand;
   const provider = args.config.evaluation.inference.provider;
-  const inferenceProvider: "none" | "command" | "transformers" =
+  const inferenceProvider: "none" | "command" | "batch_command" | "transformers" =
     args.config.dryRun
       ? "none"
       : provider === "command"
@@ -557,6 +569,9 @@ function resolveEvaluationRuntime(args: {
         : provider;
   if (inferenceProvider === "command" && !command) {
     throw new Error(`evaluation.inference.provider=command requires evaluation.${args.kind}Command`);
+  }
+  if (inferenceProvider === "batch_command" && !args.config.evaluation.inference.command) {
+    throw new Error("evaluation.inference.provider=batch_command requires evaluation.inference.command");
   }
   const configuredScoringMode: "exact_match" | "llm_judge" | "json_fields" =
     args.config.evaluation.scoring.mode;
@@ -640,8 +655,8 @@ export async function evaluateExamples(args: {
     }
   }
 
-  const inferred = inferenceProvider === "transformers"
-    ? await runTransformersInference({
+  const inferred = inferenceProvider === "transformers" || inferenceProvider === "batch_command"
+    ? await runBatchInference({
         kind: args.kind,
         modelId: args.modelId,
         baseModelId: args.baseModelId ?? args.modelId,
@@ -797,7 +812,9 @@ export async function evaluateExamples(args: {
       ? aggregateJsonFieldMetrics(jsonFieldScores, total)
       : undefined,
     generation_config: generationConfig,
-    log_uri: inferenceProvider === "transformers" ? fileUri(`${args.outputPath}.inference.log`) : undefined,
+    log_uri: inferenceProvider === "transformers" || inferenceProvider === "batch_command"
+      ? fileUri(`${args.outputPath}.inference.log`)
+      : undefined,
   };
   await writeJson(args.outputPath, report);
   if (cacheKey) {

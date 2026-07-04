@@ -148,7 +148,7 @@ export const evalReportSchema = z.object({
   artifact_uri: z.string(),
   scoring_method: z.enum(["heuristic", "command", "llm_judge", "exact_match", "json_fields"]),
   judge_model_id: z.string().nullable().optional(),
-  inference_provider: z.enum(["none", "command", "transformers"]).optional(),
+  inference_provider: z.enum(["none", "command", "batch_command", "transformers"]).optional(),
   scoring_mode: z.enum(["exact_match", "llm_judge", "json_fields"]).optional(),
   json_field_metrics: jsonFieldMetricsSchema.optional(),
   generation_config: z.record(z.string(), z.unknown()).optional(),
@@ -175,7 +175,7 @@ export const comparisonReportSchema = z.object({
 });
 
 export const trainingReportSchema = z.object({
-  provider: z.literal("local-uv"),
+  provider: z.enum(["local-uv", "local-command"]),
   training_job_name: z.string(),
   model_artifact_uri: z.string().optional(),
   base_model_artifact_uri: z.string().optional(),
@@ -242,7 +242,8 @@ export const localRunnerConfigSchema = z.object({
   artifactRoot: z.string().default(".tt-local/artifacts"),
   dryRun: z.boolean().default(false),
   training: z.object({
-    backend: z.literal("uv").default("uv"),
+    backend: z.enum(["uv", "command"]).default("uv"),
+    command: commandSchema.optional(),
     project: z.string().optional(),
     cwd: z.string().optional(),
     module: z.string().optional(),
@@ -264,11 +265,13 @@ export const localRunnerConfigSchema = z.object({
     baselineCommand: commandSchema.optional(),
     candidateCommand: commandSchema.optional(),
     inference: z.object({
-      provider: z.enum(["transformers", "command", "none"]).default("transformers"),
+      provider: z.enum(["transformers", "batch_command", "command", "none"]).default("transformers"),
+      command: commandSchema.optional(),
       project: z.string().optional(),
       cwd: z.string().optional(),
       module: z.string().optional(),
       script: z.string().default("training/sft-local/src/evaluate.py"),
+      args: z.array(z.string()).default([]),
       with: z.array(z.string()).default([]),
       env: z.record(z.string(), z.string()).default({}),
       maxNewTokens: z.number().int().min(1).default(256),
@@ -280,6 +283,7 @@ export const localRunnerConfigSchema = z.object({
     }).default({
       provider: "transformers",
       script: "training/sft-local/src/evaluate.py",
+      args: [],
       with: [],
       env: {},
       maxNewTokens: 256,
@@ -305,6 +309,7 @@ export const localRunnerConfigSchema = z.object({
     inference: {
       provider: "transformers",
       script: "training/sft-local/src/evaluate.py",
+      args: [],
       with: [],
       env: {},
       maxNewTokens: 256,

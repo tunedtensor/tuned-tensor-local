@@ -12,6 +12,11 @@ All notable changes to TT Local will be documented in this file.
   rebuilds SQLite metadata from canonical per-object files. The SQLite index
   uses `better-sqlite3` instead of Node's experimental built-in SQLite API,
   avoiding runtime experimental warnings on Node 22.
+- Added command-based local training with `training.backend: "command"` and
+  `training.command`, while preserving the existing uv script/module path.
+- Added `evaluation.inference.provider: "batch_command"` with
+  `evaluation.inference.command` for custom batch evaluators that consume the
+  same `--input`/`--output` JSON files as the bundled Transformers evaluator.
 
 ## 0.1.9 - 2026-07-03
 

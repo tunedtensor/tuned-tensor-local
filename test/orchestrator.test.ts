@@ -372,3 +372,125 @@ test("uses prebuilt test split for evaluation while preserving training artifact
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("runs custom training and evaluation scripts as a minimal nanoGPT-style workflow", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-custom-workflow-"));
+  try {
+    const trainer = join(root, "tiny-nanogpt-train.mjs");
+    await writeFile(trainer, `
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+const rows = readFileSync(join(process.env.SM_CHANNEL_TRAINING, "training.jsonl"), "utf8")
+  .trim()
+  .split("\\n")
+  .filter(Boolean)
+  .map((line) => JSON.parse(line));
+const hyperparameters = JSON.parse(readFileSync(process.env.TT_HYPERPARAMETERS_PATH, "utf8"));
+const completions = {};
+for (const row of rows) {
+  const user = row.messages.find((message) => message.role === "user")?.content;
+  const assistant = row.messages.find((message) => message.role === "assistant")?.content;
+  completions[user] = assistant;
+}
+mkdirSync(process.env.SM_MODEL_DIR, { recursive: true });
+writeFileSync(join(process.env.SM_MODEL_DIR, "model.json"), JSON.stringify({
+  architecture: "tiny-nanogpt-memorizer",
+  completions,
+}, null, 2));
+writeFileSync(join(process.env.SM_MODEL_DIR, "training-metrics.json"), JSON.stringify({
+  examples: rows.length,
+  n_epochs: Number(hyperparameters.n_epochs),
+}, null, 2));
+console.error("{'loss': '0.01', 'epoch': '1.0'}");
+`, "utf8");
+
+    const evaluator = join(root, "tiny-nanogpt-evaluate.mjs");
+    await writeFile(evaluator, `
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+const inputPath = process.argv[process.argv.indexOf("--input") + 1];
+const outputPath = process.argv[process.argv.indexOf("--output") + 1];
+const payload = JSON.parse(readFileSync(inputPath, "utf8"));
+const modelPath = payload.adapter_path ? join(payload.adapter_path, "model.json") : null;
+const model = modelPath ? JSON.parse(readFileSync(modelPath, "utf8")) : { completions: {} };
+writeFileSync(outputPath, JSON.stringify({
+  provider: "transformers",
+  model_id: payload.model_id,
+  base_model: payload.base_model,
+  adapter_path: payload.adapter_path,
+  generation_config: payload.generation,
+  results: payload.examples.map((example) => ({
+    prompt: example.input,
+    expected: example.output,
+    actual: model.completions[example.input] ?? "",
+    latency_ms: 1,
+  })),
+}, null, 2));
+`, "utf8");
+
+    const trainingPath = join(root, "train.chat.jsonl");
+    const testPath = join(root, "test.chat.jsonl");
+    const rows = [
+      chatRow("next token: A B", "C"),
+      chatRow("next token: one two", "three"),
+    ].join("\n");
+    await writeFile(trainingPath, `${rows}\n`, "utf8");
+    await writeFile(testPath, `${rows}\n`, "utf8");
+
+    const request = fineTuneRunRequestSchema.parse({
+      run_id: "99999999-1111-4111-8111-111111111111",
+      user_id: "local-user",
+      behavior_spec_id: "44444444-4444-4444-8444-444444444444",
+      run_number: 1,
+      spec_snapshot: {
+        name: "Tiny nanoGPT",
+        description: "",
+        system_prompt: "Predict the next token.",
+        guidelines: [],
+        constraints: [],
+        base_model: "Qwen/Qwen3.5-2B",
+        examples: [{ input: "spec input", output: "spec output" }],
+      },
+      hyperparameters: { n_epochs: 1 },
+      dataset_prebuilt: {
+        training: `file://${trainingPath}`,
+        test: `file://${testPath}`,
+        format: "chat_jsonl",
+      },
+    });
+    const config = localRunnerConfigSchema.parse({
+      artifactRoot: join(root, "artifacts"),
+      storeRoot: join(root, "store"),
+      dryRun: false,
+      training: {
+        backend: "command",
+        command: [process.execPath, trainer],
+      },
+      evaluation: {
+        inference: {
+          provider: "batch_command",
+          command: [process.execPath, evaluator],
+        },
+        scoring: { mode: "exact_match" },
+      },
+    });
+
+    const result = await runLocalFineTune({ request, config });
+
+    assert.equal(result.report.status, "completed");
+    assert.equal(result.report.training.provider, "local-command");
+    assert.equal(result.report.training.exit_code, 0);
+    assert.equal(result.report.training.metrics?.examples, 2);
+    assert.equal(result.report.baseline.avg_score, 0);
+    assert.equal(result.report.candidate.avg_score, 1);
+    assert.equal(result.report.candidate.inference_provider, "batch_command");
+    assert.equal(result.report.candidate.results[0]?.actual, result.report.candidate.results[0]?.expected);
+
+    const modelText = await readFile(result.report.training.model_artifact_uri.replace(/^file:\/\//, "") + "/model.json", "utf8");
+    assert.match(modelText, /tiny-nanogpt-memorizer/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
