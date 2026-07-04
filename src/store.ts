@@ -3,10 +3,14 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import type { DatabaseSync, StatementSync } from "node:sqlite";
+import type BetterSqlite3 from "better-sqlite3";
 import type { FineTuneRunRequest, RunReport, SpecSnapshot } from "./contracts.js";
 
 const require = createRequire(import.meta.url);
+const BetterSqlite = require("better-sqlite3") as typeof BetterSqlite3;
+
+type MetadataDb = BetterSqlite3.Database;
+type MetadataStatement = BetterSqlite3.Statement;
 
 export type LocalRunStatus =
   | "queued"
@@ -222,7 +226,7 @@ type EventRow = {
   occurred_at: string;
 };
 
-function initMetadataDb(db: DatabaseSync): void {
+function initMetadataDb(db: MetadataDb): void {
   db.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
@@ -357,9 +361,8 @@ function rowToEvent(row: EventRow): LocalRunEvent {
   };
 }
 
-function withMetadataDb<T>(paths: ReturnType<typeof localStorePaths>, fn: (db: DatabaseSync) => T): T {
-  const { DatabaseSync: SqliteDatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
-  const db = new SqliteDatabaseSync(paths.metadataDb);
+function withMetadataDb<T>(paths: ReturnType<typeof localStorePaths>, fn: (db: MetadataDb) => T): T {
+  const db = new BetterSqlite(paths.metadataDb);
   try {
     initMetadataDb(db);
     return fn(db);
@@ -368,7 +371,7 @@ function withMetadataDb<T>(paths: ReturnType<typeof localStorePaths>, fn: (db: D
   }
 }
 
-function runTransaction<T>(db: DatabaseSync, fn: () => T): T {
+function runTransaction<T>(db: MetadataDb, fn: () => T): T {
   db.exec("BEGIN IMMEDIATE");
   try {
     const result = fn();
@@ -380,7 +383,7 @@ function runTransaction<T>(db: DatabaseSync, fn: () => T): T {
   }
 }
 
-function bindRunState(stmt: StatementSync, state: LocalRunState, catalogUpdatedAt: string): void {
+function bindRunState(stmt: MetadataStatement, state: LocalRunState, catalogUpdatedAt: string): void {
   stmt.run(
     state.id,
     state.behavior_spec_id,
@@ -403,7 +406,7 @@ function bindRunState(stmt: StatementSync, state: LocalRunState, catalogUpdatedA
   );
 }
 
-function upsertRun(db: DatabaseSync, state: LocalRunState, catalogUpdatedAt = new Date().toISOString()): void {
+function upsertRun(db: MetadataDb, state: LocalRunState, catalogUpdatedAt = new Date().toISOString()): void {
   bindRunState(db.prepare(`
     INSERT INTO runs (
       id, behavior_spec_id, user_id, run_number, status, current_stage,
@@ -431,7 +434,7 @@ function upsertRun(db: DatabaseSync, state: LocalRunState, catalogUpdatedAt = ne
   `), state, catalogUpdatedAt);
 }
 
-function upsertSpec(db: DatabaseSync, record: LocalSpecRecord): void {
+function upsertSpec(db: MetadataDb, record: LocalSpecRecord): void {
   db.prepare(`
     INSERT INTO specs (id, name, base_model, path, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?)
@@ -444,7 +447,7 @@ function upsertSpec(db: DatabaseSync, record: LocalSpecRecord): void {
   `).run(record.id, record.name, record.base_model, record.path, record.created_at, record.updated_at);
 }
 
-function upsertModel(db: DatabaseSync, model: LocalModelRecord): void {
+function upsertModel(db: MetadataDb, model: LocalModelRecord): void {
   db.prepare(`
     INSERT INTO models (
       id, run_id, behavior_spec_id, name, provider, base_model,
@@ -474,7 +477,7 @@ function upsertModel(db: DatabaseSync, model: LocalModelRecord): void {
   );
 }
 
-function insertEvent(db: DatabaseSync, event: LocalRunEvent): void {
+function insertEvent(db: MetadataDb, event: LocalRunEvent): void {
   db.prepare(`
     INSERT OR IGNORE INTO run_events (id, run_id, stage, status, message, details_json, occurred_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
