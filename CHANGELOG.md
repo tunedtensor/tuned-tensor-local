@@ -2,6 +2,26 @@
 
 All notable changes to TT Local will be documented in this file.
 
+## 0.2.2 - 2026-07-04
+
+### Added
+
+- Added external command workflow support with `external:<id>` and
+  `command:<id>` base model identifiers for custom trainers such as nanoGPT
+  and nanochat adapters. The bundled uv trainer still requires a supported
+  Hugging Face base model.
+- Added command-workflow artifact metadata via `training.artifact`, surfaced in
+  run reports as `training.artifact_metadata`, so non-Hugging Face layouts can
+  describe their framework, format, entrypoint, and servability.
+
+### Changed
+
+- Command-backed training now receives adapter-focused hyperparameters without
+  injecting bundled LoRA/model-loader defaults, while preserving custom
+  hyperparameter keys in `TT_HYPERPARAMETERS_PATH`.
+- Unknown hyperparameter warnings now clarify that keys are passed through but
+  may be ignored by the default trainer.
+
 ## 0.2.1 - 2026-07-04
 
 ### Added
