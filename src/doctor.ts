@@ -103,7 +103,7 @@ export async function runDoctor(config: LocalRunnerConfig): Promise<DoctorCheck[
             ? `uv will run module ${config.training.module}`
             : config.training.script
               ? `uv will run script ${config.training.script}`
-              : "uv will run the bundled SFT script",
+              : "uv will run the bundled script selected by training_method",
   });
 
   return checks;
