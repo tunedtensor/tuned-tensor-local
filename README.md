@@ -62,7 +62,7 @@ supported Hugging Face base model, but command trainers receive adapter-focused
 hyperparameters without injected LoRA/model-loader defaults. Custom
 hyperparameter keys are passed through to `TT_HYPERPARAMETERS_PATH`.
 
-## Continuing From A Fine-Tuned Model
+## Continuing From a Fine-Tuned Model
 
 Start another loop from an existing TT Local model by passing the stored local
 model id:

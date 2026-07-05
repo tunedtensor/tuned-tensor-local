@@ -246,32 +246,48 @@ function assertSupportedValidateShape(request: FineTuneRunRequest, config: Local
   }
 }
 
-async function parentModelArtifactFromArgv(
+interface ParentModelSelection {
+  artifactUri: string;
+  modelId?: string;
+  baseModel?: string;
+}
+
+async function parentModelSelectionFromArgv(
   argv: string[],
   config: LocalRunnerConfig,
-): Promise<string | undefined> {
+): Promise<ParentModelSelection | undefined> {
   const parentModel = readOption(argv, "--parent-model");
   const parentModelArtifact = readOption(argv, "--parent-model-artifact");
   if (parentModel && parentModelArtifact) {
     throw new Error("Use only one of --parent-model or --parent-model-artifact.");
   }
-  if (parentModelArtifact) return parentModelArtifact;
+  if (parentModelArtifact) return { artifactUri: parentModelArtifact };
   if (!parentModel) return undefined;
   const store = createLocalStore(config.storeRoot);
   const record = await store.getModel(parentModel);
-  return record.artifact_uri;
+  return {
+    artifactUri: record.artifact_uri,
+    modelId: record.id,
+    baseModel: record.base_model,
+  };
 }
 
 function withParentModelArtifact(
   request: FineTuneRunRequest,
-  parentModelArtifact?: string,
+  parentModel?: ParentModelSelection,
 ): FineTuneRunRequest {
-  if (!parentModelArtifact) return request;
+  if (!parentModel) return request;
+  if (parentModel.baseModel && parentModel.baseModel !== request.spec_snapshot.base_model) {
+    throw new Error(
+      `Parent model ${parentModel.modelId ?? ""} uses base model ${parentModel.baseModel}, `
+      + `but this run uses ${request.spec_snapshot.base_model}. Continue from a model with the same base model.`,
+    );
+  }
   return fineTuneRunRequestSchema.parse({
     ...request,
     hyperparameters: {
       ...request.hyperparameters,
-      parent_model_artifact: parentModelArtifact,
+      parent_model_artifact: parentModel.artifactUri,
     },
   });
 }
@@ -375,7 +391,7 @@ async function main(argv: string[]): Promise<void> {
       : input.request;
     const request = withParentModelArtifact(
       baseRequest,
-      await parentModelArtifactFromArgv(argv, config),
+      await parentModelSelectionFromArgv(argv, config),
     );
     const stage = readRunStage(argv);
     const result = await runLocalFineTuneStage({
@@ -400,6 +416,7 @@ async function main(argv: string[]): Promise<void> {
         artifact_dir: result.artifactDir,
         model_id: `local-${result.report.run_id}`,
         fine_tuned_model_id: result.report.fine_tuned_model_id,
+        parent_model_artifact: result.report.run_metadata.parent_model_artifact ?? null,
         training_log: result.report.training.log_uri,
         baseline_eval: result.report.artifact_uris.baseline_eval,
         candidate_eval: result.report.artifact_uris.candidate_eval,
@@ -413,6 +430,7 @@ async function main(argv: string[]): Promise<void> {
         run_id: result.request.run_id,
         behavior_spec_id: result.request.behavior_spec_id,
         artifact_dir: result.artifactDir,
+        parent_model_artifact: result.request.hyperparameters.parent_model_artifact ?? null,
         artifacts: result.artifacts,
       });
     }
