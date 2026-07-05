@@ -2,6 +2,28 @@
 
 All notable changes to TT Local will be documented in this file.
 
+## 0.2.4 - 2026-07-05
+
+### Added
+
+- Added first-class offline DPO support for text causal-LM local runs via
+  `training_method: "dpo"` and prebuilt `preference_jsonl` datasets with
+  explicit `prompt`, `chosen`, and `rejected` fields.
+- Added a bundled TRL `DPOTrainer` path alongside the existing SFT trainer,
+  including DPO hyperparameters such as `dpo_beta`, `dpo_loss_type`,
+  `dpo_label_smoothing`, `dpo_reference_free`, `max_prompt_length`, and
+  `max_completion_length`.
+- Added DPO examples and documentation for method-selected bundled training
+  scripts.
+
+### Changed
+
+- Renamed the bundled uv training project from `training/sft-local` to
+  `training/hf-local` now that it hosts both SFT and DPO workflows.
+- Prebuilt local run preparation now fingerprints dataset file contents so
+  stale staged artifacts are refreshed when prebuilt training, validation, or
+  test files change under the same run id.
+
 ## 0.2.3 - 2026-07-05
 
 ### Added
