@@ -4,7 +4,7 @@
   "dryRun": true,
   "training": {
     "backend": "uv",
-    "project": "training/sft-local"
+    "project": "training/hf-local"
   },
   "evaluation": {
     "inference": {

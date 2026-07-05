@@ -322,7 +322,7 @@ export const localRunnerConfigSchema = z.object({
       project: z.string().optional(),
       cwd: z.string().optional(),
       module: z.string().optional(),
-      script: z.string().default("training/sft-local/src/evaluate.py"),
+      script: z.string().default("training/hf-local/src/evaluate.py"),
       args: z.array(z.string()).default([]),
       with: z.array(z.string()).default([]),
       env: z.record(z.string(), z.string()).default({}),
@@ -334,7 +334,7 @@ export const localRunnerConfigSchema = z.object({
       chatTemplateKwargs: z.record(z.string(), z.unknown()).optional(),
     }).default({
       provider: "transformers",
-      script: "training/sft-local/src/evaluate.py",
+      script: "training/hf-local/src/evaluate.py",
       args: [],
       with: [],
       env: {},
@@ -360,7 +360,7 @@ export const localRunnerConfigSchema = z.object({
   }).default({
     inference: {
       provider: "transformers",
-      script: "training/sft-local/src/evaluate.py",
+      script: "training/hf-local/src/evaluate.py",
       args: [],
       with: [],
       env: {},
