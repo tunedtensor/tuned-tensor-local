@@ -4,8 +4,7 @@
   "dryRun": true,
   "training": {
     "backend": "uv",
-    "project": "training/sft-local",
-    "script": "training/sft-local/src/train.py"
+    "project": "training/local-runner"
   },
   "evaluation": {
     "inference": {

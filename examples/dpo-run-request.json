@@ -1,0 +1,34 @@
+{
+  "run_id": "44444444-4444-4444-8444-444444444444",
+  "user_id": "local-user",
+  "behavior_spec_id": "55555555-5555-4555-8555-555555555555",
+  "run_number": 1,
+  "training_method": "dpo",
+  "spec_snapshot": {
+    "name": "Local DPO Assistant",
+    "description": "Tiny local DPO smoke request.",
+    "system_prompt": "Answer concisely and accurately.",
+    "guidelines": [
+      "Prefer direct, factual replies."
+    ],
+    "constraints": [
+      "Do not invent negative status."
+    ],
+    "base_model": "Qwen/Qwen3.5-2B",
+    "examples": [
+      {
+        "input": "Summarize status: build passed, one flaky test retried successfully.",
+        "output": "Build passed; one flaky test passed after retry."
+      }
+    ]
+  },
+  "hyperparameters": {
+    "n_epochs": 1,
+    "dpo_beta": 0.1,
+    "save_adapter_only": true
+  },
+  "dataset_prebuilt": {
+    "training": "file://examples/dpo-preferences.jsonl",
+    "format": "preference_jsonl"
+  }
+}

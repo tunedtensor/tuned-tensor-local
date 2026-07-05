@@ -27,6 +27,34 @@ uv --version
 Custom training or evaluation workflows can use command entrypoints instead of
 `uv`.
 
+## DPO
+
+TT Local supports first-class offline DPO for text causal-LM models. Set
+`training_method` to `dpo` and provide a prebuilt preference JSONL training
+dataset:
+
+```json
+{
+  "training_method": "dpo",
+  "dataset_prebuilt": {
+    "training": "file://examples/dpo-preferences.jsonl",
+    "format": "preference_jsonl"
+  }
+}
+```
+
+Each preference JSONL row must use explicit `prompt`, `chosen`, and `rejected`
+string fields:
+
+```json
+{"prompt":"Summarize status: build passed.","chosen":"Build passed.","rejected":"The build failed."}
+```
+
+DPO v1 is text-only for the bundled `uv` trainer. Validation and reporting still
+use the existing baseline-vs-candidate evaluation loop, so provide
+`dataset_prebuilt.test`, `dataset_prebuilt.validation`, or normal
+`spec_snapshot.examples` with reference outputs for evaluation.
+
 Command-backed workflows may use external model ids by setting
 `spec_snapshot.base_model` to an `external:<id>` or `command:<id>` value, for
 example `external:karpathy/nanochat`. The bundled `uv` trainer still requires a

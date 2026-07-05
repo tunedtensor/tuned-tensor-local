@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
+  fineTuneRunRequestSchema,
+  localBehaviorSpecFileSchema,
+} from "../src/contracts.js";
+import {
   initLocalSpecFile,
   loadLocalRunInput,
   runRequestFromLocalSpec,
@@ -64,6 +68,88 @@ test("runRequestFromLocalSpec preserves local spec metadata", () => {
   assert.equal(request.behavior_spec_id, "77777777-7777-4777-8777-777777777777");
   assert.equal(request.run_number, 3);
   assert.equal(request.hyperparameters.n_epochs, 2);
+});
+
+test("runRequestFromLocalSpec preserves DPO training method", () => {
+  const spec = localBehaviorSpecFileSchema.parse({
+    id: "11111111-1111-4111-8111-111111111111",
+    name: "DPO Spec",
+    base_model: "Qwen/Qwen3.5-2B",
+    training_method: "dpo",
+    examples: [{ input: "eval", output: "answer" }],
+    dataset_prebuilt: {
+      training: "file:///tmp/preferences.jsonl",
+      format: "preference_jsonl",
+    },
+  });
+
+  const request = runRequestFromLocalSpec(spec);
+  assert.equal(request.training_method, "dpo");
+  assert.equal(request.dataset_prebuilt?.format, "preference_jsonl");
+});
+
+test("DPO request schema enforces preference training data and evaluation references", () => {
+  assert.doesNotThrow(() => fineTuneRunRequestSchema.parse({
+    run_id: "22222222-2222-4222-8222-222222222222",
+    user_id: "user",
+    behavior_spec_id: "33333333-3333-4333-8333-333333333333",
+    run_number: 1,
+    training_method: "dpo",
+    spec_snapshot: {
+      name: "DPO",
+      description: "",
+      system_prompt: "",
+      base_model: "Qwen/Qwen3.5-2B",
+      examples: [{ input: "eval", output: "answer" }],
+    },
+    dataset_prebuilt: {
+      training: "file:///tmp/preferences.jsonl",
+      format: "preference_jsonl",
+    },
+  }));
+
+  assert.throws(
+    () => fineTuneRunRequestSchema.parse({
+      run_id: "44444444-4444-4444-8444-444444444444",
+      user_id: "user",
+      behavior_spec_id: "55555555-5555-4555-8555-555555555555",
+      run_number: 1,
+      training_method: "dpo",
+      spec_snapshot: {
+        name: "DPO",
+        description: "",
+        system_prompt: "",
+        base_model: "Qwen/Qwen3.5-2B",
+        examples: [],
+      },
+      dataset_prebuilt: {
+        training: "file:///tmp/preferences.jsonl",
+        format: "preference_jsonl",
+      },
+    }),
+    /DPO evaluation requires/,
+  );
+
+  assert.throws(
+    () => fineTuneRunRequestSchema.parse({
+      run_id: "66666666-6666-4666-8666-666666666666",
+      user_id: "user",
+      behavior_spec_id: "77777777-7777-4777-8777-777777777777",
+      run_number: 1,
+      spec_snapshot: {
+        name: "SFT",
+        description: "",
+        system_prompt: "",
+        base_model: "Qwen/Qwen3.5-2B",
+        examples: [{ input: "eval", output: "answer" }],
+      },
+      dataset_prebuilt: {
+        training: "file:///tmp/preferences.jsonl",
+        format: "preference_jsonl",
+      },
+    }),
+    /preference_jsonl datasets require training_method dpo/,
+  );
 });
 
 test("unknownHyperparameterWarnings flags pass-through keys that the default trainer may ignore", () => {

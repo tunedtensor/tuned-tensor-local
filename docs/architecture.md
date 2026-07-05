@@ -18,7 +18,8 @@ packaged as a standalone CLI.
   configured `storeRoot` for portable artifacts, recovery, and inspection.
 - Training adapter: launches either a uv-managed Python process or an arbitrary
   command with local input, model cache, and output directories passed through
-  environment variables.
+  environment variables. Bundled uv training supports SFT and text-only offline
+  DPO; command training can implement custom methods.
 - Evaluation adapter: runs local Hugging Face/PEFT inference, an arbitrary
   batch command, or per-example commands for baseline and candidate evaluation.
   Evaluation can also use an OpenRouter LLM judge to score locally generated
@@ -58,10 +59,10 @@ The first runnable milestone should support:
 ## Configuration Shape
 
 The public runner should accept a plain JSON run request and a local runner
-configuration. The run request describes the behavior spec, base model,
-examples, and hyperparameters. The local runner configuration describes artifact
-paths, store paths, uv or command entrypoint settings, model cache paths,
-OpenRouter judge settings, and timeout limits.
+configuration. The run request describes the training method, behavior spec,
+base model, examples, datasets, and hyperparameters. The local runner
+configuration describes artifact paths, store paths, uv or command entrypoint
+settings, model cache paths, OpenRouter judge settings, and timeout limits.
 
 ## Evaluation Loop
 

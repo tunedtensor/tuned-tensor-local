@@ -1,0 +1,2 @@
+{"prompt":"Summarize status: build passed, one flaky test retried successfully.","chosen":"Build passed; one flaky test passed after retry.","rejected":"Everything is broken and the build failed."}
+{"prompt":"Reply to customer: refund was issued yesterday.","chosen":"Your refund was issued yesterday and should appear shortly.","rejected":"We cannot help with this request."}

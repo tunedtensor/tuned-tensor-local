@@ -41,8 +41,15 @@ tt-local run examples/smoke-run-request.json --config examples/local-runner.json
 
 ## Real Training
 
-For real training with the bundled SFT workflow, set `dryRun: false` and
-configure the uv training entrypoint:
+For real training with the bundled SFT or DPO workflow, set `dryRun: false` and
+configure the uv project. Leave `training.script` unset: the runner chooses the
+bundled script from the run request's `training_method`.
+
+- `training_method: "sft"` runs `training/local-runner/src/train.py`.
+- `training_method: "dpo"` runs `training/local-runner/src/train_dpo.py`.
+
+Set `training.script` only when you want to override that selection with a
+specific custom uv script.
 
 ```json
 {
@@ -50,8 +57,7 @@ configure the uv training entrypoint:
   "dryRun": false,
   "training": {
     "backend": "uv",
-    "project": "training/sft-local",
-    "script": "training/sft-local/src/train.py"
+    "project": "training/local-runner"
   },
   "paths": {
     "modelCache": "/home/eve/.cache/huggingface"
@@ -61,7 +67,7 @@ configure the uv training entrypoint:
 
 The runner sets:
 
-- `SM_CHANNEL_TRAINING` to the local chat JSONL training directory;
+- `SM_CHANNEL_TRAINING` to the local training JSONL directory;
 - `TT_HYPERPARAMETERS_PATH` to the generated hyperparameter JSON file;
 - `SM_OUTPUT_DIR` to the local training output directory;
 - `SM_MODEL_DIR` to the local model output directory;
@@ -101,10 +107,12 @@ The training command receives the same environment variables listed above. The
 batch evaluator is called with `--input <path> --output <path>` and should write
 the same results JSON shape as the bundled evaluator.
 
-The included first-pass SFT script can be run by the local runner through uv:
+The included first-pass SFT and DPO scripts can be run by the local runner
+through uv:
 
 ```bash
 tt-local run examples/smoke-run-request.json --config examples/local-runner.json
+tt-local run examples/dpo-run-request.json --config examples/local-runner.json
 ```
 
 The SFT uv project currently points Linux installs at the PyTorch CUDA 13.0

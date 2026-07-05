@@ -24,7 +24,27 @@ function buildCommandTrainingHyperparameters(request: FineTuneRunRequest): Recor
     ...hyperparameters,
     run_id: request.run_id,
     base_model: request.spec_snapshot.base_model,
+    training_method: request.training_method,
     model_mode: isExternalTrainingModel(request.spec_snapshot.base_model) ? "external" : "supported",
+  };
+}
+
+function defaultTrainingScript(request: FineTuneRunRequest): string {
+  return request.training_method === "dpo"
+    ? "training/local-runner/src/train_dpo.py"
+    : "training/local-runner/src/train.py";
+}
+
+function buildDpoHyperparameters(request: FineTuneRunRequest): Record<string, string> {
+  if (request.training_method !== "dpo") return {};
+  const hyper = request.hyperparameters;
+  return {
+    dpo_beta: String(hyper.dpo_beta ?? 0.1),
+    dpo_loss_type: hyper.dpo_loss_type ?? "sigmoid",
+    dpo_label_smoothing: String(hyper.dpo_label_smoothing ?? 0),
+    dpo_reference_free: String(hyper.dpo_reference_free ?? false),
+    ...(hyper.max_prompt_length ? { max_prompt_length: String(hyper.max_prompt_length) } : {}),
+    ...(hyper.max_completion_length ? { max_completion_length: String(hyper.max_completion_length) } : {}),
   };
 }
 
@@ -35,12 +55,16 @@ export function buildTrainingHyperparameters(
   if (options.backend === "command") return buildCommandTrainingHyperparameters(request);
 
   const model = resolveTrainingModel(request.spec_snapshot.base_model);
+  if (request.training_method === "dpo" && model.loader === "image_text_to_text") {
+    throw new Error("Bundled DPO training supports text causal-LM models only in v1. Use a causal_lm base model or training.backend=command for a custom DPO trainer.");
+  }
   const hyper = request.hyperparameters;
   return {
     run_id: request.run_id,
     base_model: model.id,
     model_family: model.family,
     model_loader: model.loader,
+    training_method: request.training_method,
     n_epochs: String(hyper.n_epochs),
     learning_rate: String(hyper.learning_rate ?? model.defaultLearningRate),
     per_device_train_batch_size: String(hyper.batch_size ?? model.defaultPerDeviceBatchSize),
@@ -54,6 +78,7 @@ export function buildTrainingHyperparameters(
     save_adapter_only: String(hyper.save_adapter_only),
     requires_hf_token: String(model.requiresHfToken),
     trust_remote_code: String(model.trustRemoteCode),
+    ...buildDpoHyperparameters(request),
     ...(hyper.chat_template_kwargs
       ? { chat_template_kwargs: JSON.stringify(hyper.chat_template_kwargs) }
       : {}),
@@ -169,7 +194,7 @@ export async function launchProcessTraining(args: {
   if (config.dryRun) {
     const dryCommand = config.training.backend === "command" && !config.training.command
       ? null
-      : buildEntrypointCommand(config.training, { defaultScript: "training/sft-local/src/train.py" });
+      : buildEntrypointCommand(config.training, { defaultScript: defaultTrainingScript(request) });
     await writeFile(
       artifacts.trainingLog,
       "Dry run enabled. Training process was not launched.\n",
@@ -188,7 +213,7 @@ export async function launchProcessTraining(args: {
     };
   }
 
-  const entrypoint = buildEntrypointCommand(config.training, { defaultScript: "training/sft-local/src/train.py" });
+  const entrypoint = buildEntrypointCommand(config.training, { defaultScript: defaultTrainingScript(request) });
   const command = entrypoint.displayCommand;
   const provider = entrypoint.kind === "uv" ? "local-uv" : "local-command";
   const childEnv: NodeJS.ProcessEnv = {
