@@ -2,6 +2,24 @@
 
 All notable changes to TT Local will be documented in this file.
 
+## 0.2.5 - 2026-07-05
+
+### Added
+
+- Added continued local fine-tuning from a previous TT Local PEFT adapter via
+  `hyperparameters.parent_model_artifact`, `tt-local run --parent-model`, and
+  `tt-local run --parent-model-artifact`.
+- Added parent-model lineage to training reports, run metadata, and `tt-local
+  run` JSON output.
+
+### Changed
+
+- Continued runs now evaluate the parent adapter as the baseline and then train
+  the child adapter from that parent, so each follow-up loop compares against
+  the model it actually continues from.
+- `tt-local run --parent-model` now rejects stored parent models whose recorded
+  base model differs from the new run's base model before launching training.
+
 ## 0.2.4 - 2026-07-05
 
 ### Added

@@ -1,6 +1,6 @@
 {
   "name": "@tuned-tensor/local",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "TT Local: tuning tensors locally on hardware you control.",
   "license": "Apache-2.0",
   "private": false,
