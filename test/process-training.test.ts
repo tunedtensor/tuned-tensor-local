@@ -56,6 +56,47 @@ test("builds text and multimodal model loader hyperparameters", () => {
   assert.equal(buildTrainingHyperparameters(multimodalRequest).model_loader, "image_text_to_text");
 });
 
+test("builds DPO uv hyperparameters with LoRA defaults", () => {
+  const request = fineTuneRunRequestSchema.parse({
+    run_id: "12121212-1212-4212-8212-121212121212",
+    user_id: "user",
+    behavior_spec_id: "34343434-3434-4434-8434-343434343434",
+    run_number: 1,
+    training_method: "dpo",
+    spec_snapshot: {
+      name: "DPO",
+      description: "",
+      system_prompt: "",
+      base_model: "Qwen/Qwen3.5-2B",
+      examples: [{ input: "hello", output: "greeting" }],
+    },
+    hyperparameters: {
+      n_epochs: 1,
+      dpo_beta: 0.2,
+      dpo_loss_type: "ipo",
+      dpo_label_smoothing: 0.1,
+      dpo_reference_free: true,
+      max_prompt_length: 512,
+      max_completion_length: 256,
+    },
+    dataset_prebuilt: {
+      training: "file:///tmp/preferences.jsonl",
+      format: "preference_jsonl",
+    },
+  });
+
+  const hyperparameters = buildTrainingHyperparameters(request);
+  assert.equal(hyperparameters.training_method, "dpo");
+  assert.equal(hyperparameters.model_loader, "causal_lm");
+  assert.equal(hyperparameters.dpo_beta, "0.2");
+  assert.equal(hyperparameters.dpo_loss_type, "ipo");
+  assert.equal(hyperparameters.dpo_label_smoothing, "0.1");
+  assert.equal(hyperparameters.dpo_reference_free, "true");
+  assert.equal(hyperparameters.max_prompt_length, "512");
+  assert.equal(hyperparameters.max_completion_length, "256");
+  assert.equal(hyperparameters.lora_rank, "16");
+});
+
 test("command training hyperparameters allow external models and avoid bundled model defaults", () => {
   const request = fineTuneRunRequestSchema.parse({
     run_id: "33333333-3333-4333-8333-333333333333",
@@ -78,6 +119,7 @@ test("command training hyperparameters allow external models and avoid bundled m
 
   const hyperparameters = buildTrainingHyperparameters(request, { backend: "command" });
   assert.equal(hyperparameters.base_model, "external:karpathy/nanochat");
+  assert.equal(hyperparameters.training_method, "sft");
   assert.equal(hyperparameters.model_mode, "external");
   assert.equal(hyperparameters.nanochat_depth, "1");
   assert.equal(hyperparameters.custom_options, "{\"compile\":false}");
@@ -85,6 +127,64 @@ test("command training hyperparameters allow external models and avoid bundled m
   assert.equal(hyperparameters.model_family, undefined);
   assert.equal(hyperparameters.model_loader, undefined);
   assert.equal(hyperparameters.lora_rank, undefined);
+});
+
+test("command DPO hyperparameters pass through for external trainers", () => {
+  const request = fineTuneRunRequestSchema.parse({
+    run_id: "77777777-7777-4777-8777-777777777777",
+    user_id: "user",
+    behavior_spec_id: "88888888-8888-4888-8888-888888888888",
+    run_number: 1,
+    training_method: "dpo",
+    spec_snapshot: {
+      name: "External DPO",
+      description: "",
+      system_prompt: "",
+      base_model: "external:karpathy/nanochat",
+      examples: [{ input: "hello", output: "greeting" }],
+    },
+    hyperparameters: {
+      n_epochs: 1,
+      dpo_beta: 0.3,
+    },
+    dataset_prebuilt: {
+      training: "file:///tmp/preferences.jsonl",
+      format: "preference_jsonl",
+    },
+  });
+
+  const hyperparameters = buildTrainingHyperparameters(request, { backend: "command" });
+  assert.equal(hyperparameters.base_model, "external:karpathy/nanochat");
+  assert.equal(hyperparameters.training_method, "dpo");
+  assert.equal(hyperparameters.dpo_beta, "0.3");
+  assert.equal(hyperparameters.model_mode, "external");
+  assert.equal(hyperparameters.model_loader, undefined);
+});
+
+test("uv DPO rejects multimodal models", () => {
+  const request = fineTuneRunRequestSchema.parse({
+    run_id: "99999999-9999-4999-8999-999999999999",
+    user_id: "user",
+    behavior_spec_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    run_number: 1,
+    training_method: "dpo",
+    spec_snapshot: {
+      name: "Vision DPO",
+      description: "",
+      system_prompt: "",
+      base_model: "Qwen/Qwen3-VL-2B-Instruct",
+      examples: [{ input: "hello", output: "greeting" }],
+    },
+    dataset_prebuilt: {
+      training: "file:///tmp/preferences.jsonl",
+      format: "preference_jsonl",
+    },
+  });
+
+  assert.throws(
+    () => buildTrainingHyperparameters(request),
+    /DPO training supports text causal-LM models only/,
+  );
 });
 
 test("uv training still rejects external models", () => {

@@ -60,6 +60,7 @@ interface StageMetadata {
   run_id: string;
   behavior_spec_id: string;
   user_id: string;
+  training_method: FineTuneRunRequest["training_method"];
   source_fingerprint: string;
   eval_split: EvalSplit;
   eval_sample_seed: number;
@@ -68,6 +69,8 @@ interface StageMetadata {
   max_eval_examples: number | null;
   training_example_count: number | null;
   dataset_prebuilt: boolean;
+  dataset_format: NonNullable<FineTuneRunRequest["dataset_prebuilt"]>["format"] | null;
+  dataset_fingerprints: Record<string, string>;
   dataset_uri: string;
   base_model_for_evaluation: string;
   system_prompt_sha256: string;
@@ -125,6 +128,19 @@ function selectPrebuiltEvaluation(dataset: FineTuneRunRequest["dataset_prebuilt"
   return { path: stripFileUri(dataset.training), split: "prebuilt_training" };
 }
 
+function selectDpoEvaluation(request: FineTuneRunRequest): {
+  path?: string;
+  split: EvalSplit;
+} {
+  if (request.dataset_prebuilt?.test) {
+    return { path: stripFileUri(request.dataset_prebuilt.test), split: "prebuilt_test" };
+  }
+  if (request.dataset_prebuilt?.validation) {
+    return { path: stripFileUri(request.dataset_prebuilt.validation), split: "prebuilt_validation" };
+  }
+  return { split: "spec_examples" };
+}
+
 function artifactPrefix(request: FineTuneRunRequest): string {
   return request.artifacts?.prefix ?? defaultArtifactPrefix({
     userId: request.user_id,
@@ -142,14 +158,41 @@ function preparedSourceFingerprint(args: {
   baseModelForEvaluation: string;
   evalSampleSeed: number;
   maxEvalExamples?: number;
+  datasetFingerprints: Record<string, string>;
 }): string {
   return hashJson({
+    training_method: args.request.training_method,
     spec_snapshot: args.request.spec_snapshot,
     dataset_prebuilt: args.request.dataset_prebuilt ?? null,
+    dataset_fingerprints: args.datasetFingerprints,
     base_model_for_evaluation: args.baseModelForEvaluation,
     eval_sample_seed: args.evalSampleSeed,
     max_eval_examples: args.maxEvalExamples ?? null,
   });
+}
+
+async function countJsonlRows(path: string): Promise<number> {
+  const text = await readFile(path, "utf8");
+  return text.split(/\r?\n/).filter((line) => line.trim()).length;
+}
+
+async function hashFile(path: string): Promise<string> {
+  return createHash("sha256").update(await readFile(path)).digest("hex");
+}
+
+async function datasetFingerprints(request: FineTuneRunRequest): Promise<Record<string, string>> {
+  const dataset = request.dataset_prebuilt;
+  if (!dataset) return {};
+  const entries: Array<[string, string | undefined]> = [
+    ["training", dataset.training],
+    ["validation", dataset.validation],
+    ["test", dataset.test],
+  ];
+  const fingerprints: Record<string, string> = {};
+  for (const [key, value] of entries) {
+    if (value) fingerprints[key] = await hashFile(stripFileUri(value));
+  }
+  return fingerprints;
 }
 
 function statusForProgressStage(stage: string): LocalRunStatus {
@@ -263,7 +306,17 @@ async function computePreparedRun(args: {
   let evalSplit: EvalSplit = "spec_examples";
   let trainingExampleCount: number | null = examples.length;
 
-  if (request.dataset_prebuilt) {
+  if (request.training_method === "dpo") {
+    if (!request.dataset_prebuilt) throw new Error("DPO training requires dataset_prebuilt.");
+    const trainingPath = stripFileUri(request.dataset_prebuilt.training);
+    if (args.writeArtifacts) await copyFile(trainingPath, artifacts.trainingJsonl);
+    trainingExampleCount = await countJsonlRows(trainingPath);
+    const evaluation = selectDpoEvaluation(request);
+    evalSplit = evaluation.split;
+    examples = evaluation.path
+      ? await examplesFromChatJsonl(evaluation.path)
+      : examplesFromSpec(request.spec_snapshot);
+  } else if (request.dataset_prebuilt) {
     const trainingPath = stripFileUri(request.dataset_prebuilt.training);
     const evaluation = selectPrebuiltEvaluation(request.dataset_prebuilt);
     evalSplit = evaluation.split;
@@ -296,15 +349,18 @@ async function computePreparedRun(args: {
   const baseModelForEvaluation = config.paths.baseModel ?? request.spec_snapshot.base_model;
   const maxEvalExamples = config.evaluation.maxExamples ?? request.hyperparameters.max_eval_examples;
   const evalExamplesUsed = Math.min(maxEvalExamples ?? examples.length, examples.length);
+  const fingerprints = await datasetFingerprints(request);
   const metadata: StageMetadata = {
     run_id: request.run_id,
     behavior_spec_id: request.behavior_spec_id,
     user_id: request.user_id,
+    training_method: request.training_method,
     source_fingerprint: preparedSourceFingerprint({
       request,
       baseModelForEvaluation,
       evalSampleSeed,
       maxEvalExamples,
+      datasetFingerprints: fingerprints,
     }),
     eval_split: evalSplit,
     eval_sample_seed: evalSampleSeed,
@@ -313,6 +369,8 @@ async function computePreparedRun(args: {
     max_eval_examples: maxEvalExamples ?? null,
     training_example_count: trainingExampleCount,
     dataset_prebuilt: Boolean(request.dataset_prebuilt),
+    dataset_format: request.dataset_prebuilt?.format ?? null,
+    dataset_fingerprints: fingerprints,
     dataset_uri: fileUri(artifacts.trainingJsonl),
     base_model_for_evaluation: baseModelForEvaluation,
     system_prompt_sha256: createHash("sha256").update(system).digest("hex"),
@@ -651,7 +709,9 @@ async function runReportStage(args: {
     run_metadata: {
       base_model: args.prepared.request.spec_snapshot.base_model,
       fine_tuned_model_id: training.model_artifact_uri ?? training.training_job_name,
+      training_method: args.prepared.request.training_method,
       dataset_prebuilt: args.prepared.metadata.dataset_prebuilt,
+      dataset_format: args.prepared.metadata.dataset_format,
       dataset_uri: fileUri(args.prepared.artifacts.trainingJsonl),
       spec_example_count: args.prepared.request.spec_snapshot.examples.length,
       training_example_count: args.prepared.metadata.training_example_count,

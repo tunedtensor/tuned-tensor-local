@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import { cwd } from "node:process";
 import { fileURLToPath } from "node:url";
 import { compareRuns } from "./compare.js";
-import { fineTuneRunRequestSchema, localBehaviorSpecFileSchema, localRunnerConfigSchema, specSnapshotSchema, type LocalRunnerConfig } from "./contracts.js";
+import { fineTuneRunRequestSchema, localBehaviorSpecFileSchema, localRunnerConfigSchema, specSnapshotSchema, type FineTuneRunRequest, type LocalRunnerConfig } from "./contracts.js";
 import { buildSystemMessage } from "./dataset.js";
 import { runLocalLabelingJob } from "./labeling.js";
 import {
@@ -15,6 +15,7 @@ import {
   type LocalRunStage,
 } from "./orchestrator.js";
 import { runDoctor } from "./doctor.js";
+import { resolveTrainingModel } from "./model-registry.js";
 import { createLocalStore } from "./store.js";
 import { serveLocalDashboard } from "./server.js";
 import {
@@ -234,6 +235,14 @@ function createConsoleReporter(options: { verbose: boolean; quiet: boolean }): L
   };
 }
 
+function assertSupportedValidateShape(request: FineTuneRunRequest, config: LocalRunnerConfig): void {
+  if (request.training_method !== "dpo" || config.training.backend === "command") return;
+  const model = resolveTrainingModel(request.spec_snapshot.base_model);
+  if (model.loader === "image_text_to_text") {
+    throw new Error("Bundled DPO training supports text causal-LM models only in v1. Use a causal_lm base model or training.backend=command for a custom DPO trainer.");
+  }
+}
+
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
@@ -292,13 +301,16 @@ async function main(argv: string[]): Promise<void> {
     });
     const request = input.request;
     const config = await configFromArgv(argv);
+    assertSupportedValidateShape(request, config);
     printJson({
       ok: true,
       input_kind: input.kind,
       input_path: input.path,
       run_id: request.run_id,
       behavior_spec_id: request.behavior_spec_id,
+      training_method: request.training_method,
       base_model: request.spec_snapshot.base_model,
+      dataset_format: request.dataset_prebuilt?.format ?? null,
       artifact_root: config.artifactRoot,
       store_root: config.storeRoot,
       dry_run: config.dryRun,

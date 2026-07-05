@@ -16,6 +16,10 @@ function chatRow(input: string, output: string): string {
   });
 }
 
+function preferenceRow(prompt: string, chosen: string, rejected: string): string {
+  return JSON.stringify({ prompt, chosen, rejected });
+}
+
 async function exists(path: string): Promise<boolean> {
   try {
     await stat(path);
@@ -377,6 +381,204 @@ test("uses prebuilt test split for evaluation while preserving training artifact
     const datasetText = await readFile(result.report.artifact_uris.dataset.replace(/^file:\/\//, ""), "utf8");
     assert.match(datasetText, /train input/);
     assert.doesNotMatch(datasetText, /test input/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DPO dry run trains on preference JSONL and evaluates spec examples", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-dpo-spec-eval-"));
+  try {
+    const trainingPath = join(root, "preferences.jsonl");
+    const preferenceRows = [
+      preferenceRow("prefer short", "yes", "yes, and also here is a long aside"),
+      preferenceRow("prefer JSON", "{\"ok\":true}", "ok"),
+    ].join("\n");
+    await writeFile(trainingPath, `${preferenceRows}\n`, "utf8");
+
+    const request = fineTuneRunRequestSchema.parse({
+      run_id: "41414141-4141-4441-8441-414141414141",
+      user_id: "local-user",
+      behavior_spec_id: "42424242-4242-4442-8442-424242424242",
+      run_number: 1,
+      training_method: "dpo",
+      spec_snapshot: {
+        name: "DPO Spec Eval",
+        description: "",
+        system_prompt: "Return concise answers.",
+        guidelines: [],
+        constraints: [],
+        base_model: "Qwen/Qwen3.5-2B",
+        examples: [{ input: "spec prompt", output: "spec answer" }],
+      },
+      hyperparameters: { n_epochs: 1, dpo_beta: 0.2 },
+      dataset_prebuilt: {
+        training: `file://${trainingPath}`,
+        format: "preference_jsonl",
+      },
+    });
+    const config = localRunnerConfigSchema.parse({
+      artifactRoot: join(root, "artifacts"),
+      storeRoot: join(root, "store"),
+      dryRun: true,
+      evaluation: { scoring: { mode: "exact_match" } },
+    });
+
+    const result = await runLocalFineTune({ request, config });
+
+    assert.equal(result.report.run_metadata.training_method, "dpo");
+    assert.equal(result.report.run_metadata.dataset_format, "preference_jsonl");
+    assert.equal(result.report.run_metadata.training_example_count, 2);
+    assert.equal(result.report.baseline.eval_split, "spec_examples");
+    assert.equal(result.report.baseline.results[0]?.prompt, "spec prompt");
+    assert.equal(result.report.candidate.results[0]?.expected, "spec answer");
+
+    const datasetText = await readFile(result.report.artifact_uris.dataset.replace(/^file:\/\//, ""), "utf8");
+    assert.equal(datasetText, `${preferenceRows}\n`);
+    assert.doesNotMatch(datasetText, /spec prompt/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DPO evaluation prefers prebuilt test over validation and never uses preference rows", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-dpo-test-eval-"));
+  try {
+    const trainingPath = join(root, "preferences.jsonl");
+    const validationPath = join(root, "validation.chat.jsonl");
+    const testPath = join(root, "test.chat.jsonl");
+    await writeFile(trainingPath, `${preferenceRow("preference prompt", "chosen", "rejected")}\n`, "utf8");
+    await writeFile(validationPath, `${chatRow("validation prompt", "validation answer")}\n`, "utf8");
+    await writeFile(testPath, `${chatRow("test prompt", "test answer")}\n`, "utf8");
+
+    const request = fineTuneRunRequestSchema.parse({
+      run_id: "51515151-5151-4551-8551-515151515151",
+      user_id: "local-user",
+      behavior_spec_id: "52525252-5252-4552-8552-525252525252",
+      run_number: 1,
+      training_method: "dpo",
+      spec_snapshot: {
+        name: "DPO Test Eval",
+        description: "",
+        system_prompt: "Return concise answers.",
+        guidelines: [],
+        constraints: [],
+        base_model: "Qwen/Qwen3.5-2B",
+        examples: [{ input: "spec prompt", output: "spec answer" }],
+      },
+      dataset_prebuilt: {
+        training: `file://${trainingPath}`,
+        validation: `file://${validationPath}`,
+        test: `file://${testPath}`,
+        format: "preference_jsonl",
+      },
+    });
+    const config = localRunnerConfigSchema.parse({
+      artifactRoot: join(root, "artifacts"),
+      storeRoot: join(root, "store"),
+      dryRun: true,
+      evaluation: { scoring: { mode: "exact_match" } },
+    });
+
+    const result = await runLocalFineTune({ request, config });
+
+    assert.equal(result.report.baseline.eval_split, "prebuilt_test");
+    assert.equal(result.report.baseline.results[0]?.prompt, "test prompt");
+    assert.equal(result.report.baseline.results[0]?.expected, "test answer");
+    assert.notEqual(result.report.baseline.results[0]?.prompt, "preference prompt");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("DPO prepare refreshes when preference file contents change", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-dpo-refresh-"));
+  try {
+    const trainingPath = join(root, "preferences.jsonl");
+    await writeFile(trainingPath, `${preferenceRow("first preference", "chosen", "rejected")}\n`, "utf8");
+
+    const request = fineTuneRunRequestSchema.parse({
+      run_id: "61616161-6161-4661-8661-616161616161",
+      user_id: "local-user",
+      behavior_spec_id: "62626262-6262-4662-8662-626262626262",
+      run_number: 1,
+      training_method: "dpo",
+      spec_snapshot: {
+        name: "DPO Refresh",
+        description: "",
+        system_prompt: "Return concise answers.",
+        guidelines: [],
+        constraints: [],
+        base_model: "Qwen/Qwen3.5-2B",
+        examples: [{ input: "spec prompt", output: "spec answer" }],
+      },
+      dataset_prebuilt: {
+        training: `file://${trainingPath}`,
+        format: "preference_jsonl",
+      },
+    });
+    const config = localRunnerConfigSchema.parse({
+      artifactRoot: join(root, "artifacts"),
+      storeRoot: join(root, "store"),
+      dryRun: true,
+    });
+
+    const prepared = await runLocalFineTuneStage({ request, config, stage: "prepare" });
+    assert.match(await readFile(prepared.artifacts.training_jsonl, "utf8"), /first preference/);
+
+    await writeFile(trainingPath, `${preferenceRow("second preference", "chosen", "rejected")}\n`, "utf8");
+    await runLocalFineTuneStage({ request, config, stage: "prepare" });
+    const refreshed = await readFile(prepared.artifacts.training_jsonl, "utf8");
+    assert.match(refreshed, /second preference/);
+    assert.doesNotMatch(refreshed, /first preference/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("prepare refreshes when training method changes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-method-refresh-"));
+  try {
+    const trainingPath = join(root, "preferences.jsonl");
+    await writeFile(trainingPath, `${preferenceRow("preference prompt", "chosen", "rejected")}\n`, "utf8");
+
+    const base = {
+      run_id: "71717171-7171-4771-8771-717171717171",
+      user_id: "local-user",
+      behavior_spec_id: "72727272-7272-4772-8772-727272727272",
+      run_number: 1,
+      spec_snapshot: {
+        name: "Method Refresh",
+        description: "",
+        system_prompt: "Return labels.",
+        guidelines: [],
+        constraints: [],
+        base_model: "Qwen/Qwen3.5-2B",
+        examples: [{ input: "spec prompt", output: "spec answer" }],
+      },
+    };
+    const config = localRunnerConfigSchema.parse({
+      artifactRoot: join(root, "artifacts"),
+      storeRoot: join(root, "store"),
+      dryRun: true,
+    });
+
+    const sftRequest = fineTuneRunRequestSchema.parse(base);
+    const prepared = await runLocalFineTuneStage({ request: sftRequest, config, stage: "prepare" });
+    assert.match(await readFile(prepared.artifacts.training_jsonl, "utf8"), /messages/);
+
+    const dpoRequest = fineTuneRunRequestSchema.parse({
+      ...base,
+      training_method: "dpo",
+      dataset_prebuilt: {
+        training: `file://${trainingPath}`,
+        format: "preference_jsonl",
+      },
+    });
+    await runLocalFineTuneStage({ request: dpoRequest, config, stage: "prepare" });
+    const refreshed = await readFile(prepared.artifacts.training_jsonl, "utf8");
+    assert.match(refreshed, /preference prompt/);
+    assert.doesNotMatch(refreshed, /messages/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

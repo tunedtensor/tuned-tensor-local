@@ -1,6 +1,8 @@
 import { z } from "zod";
 import { canonicalizeTrainingModel } from "./model-registry.js";
 
+export const trainingMethodSchema = z.enum(["sft", "dpo"]);
+
 export const documentInputAssetSchema = z.object({
   type: z.literal("image").default("image"),
   mime_type: z.string().min(1).optional(),
@@ -35,7 +37,7 @@ export const datasetPrebuiltSchema = z.object({
   training: z.string().min(1),
   validation: z.string().min(1).optional(),
   test: z.string().min(1).optional(),
-  format: z.enum(["chat_jsonl", "document_ocr_chat_jsonl"]).optional(),
+  format: z.enum(["chat_jsonl", "document_ocr_chat_jsonl", "preference_jsonl"]).optional(),
 });
 
 export const fineTuneHyperparametersSchema = z.object({
@@ -52,6 +54,12 @@ export const fineTuneHyperparametersSchema = z.object({
   use_llm_judge: z.boolean().default(false),
   max_eval_examples: z.number().int().min(1).optional(),
   chat_template_kwargs: z.record(z.string(), z.unknown()).optional(),
+  dpo_beta: z.number().positive().optional(),
+  dpo_loss_type: z.string().min(1).optional(),
+  dpo_label_smoothing: z.number().min(0).max(1).optional(),
+  dpo_reference_free: z.boolean().optional(),
+  max_prompt_length: z.number().int().min(1).optional(),
+  max_completion_length: z.number().int().min(1).optional(),
 }).passthrough();
 
 export const modelArtifactMetadataSchema = z.object({
@@ -71,6 +79,7 @@ export const fineTuneRunRequestSchema = z.object({
   user_id: z.string().min(1),
   behavior_spec_id: z.string().uuid(),
   run_number: z.number().int().min(1),
+  training_method: trainingMethodSchema.default("sft"),
   spec_snapshot: specSnapshotSchema,
   hyperparameters: fineTuneHyperparametersSchema.default({
     n_epochs: 3,
@@ -81,7 +90,36 @@ export const fineTuneRunRequestSchema = z.object({
   artifacts: localArtifactsSchema.optional(),
   dataset_prebuilt: datasetPrebuiltSchema.optional(),
 }).superRefine((request, ctx) => {
-  if (request.spec_snapshot.examples.length === 0 && !request.dataset_prebuilt) {
+  if (request.training_method === "dpo") {
+    if (!request.dataset_prebuilt) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["dataset_prebuilt"],
+        message: "DPO training requires dataset_prebuilt.training with format preference_jsonl",
+      });
+    } else if (request.dataset_prebuilt.format !== "preference_jsonl") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["dataset_prebuilt", "format"],
+        message: "DPO training requires dataset_prebuilt.format to be preference_jsonl",
+      });
+    }
+    if (!request.dataset_prebuilt?.test && !request.dataset_prebuilt?.validation && request.spec_snapshot.examples.length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["spec_snapshot", "examples"],
+        message: "DPO evaluation requires dataset_prebuilt.test, dataset_prebuilt.validation, or spec_snapshot.examples",
+      });
+    }
+  } else if (request.dataset_prebuilt?.format === "preference_jsonl") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["dataset_prebuilt", "format"],
+      message: "preference_jsonl datasets require training_method dpo",
+    });
+  }
+
+  if (request.training_method === "sft" && request.spec_snapshot.examples.length === 0 && !request.dataset_prebuilt) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["spec_snapshot", "examples"],
@@ -94,6 +132,7 @@ export const localBehaviorSpecFileSchema = specSnapshotSchema.extend({
   id: z.string().uuid().optional(),
   user_id: z.string().min(1).default("local-user"),
   run_number: z.number().int().min(1).default(1),
+  training_method: trainingMethodSchema.default("sft"),
   hyperparameters: fineTuneHyperparametersSchema.optional(),
   artifacts: localArtifactsSchema.optional(),
   dataset_prebuilt: datasetPrebuiltSchema.optional(),
@@ -215,7 +254,9 @@ export const runReportSchema = z.object({
   run_metadata: z.object({
     base_model: z.string(),
     fine_tuned_model_id: z.string(),
+    training_method: trainingMethodSchema.default("sft"),
     dataset_prebuilt: z.boolean(),
+    dataset_format: z.enum(["chat_jsonl", "document_ocr_chat_jsonl", "preference_jsonl"]).nullable().optional(),
     dataset_uri: z.string(),
     spec_example_count: z.number().int().nonnegative(),
     training_example_count: z.number().int().nonnegative().nullable(),
