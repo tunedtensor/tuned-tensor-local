@@ -62,6 +62,26 @@ supported Hugging Face base model, but command trainers receive adapter-focused
 hyperparameters without injected LoRA/model-loader defaults. Custom
 hyperparameter keys are passed through to `TT_HYPERPARAMETERS_PATH`.
 
+## Continuing From a Fine-Tuned Model
+
+Start another loop from an existing TT Local model by passing the stored local
+model id:
+
+```bash
+tt-local run tunedtensor.json --parent-model local-<previous-run-id>
+```
+
+You can also set the parent adapter artifact explicitly:
+
+```bash
+tt-local run tunedtensor.json --parent-model-artifact file:///path/to/model.tar.gz
+```
+
+For config-only workflows, put the same value in
+`hyperparameters.parent_model_artifact`. The parent adapter becomes the
+baseline for the new run, and the bundled SFT/DPO trainers load it before
+continuing LoRA training.
+
 Non-Hugging Face artifacts can describe their layout in `training.artifact`:
 
 ```json

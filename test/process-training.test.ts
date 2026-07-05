@@ -114,6 +114,7 @@ test("command training hyperparameters allow external models and avoid bundled m
     },
     hyperparameters: {
       n_epochs: 1,
+      parent_model_artifact: "file:///tmp/parent-adapter",
       nanochat_depth: 1,
       custom_options: { compile: false },
     },
@@ -126,6 +127,7 @@ test("command training hyperparameters allow external models and avoid bundled m
   assert.equal(hyperparameters.nanochat_depth, "1");
   assert.equal(hyperparameters.custom_options, "{\"compile\":false}");
   assert.equal(hyperparameters.n_epochs, "1");
+  assert.equal(hyperparameters.parent_model_artifact, "file:///tmp/parent-adapter");
   assert.equal(hyperparameters.model_family, undefined);
   assert.equal(hyperparameters.model_loader, undefined);
   assert.equal(hyperparameters.lora_rank, undefined);
@@ -208,4 +210,28 @@ test("uv training still rejects external models", () => {
     () => buildTrainingHyperparameters(request),
     /Unsupported base model/,
   );
+});
+
+test("uv training hyperparameters include parent model artifact", () => {
+  const request = fineTuneRunRequestSchema.parse({
+    run_id: "10101010-1010-4010-8010-101010101010",
+    user_id: "user",
+    behavior_spec_id: "20202020-2020-4020-8020-202020202020",
+    run_number: 1,
+    spec_snapshot: {
+      name: "Continued",
+      description: "",
+      system_prompt: "",
+      base_model: "Qwen/Qwen3.5-2B",
+      examples: [{ input: "hello", output: "greeting" }],
+    },
+    hyperparameters: {
+      n_epochs: 1,
+      parent_model_artifact: "file:///tmp/parent-adapter",
+    },
+  });
+
+  const hyperparameters = buildTrainingHyperparameters(request);
+  assert.equal(hyperparameters.base_model, "Qwen/Qwen3.5-2B");
+  assert.equal(hyperparameters.parent_model_artifact, "file:///tmp/parent-adapter");
 });

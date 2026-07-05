@@ -11,7 +11,7 @@ from typing import Any
 
 import torch
 from datasets import Dataset as HFDataset
-from peft import LoraConfig
+from peft import LoraConfig, PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import DPOConfig, DPOTrainer
 
@@ -100,6 +100,39 @@ def resolve_model_source() -> str:
     return hp("base_model") or "Qwen/Qwen3.5-2B"
 
 
+def strip_file_uri(value: str | None) -> str | None:
+    if not value:
+        return value
+    if value.startswith("file://"):
+        return value[7:]
+    return value
+
+
+def resolve_adapter_path(value: str | None, tmp: Path) -> str | None:
+    path_value = strip_file_uri(value)
+    if not path_value:
+        return None
+    path = Path(path_value)
+    if path.is_file() and path.name.endswith(".tar.gz"):
+        extracted = tmp / "parent-adapter"
+        extracted.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(path, "r:gz") as tar:
+            extracted_root = extracted.resolve()
+            for member in tar.getmembers():
+                destination = (extracted / member.name).resolve()
+                try:
+                    destination.relative_to(extracted_root)
+                except ValueError:
+                    raise ValueError(f"Unsafe archive member: {member.name}")
+            tar.extractall(extracted)
+        candidates = [candidate for candidate in extracted.rglob("adapter_config.json")]
+        if candidates:
+            return str(candidates[0].parent)
+        directories = [candidate for candidate in extracted.iterdir() if candidate.is_dir()]
+        return str(directories[0] if len(directories) == 1 else extracted)
+    return str(path)
+
+
 def create_model_and_tokenizer(model_source: str):
     trust_remote_code = hp_bool("trust_remote_code", True)
     token = os.getenv("HF_TOKEN")
@@ -181,10 +214,13 @@ def dpo_config(output_dir: str) -> DPOConfig:
 
 
 def run_training(rows: list[dict[str, str]], model_source: str) -> dict[str, Any]:
-    model, tokenizer = create_model_and_tokenizer(model_source)
-    dataset = HFDataset.from_list(rows)
-
     with TemporaryDirectory() as tmp:
+        parent_adapter = resolve_adapter_path(hp("parent_model_artifact"), Path(tmp))
+        model, tokenizer = create_model_and_tokenizer(model_source)
+        if parent_adapter:
+            model = PeftModel.from_pretrained(model, parent_adapter, is_trainable=True)
+        dataset = HFDataset.from_list(rows)
+
         args = dpo_config(tmp)
         trainer_values: dict[str, Any] = {
             "model": model,
@@ -193,8 +229,9 @@ def run_training(rows: list[dict[str, str]], model_source: str) -> dict[str, Any
             "train_dataset": dataset,
             "processing_class": tokenizer,
             "tokenizer": tokenizer,
-            "peft_config": lora_config(),
         }
+        if not parent_adapter:
+            trainer_values["peft_config"] = lora_config()
         trainer = DPOTrainer(**supported_kwargs(DPOTrainer, trainer_values))
         result = trainer.train()
         trainer.save_model(MODEL_DIR)
@@ -217,6 +254,7 @@ def main() -> None:
         "training_method": "dpo",
         "preference_rows": len(rows),
         "model_source": model_source,
+        "parent_model_artifact": hp("parent_model_artifact"),
         "dpo_beta": hp_float("dpo_beta", 0.1),
         "dpo_loss_type": hp("dpo_loss_type", "sigmoid"),
         "train_runtime": round(time.time() - started, 3),

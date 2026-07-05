@@ -114,7 +114,8 @@ Commands:
   doctor [--config local-runner.json]
   validate [tunedtensor.json|request.json] [--config local-runner.json]
   run [tunedtensor.json|request.json] [--config local-runner.json] [--stage all|prepare|baseline|train|candidate|score|report]
-      [--run-id uuid] [--model-artifact path-or-file-uri] [--force] [--dry-run] [--verbose] [--quiet]
+      [--run-id uuid] [--parent-model local-model-id] [--parent-model-artifact path-or-file-uri]
+      [--model-artifact path-or-file-uri] [--force] [--dry-run] [--verbose] [--quiet]
   label <input.jsonl|input.csv> [--input-column col] [--spec tunedtensor.json] [--system-prompt "..."]
         [--model teacher-model] [--output labeled.jsonl] [--config local-runner.json] [--dry-run]
   serve [--config local-runner.json] [--host 127.0.0.1] [--port 8787]
@@ -141,6 +142,8 @@ const optionNamesWithValues = new Set([
   "--run-id",
   "--stage",
   "--model-artifact",
+  "--parent-model",
+  "--parent-model-artifact",
   "--input-column",
   "--system-prompt",
   "--spec",
@@ -243,6 +246,52 @@ function assertSupportedValidateShape(request: FineTuneRunRequest, config: Local
   }
 }
 
+interface ParentModelSelection {
+  artifactUri: string;
+  modelId?: string;
+  baseModel?: string;
+}
+
+async function parentModelSelectionFromArgv(
+  argv: string[],
+  config: LocalRunnerConfig,
+): Promise<ParentModelSelection | undefined> {
+  const parentModel = readOption(argv, "--parent-model");
+  const parentModelArtifact = readOption(argv, "--parent-model-artifact");
+  if (parentModel && parentModelArtifact) {
+    throw new Error("Use only one of --parent-model or --parent-model-artifact.");
+  }
+  if (parentModelArtifact) return { artifactUri: parentModelArtifact };
+  if (!parentModel) return undefined;
+  const store = createLocalStore(config.storeRoot);
+  const record = await store.getModel(parentModel);
+  return {
+    artifactUri: record.artifact_uri,
+    modelId: record.id,
+    baseModel: record.base_model,
+  };
+}
+
+function withParentModelArtifact(
+  request: FineTuneRunRequest,
+  parentModel?: ParentModelSelection,
+): FineTuneRunRequest {
+  if (!parentModel) return request;
+  if (parentModel.baseModel && parentModel.baseModel !== request.spec_snapshot.base_model) {
+    throw new Error(
+      `Parent model ${parentModel.modelId ?? ""} uses base model ${parentModel.baseModel}, `
+      + `but this run uses ${request.spec_snapshot.base_model}. Continue from a model with the same base model.`,
+    );
+  }
+  return fineTuneRunRequestSchema.parse({
+    ...request,
+    hyperparameters: {
+      ...request.hyperparameters,
+      parent_model_artifact: parentModel.artifactUri,
+    },
+  });
+}
+
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
@@ -337,9 +386,13 @@ async function main(argv: string[]): Promise<void> {
       }
     }
     const runId = readOption(argv, "--run-id");
-    const request = runId && input.kind === "request"
+    const baseRequest = runId && input.kind === "request"
       ? fineTuneRunRequestSchema.parse({ ...input.request, run_id: runId })
       : input.request;
+    const request = withParentModelArtifact(
+      baseRequest,
+      await parentModelSelectionFromArgv(argv, config),
+    );
     const stage = readRunStage(argv);
     const result = await runLocalFineTuneStage({
       request,
@@ -363,6 +416,7 @@ async function main(argv: string[]): Promise<void> {
         artifact_dir: result.artifactDir,
         model_id: `local-${result.report.run_id}`,
         fine_tuned_model_id: result.report.fine_tuned_model_id,
+        parent_model_artifact: result.report.run_metadata.parent_model_artifact ?? null,
         training_log: result.report.training.log_uri,
         baseline_eval: result.report.artifact_uris.baseline_eval,
         candidate_eval: result.report.artifact_uris.candidate_eval,
@@ -376,6 +430,7 @@ async function main(argv: string[]): Promise<void> {
         run_id: result.request.run_id,
         behavior_spec_id: result.request.behavior_spec_id,
         artifact_dir: result.artifactDir,
+        parent_model_artifact: result.request.hyperparameters.parent_model_artifact ?? null,
         artifacts: result.artifacts,
       });
     }

@@ -82,6 +82,9 @@ export function buildTrainingHyperparameters(
     ...(hyper.chat_template_kwargs
       ? { chat_template_kwargs: JSON.stringify(hyper.chat_template_kwargs) }
       : {}),
+    ...(hyper.parent_model_artifact
+      ? { parent_model_artifact: hyper.parent_model_artifact }
+      : {}),
   };
 }
 
@@ -186,6 +189,7 @@ export async function launchProcessTraining(args: {
 }): Promise<TrainingReport> {
   const { request, artifacts, config } = args;
   const jobName = `tt-local-${request.run_id}`;
+  const parentModelArtifact = request.hyperparameters.parent_model_artifact;
   await mkdir(artifacts.trainingDir, { recursive: true });
   await copyDatasetToTrainingChannel(artifacts);
   const hyperparameters = buildTrainingHyperparameters(request, { backend: config.training.backend });
@@ -205,6 +209,7 @@ export async function launchProcessTraining(args: {
       training_job_name: jobName,
       model_artifact_uri: fileUri(artifacts.trainingModelDir),
       base_model_artifact_uri: config.paths.baseModel ? fileUri(config.paths.baseModel) : undefined,
+      parent_model_artifact_uri: parentModelArtifact,
       artifact_metadata: config.training.artifact,
       metrics: { dry_run: true },
       exit_code: 0,
@@ -291,6 +296,7 @@ export async function launchProcessTraining(args: {
     training_job_name: jobName,
     model_artifact_uri: modelUri,
     base_model_artifact_uri: config.paths.baseModel ? fileUri(config.paths.baseModel) : undefined,
+    parent_model_artifact_uri: parentModelArtifact,
     artifact_metadata: config.training.artifact,
     metrics,
     exit_code: exitCode,
