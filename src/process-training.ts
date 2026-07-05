@@ -35,6 +35,19 @@ function defaultTrainingScript(request: FineTuneRunRequest): string {
     : "training/sft-local/src/train.py";
 }
 
+function buildDpoHyperparameters(request: FineTuneRunRequest): Record<string, string> {
+  if (request.training_method !== "dpo") return {};
+  const hyper = request.hyperparameters;
+  return {
+    dpo_beta: String(hyper.dpo_beta ?? 0.1),
+    dpo_loss_type: hyper.dpo_loss_type ?? "sigmoid",
+    dpo_label_smoothing: String(hyper.dpo_label_smoothing ?? 0),
+    dpo_reference_free: String(hyper.dpo_reference_free ?? false),
+    ...(hyper.max_prompt_length ? { max_prompt_length: String(hyper.max_prompt_length) } : {}),
+    ...(hyper.max_completion_length ? { max_completion_length: String(hyper.max_completion_length) } : {}),
+  };
+}
+
 export function buildTrainingHyperparameters(
   request: FineTuneRunRequest,
   options: { backend?: LocalRunnerConfig["training"]["backend"] } = {},
@@ -65,12 +78,7 @@ export function buildTrainingHyperparameters(
     save_adapter_only: String(hyper.save_adapter_only),
     requires_hf_token: String(model.requiresHfToken),
     trust_remote_code: String(model.trustRemoteCode),
-    dpo_beta: String(hyper.dpo_beta ?? 0.1),
-    dpo_loss_type: hyper.dpo_loss_type ?? "sigmoid",
-    dpo_label_smoothing: String(hyper.dpo_label_smoothing ?? 0),
-    dpo_reference_free: String(hyper.dpo_reference_free ?? false),
-    ...(hyper.max_prompt_length ? { max_prompt_length: String(hyper.max_prompt_length) } : {}),
-    ...(hyper.max_completion_length ? { max_completion_length: String(hyper.max_completion_length) } : {}),
+    ...buildDpoHyperparameters(request),
     ...(hyper.chat_template_kwargs
       ? { chat_template_kwargs: JSON.stringify(hyper.chat_template_kwargs) }
       : {}),

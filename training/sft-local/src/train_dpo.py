@@ -57,7 +57,7 @@ def hp_bool(name: str, default: bool) -> bool:
     return (hp(name, str(default)) or "").lower() in {"1", "true", "yes", "y"}
 
 
-def filtered_kwargs(callable_obj: Any, values: dict[str, Any]) -> dict[str, Any]:
+def supported_kwargs(callable_obj: Any, values: dict[str, Any]) -> dict[str, Any]:
     accepted = set(inspect.signature(callable_obj).parameters)
     return {key: value for key, value in values.items() if key in accepted}
 
@@ -87,6 +87,13 @@ def resolve_model_source() -> str:
         extracted = Path("/tmp/base-model")
         extracted.mkdir(parents=True, exist_ok=True)
         with tarfile.open(archive, "r:gz") as tar:
+            extracted_root = extracted.resolve()
+            for member in tar.getmembers():
+                destination = (extracted / member.name).resolve()
+                try:
+                    destination.relative_to(extracted_root)
+                except ValueError:
+                    raise ValueError(f"Unsafe archive member: {member.name}")
             tar.extractall(extracted)
         candidates = [path for path in extracted.iterdir() if path.is_dir()]
         return str(candidates[0] if len(candidates) == 1 else extracted)
@@ -145,7 +152,7 @@ def create_model_archive() -> Path:
 def dpo_config(output_dir: str) -> DPOConfig:
     max_prompt_length = hp("max_prompt_length")
     max_completion_length = hp("max_completion_length")
-    values: dict[str, Any] = {
+    config_values: dict[str, Any] = {
         "output_dir": output_dir,
         "num_train_epochs": hp_int("n_epochs", 3),
         "learning_rate": hp_float("learning_rate", 0.00001),
@@ -167,7 +174,10 @@ def dpo_config(output_dir: str) -> DPOConfig:
         "max_prompt_length": int(max_prompt_length) if max_prompt_length else None,
         "max_completion_length": int(max_completion_length) if max_completion_length else None,
     }
-    return DPOConfig(**filtered_kwargs(DPOConfig, {key: value for key, value in values.items() if value is not None}))
+    return DPOConfig(**supported_kwargs(
+        DPOConfig,
+        {key: value for key, value in config_values.items() if value is not None},
+    ))
 
 
 def run_training(rows: list[dict[str, str]], model_source: str) -> dict[str, Any]:
@@ -185,7 +195,7 @@ def run_training(rows: list[dict[str, str]], model_source: str) -> dict[str, Any
             "tokenizer": tokenizer,
             "peft_config": lora_config(),
         }
-        trainer = DPOTrainer(**filtered_kwargs(DPOTrainer, trainer_values))
+        trainer = DPOTrainer(**supported_kwargs(DPOTrainer, trainer_values))
         result = trainer.train()
         trainer.save_model(MODEL_DIR)
 

@@ -44,7 +44,9 @@ test("builds text and multimodal model loader hyperparameters", () => {
   };
 
   const textRequest = fineTuneRunRequestSchema.parse(base);
-  assert.equal(buildTrainingHyperparameters(textRequest).model_loader, "causal_lm");
+  const textHyperparameters = buildTrainingHyperparameters(textRequest);
+  assert.equal(textHyperparameters.model_loader, "causal_lm");
+  assert.equal(textHyperparameters.dpo_beta, undefined);
 
   const multimodalRequest = fineTuneRunRequestSchema.parse({
     ...base,

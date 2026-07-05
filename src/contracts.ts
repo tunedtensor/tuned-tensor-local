@@ -2,6 +2,7 @@ import { z } from "zod";
 import { canonicalizeTrainingModel } from "./model-registry.js";
 
 export const trainingMethodSchema = z.enum(["sft", "dpo"]);
+export const datasetFormatSchema = z.enum(["chat_jsonl", "document_ocr_chat_jsonl", "preference_jsonl"]);
 
 export const documentInputAssetSchema = z.object({
   type: z.literal("image").default("image"),
@@ -37,7 +38,7 @@ export const datasetPrebuiltSchema = z.object({
   training: z.string().min(1),
   validation: z.string().min(1).optional(),
   test: z.string().min(1).optional(),
-  format: z.enum(["chat_jsonl", "document_ocr_chat_jsonl", "preference_jsonl"]).optional(),
+  format: datasetFormatSchema.optional(),
 });
 
 export const fineTuneHyperparametersSchema = z.object({
@@ -256,7 +257,7 @@ export const runReportSchema = z.object({
     fine_tuned_model_id: z.string(),
     training_method: trainingMethodSchema.default("sft"),
     dataset_prebuilt: z.boolean(),
-    dataset_format: z.enum(["chat_jsonl", "document_ocr_chat_jsonl", "preference_jsonl"]).nullable().optional(),
+    dataset_format: datasetFormatSchema.nullable().optional(),
     dataset_uri: z.string(),
     spec_example_count: z.number().int().nonnegative(),
     training_example_count: z.number().int().nonnegative().nullable(),
