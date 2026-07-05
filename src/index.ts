@@ -114,7 +114,8 @@ Commands:
   doctor [--config local-runner.json]
   validate [tunedtensor.json|request.json] [--config local-runner.json]
   run [tunedtensor.json|request.json] [--config local-runner.json] [--stage all|prepare|baseline|train|candidate|score|report]
-      [--run-id uuid] [--model-artifact path-or-file-uri] [--force] [--dry-run] [--verbose] [--quiet]
+      [--run-id uuid] [--parent-model local-model-id] [--parent-model-artifact path-or-file-uri]
+      [--model-artifact path-or-file-uri] [--force] [--dry-run] [--verbose] [--quiet]
   label <input.jsonl|input.csv> [--input-column col] [--spec tunedtensor.json] [--system-prompt "..."]
         [--model teacher-model] [--output labeled.jsonl] [--config local-runner.json] [--dry-run]
   serve [--config local-runner.json] [--host 127.0.0.1] [--port 8787]
@@ -141,6 +142,8 @@ const optionNamesWithValues = new Set([
   "--run-id",
   "--stage",
   "--model-artifact",
+  "--parent-model",
+  "--parent-model-artifact",
   "--input-column",
   "--system-prompt",
   "--spec",
@@ -243,6 +246,36 @@ function assertSupportedValidateShape(request: FineTuneRunRequest, config: Local
   }
 }
 
+async function parentModelArtifactFromArgv(
+  argv: string[],
+  config: LocalRunnerConfig,
+): Promise<string | undefined> {
+  const parentModel = readOption(argv, "--parent-model");
+  const parentModelArtifact = readOption(argv, "--parent-model-artifact");
+  if (parentModel && parentModelArtifact) {
+    throw new Error("Use only one of --parent-model or --parent-model-artifact.");
+  }
+  if (parentModelArtifact) return parentModelArtifact;
+  if (!parentModel) return undefined;
+  const store = createLocalStore(config.storeRoot);
+  const record = await store.getModel(parentModel);
+  return record.artifact_uri;
+}
+
+function withParentModelArtifact(
+  request: FineTuneRunRequest,
+  parentModelArtifact?: string,
+): FineTuneRunRequest {
+  if (!parentModelArtifact) return request;
+  return fineTuneRunRequestSchema.parse({
+    ...request,
+    hyperparameters: {
+      ...request.hyperparameters,
+      parent_model_artifact: parentModelArtifact,
+    },
+  });
+}
+
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
@@ -337,9 +370,13 @@ async function main(argv: string[]): Promise<void> {
       }
     }
     const runId = readOption(argv, "--run-id");
-    const request = runId && input.kind === "request"
+    const baseRequest = runId && input.kind === "request"
       ? fineTuneRunRequestSchema.parse({ ...input.request, run_id: runId })
       : input.request;
+    const request = withParentModelArtifact(
+      baseRequest,
+      await parentModelArtifactFromArgv(argv, config),
+    );
     const stage = readRunStage(argv);
     const result = await runLocalFineTuneStage({
       request,

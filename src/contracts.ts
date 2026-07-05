@@ -61,6 +61,7 @@ export const fineTuneHyperparametersSchema = z.object({
   dpo_reference_free: z.boolean().optional(),
   max_prompt_length: z.number().int().min(1).optional(),
   max_completion_length: z.number().int().min(1).optional(),
+  parent_model_artifact: z.string().min(1).optional(),
 }).passthrough();
 
 export const modelArtifactMetadataSchema = z.object({
@@ -227,6 +228,7 @@ export const trainingReportSchema = z.object({
   training_job_name: z.string(),
   model_artifact_uri: z.string().optional(),
   base_model_artifact_uri: z.string().optional(),
+  parent_model_artifact_uri: z.string().optional(),
   artifact_metadata: modelArtifactMetadataSchema.optional(),
   metrics: z.record(z.string(), z.unknown()).nullable(),
   exit_code: z.number().int().nullable(),
@@ -255,6 +257,7 @@ export const runReportSchema = z.object({
   run_metadata: z.object({
     base_model: z.string(),
     fine_tuned_model_id: z.string(),
+    parent_model_artifact: z.string().nullable().optional(),
     training_method: trainingMethodSchema.default("sft"),
     dataset_prebuilt: z.boolean(),
     dataset_format: datasetFormatSchema.nullable().optional(),

@@ -935,3 +935,48 @@ test("candidate stage accepts an external model artifact", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("continued run evaluates parent model as baseline", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-stage-parent-model-"));
+  try {
+    const parentArtifact = `file://${join(root, "parent-adapter")}`;
+    const request = fineTuneRunRequestSchema.parse({
+      run_id: "14141414-1414-4414-8414-141414141414",
+      user_id: "local-user",
+      behavior_spec_id: "25252525-2525-4525-8525-252525252525",
+      run_number: 2,
+      spec_snapshot: {
+        name: "Continued candidate",
+        description: "",
+        system_prompt: "Return labels.",
+        guidelines: [],
+        constraints: [],
+        base_model: "Qwen/Qwen3.5-2B",
+        examples: [
+          { input: "Classify: good", output: "positive" },
+          { input: "Classify: bad", output: "negative" },
+        ],
+      },
+      hyperparameters: {
+        n_epochs: 1,
+        parent_model_artifact: parentArtifact,
+      },
+    });
+    const config = localRunnerConfigSchema.parse({
+      artifactRoot: join(root, "artifacts"),
+      storeRoot: join(root, "store"),
+      dryRun: true,
+      evaluation: { scoring: { mode: "exact_match" } },
+    });
+
+    const result = await runLocalFineTuneStage({ request, config, stage: "all" });
+    const baseline = JSON.parse(await readFile(result.artifacts.baseline_eval, "utf8"));
+    const training = JSON.parse(await readFile(result.artifacts.training_report, "utf8"));
+
+    assert.equal(baseline.model_id, parentArtifact);
+    assert.equal(training.parent_model_artifact_uri, parentArtifact);
+    assert.equal(result.report?.run_metadata.parent_model_artifact, parentArtifact);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

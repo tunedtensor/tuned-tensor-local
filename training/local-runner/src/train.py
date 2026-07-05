@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 from datasets import Dataset as HFDataset
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from PIL import Image
 from torch.utils.data import Dataset
 from transformers import (
@@ -96,6 +96,39 @@ def resolve_model_source() -> str:
         candidates = [path for path in extracted.iterdir() if path.is_dir()]
         return str(candidates[0] if len(candidates) == 1 else extracted)
     return hp("base_model") or "Qwen/Qwen3.5-2B"
+
+
+def strip_file_uri(value: str | None) -> str | None:
+    if not value:
+        return value
+    if value.startswith("file://"):
+        return value[7:]
+    return value
+
+
+def resolve_adapter_path(value: str | None, tmp: Path) -> str | None:
+    path_value = strip_file_uri(value)
+    if not path_value:
+        return None
+    path = Path(path_value)
+    if path.is_file() and path.name.endswith(".tar.gz"):
+        extracted = tmp / "parent-adapter"
+        extracted.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(path, "r:gz") as tar:
+            extracted_root = extracted.resolve()
+            for member in tar.getmembers():
+                destination = (extracted / member.name).resolve()
+                try:
+                    destination.relative_to(extracted_root)
+                except ValueError:
+                    raise ValueError(f"Unsafe archive member: {member.name}")
+            tar.extractall(extracted)
+        candidates = [candidate for candidate in extracted.rglob("adapter_config.json")]
+        if candidates:
+            return str(candidates[0].parent)
+        directories = [candidate for candidate in extracted.iterdir() if candidate.is_dir()]
+        return str(directories[0] if len(directories) == 1 else extracted)
+    return str(path)
 
 
 def chat_template_kwargs() -> dict[str, Any]:
@@ -320,14 +353,19 @@ def create_model_archive() -> Path:
 
 
 def run_text_training(rows: list[dict[str, Any]], model_source: str) -> dict[str, Any]:
-    model, tokenizer = create_text_model_and_tokenizer(model_source)
-    model = maybe_apply_lora(model)
-
-    texts = [row_to_text(tokenizer, row) for row in rows]
-    dataset = TextDataset(texts, tokenizer, max_length=hp_int("max_seq_length", 2048))
-    collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-
     with TemporaryDirectory() as tmp:
+        parent_adapter = resolve_adapter_path(hp("parent_model_artifact"), Path(tmp))
+        model, tokenizer = create_text_model_and_tokenizer(model_source)
+        model = (
+            PeftModel.from_pretrained(model, parent_adapter, is_trainable=True)
+            if parent_adapter
+            else maybe_apply_lora(model)
+        )
+
+        texts = [row_to_text(tokenizer, row) for row in rows]
+        dataset = TextDataset(texts, tokenizer, max_length=hp_int("max_seq_length", 2048))
+        collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
         args = TrainingArguments(
             output_dir=tmp,
             num_train_epochs=hp_int("n_epochs", 3),
@@ -355,10 +393,13 @@ def run_text_training(rows: list[dict[str, Any]], model_source: str) -> dict[str
 
 
 def run_multimodal_training(rows: list[dict[str, Any]], model_source: str) -> dict[str, Any]:
-    model, processor = create_multimodal_model_and_processor(model_source)
-    dataset = HFDataset.from_list([row_to_multimodal_example(row) for row in rows])
-
     with TemporaryDirectory() as tmp:
+        parent_adapter = resolve_adapter_path(hp("parent_model_artifact"), Path(tmp))
+        model, processor = create_multimodal_model_and_processor(model_source)
+        if parent_adapter:
+            model = PeftModel.from_pretrained(model, parent_adapter, is_trainable=True)
+        dataset = HFDataset.from_list([row_to_multimodal_example(row) for row in rows])
+
         args = SFTConfig(
             output_dir=tmp,
             num_train_epochs=hp_int("n_epochs", 3),
@@ -376,13 +417,15 @@ def run_multimodal_training(rows: list[dict[str, Any]], model_source: str) -> di
             dataset_kwargs={"skip_prepare_dataset": True},
             max_length=None,
         )
-        trainer = SFTTrainer(
-            model=model,
-            args=args,
-            train_dataset=dataset,
-            processing_class=processor,
-            peft_config=multimodal_lora_config(),
-        )
+        trainer_values: dict[str, Any] = {
+            "model": model,
+            "args": args,
+            "train_dataset": dataset,
+            "processing_class": processor,
+        }
+        if not parent_adapter:
+            trainer_values["peft_config"] = multimodal_lora_config()
+        trainer = SFTTrainer(**trainer_values)
         result = trainer.train()
         trainer.save_model(MODEL_DIR)
     processor.save_pretrained(MODEL_DIR)
@@ -407,6 +450,7 @@ def main() -> None:
         "training_rows": len(rows),
         "model_source": model_source,
         "model_loader": model_loader,
+        "parent_model_artifact": hp("parent_model_artifact"),
         "train_runtime": round(time.time() - started, 3),
         **{key: float(value) for key, value in metrics.items() if isinstance(value, (int, float))},
         "model_archive": str(archive_path),

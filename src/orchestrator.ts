@@ -73,6 +73,7 @@ interface StageMetadata {
   dataset_fingerprints: Record<string, string>;
   dataset_uri: string;
   base_model_for_evaluation: string;
+  parent_model_artifact: string | null;
   system_prompt_sha256: string;
   prepared_at: string;
 }
@@ -156,6 +157,7 @@ function hashJson(value: unknown): string {
 function preparedSourceFingerprint(args: {
   request: FineTuneRunRequest;
   baseModelForEvaluation: string;
+  parentModelArtifact?: string;
   evalSampleSeed: number;
   maxEvalExamples?: number;
   datasetFingerprints: Record<string, string>;
@@ -166,6 +168,7 @@ function preparedSourceFingerprint(args: {
     dataset_prebuilt: args.request.dataset_prebuilt ?? null,
     dataset_fingerprints: args.datasetFingerprints,
     base_model_for_evaluation: args.baseModelForEvaluation,
+    parent_model_artifact: args.parentModelArtifact ?? null,
     eval_sample_seed: args.evalSampleSeed,
     max_eval_examples: args.maxEvalExamples ?? null,
   });
@@ -347,6 +350,7 @@ async function computePreparedRun(args: {
 
   const system = buildSystemMessage(request.spec_snapshot);
   const baseModelForEvaluation = config.paths.baseModel ?? request.spec_snapshot.base_model;
+  const parentModelArtifact = request.hyperparameters.parent_model_artifact;
   const maxEvalExamples = config.evaluation.maxExamples ?? request.hyperparameters.max_eval_examples;
   const evalExamplesUsed = Math.min(maxEvalExamples ?? examples.length, examples.length);
   const fingerprints = await datasetFingerprints(request);
@@ -358,6 +362,7 @@ async function computePreparedRun(args: {
     source_fingerprint: preparedSourceFingerprint({
       request,
       baseModelForEvaluation,
+      parentModelArtifact,
       evalSampleSeed,
       maxEvalExamples,
       datasetFingerprints: fingerprints,
@@ -373,6 +378,7 @@ async function computePreparedRun(args: {
     dataset_fingerprints: fingerprints,
     dataset_uri: fileUri(artifacts.trainingJsonl),
     base_model_for_evaluation: baseModelForEvaluation,
+    parent_model_artifact: parentModelArtifact ?? null,
     system_prompt_sha256: createHash("sha256").update(system).digest("hex"),
     prepared_at: new Date().toISOString(),
   };
@@ -476,13 +482,15 @@ async function runBaselineStage(args: {
       examples: args.prepared.examples.length,
       eval_examples_used: args.prepared.metadata.eval_examples_used,
       eval_split: args.prepared.metadata.eval_split,
-      model_id: args.prepared.baseModelForEvaluation,
+      model_id: args.prepared.metadata.parent_model_artifact ?? args.prepared.baseModelForEvaluation,
+      parent_model_artifact: args.prepared.metadata.parent_model_artifact,
     },
   });
   return evaluateExamples({
     kind: "baseline",
-    modelId: args.prepared.baseModelForEvaluation,
+    modelId: args.prepared.metadata.parent_model_artifact ?? args.prepared.baseModelForEvaluation,
     baseModelId: args.prepared.baseModelForEvaluation,
+    adapterPath: args.prepared.metadata.parent_model_artifact ?? undefined,
     examples: args.prepared.examples,
     system: args.prepared.system,
     config: args.config,
@@ -543,6 +551,7 @@ async function writeExternalTrainingReport(args: {
     training_job_name: `external-${args.prepared.request.run_id}`,
     model_artifact_uri: args.modelArtifact,
     base_model_artifact_uri: args.config.paths.baseModel ? fileUri(args.config.paths.baseModel) : undefined,
+    parent_model_artifact_uri: args.prepared.metadata.parent_model_artifact ?? undefined,
     artifact_metadata: {
       ...(args.config.training.artifact ?? {}),
       notes: args.config.training.artifact?.notes ?? "External model artifact supplied with --model-artifact.",
@@ -709,6 +718,7 @@ async function runReportStage(args: {
     run_metadata: {
       base_model: args.prepared.request.spec_snapshot.base_model,
       fine_tuned_model_id: training.model_artifact_uri ?? training.training_job_name,
+      parent_model_artifact: args.prepared.metadata.parent_model_artifact,
       training_method: args.prepared.request.training_method,
       dataset_prebuilt: args.prepared.metadata.dataset_prebuilt,
       dataset_format: args.prepared.metadata.dataset_format,
