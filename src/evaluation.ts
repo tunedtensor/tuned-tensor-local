@@ -582,6 +582,163 @@ function resolveEvaluationRuntime(args: {
   return { command, inferenceProvider, scoringMode };
 }
 
+interface GeneratedEvalResult {
+  prompt: string;
+  expected: string;
+  actual: string;
+  latency_ms: number;
+}
+
+async function scoreGeneratedEvalResults(args: {
+  kind: "baseline" | "candidate";
+  modelId: string;
+  generated: GeneratedEvalResult[];
+  evalExamplesTotal: number;
+  config: LocalRunnerConfig;
+  outputPath: string;
+  scoringMode: "exact_match" | "llm_judge" | "json_fields";
+  inferenceProvider: "none" | "command" | "batch_command" | "transformers";
+  system?: string;
+  evalSplit?: EvalSplit;
+  evalSampleSeed?: number | null;
+  generationConfig?: Record<string, unknown>;
+  logUri?: string;
+  reporter?: LocalRunReporter;
+}): Promise<EvalReport> {
+  const results: EvalExampleResult[] = [];
+  const jsonFieldScores: JsonFieldScore[] = [];
+  let judgeModelId: string | null = null;
+  const shouldJudge = args.scoringMode === "llm_judge" && canUseOpenRouterJudge(args.config);
+  if (args.scoringMode === "llm_judge" && !shouldJudge && args.config.evaluation.scoring.fallback === "fail") {
+    const keyName = args.config.llm?.apiKeyEnv ?? "OPENROUTER_API_KEY";
+    throw new Error(`evaluation.scoring.mode=llm_judge requires ${keyName} or scoring.fallback=exact_match`);
+  }
+
+  for (const [index, generated] of args.generated.entries()) {
+    const exactScore = scoreActual(generated.expected, generated.actual);
+    if (shouldJudge && index === 0) {
+      await args.reporter?.onEvent?.({
+        stage: `evaluating_${args.kind}`,
+        status: "running",
+        message: `Scoring ${args.kind} outputs with OpenRouter judge.`,
+        details: { model: args.config.llm?.model, examples: args.generated.length },
+      });
+    }
+    let judged: { score: number; passed: boolean; reasoning: string; model: string | null } | null = null;
+    let judgeFellBack = false;
+    if (shouldJudge) {
+      try {
+        judged = await judgeWithOpenRouter({
+          prompt: generated.prompt,
+          expected: generated.expected,
+          actual: generated.actual,
+          taskInstructions: args.system?.trim() || undefined,
+          config: args.config,
+        });
+      } catch (error) {
+        if (args.config.evaluation.scoring.fallback === "fail") throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        judgeFellBack = true;
+        judged = {
+          score: exactScore,
+          passed: exactScore === 1,
+          reasoning: `LLM judge failed (${message.slice(0, 300)}); scored by normalized exact match.`,
+          model: null,
+        };
+      }
+    }
+    if (judged?.model) judgeModelId = judged.model;
+    const jsonFieldScore = args.scoringMode === "json_fields"
+      ? scoreJsonFields(generated.expected, generated.actual, args.config.evaluation.scoring.fields)
+      : null;
+    if (jsonFieldScore) jsonFieldScores.push(jsonFieldScore);
+    const score = judged?.score ?? jsonFieldScore?.score ?? exactScore;
+    const scoredBy: EvalExampleResult["scored_by"] = judged
+      ? (judgeFellBack ? "exact_match_fallback" : "llm_judge")
+      : jsonFieldScore
+        ? "json_fields"
+        : args.inferenceProvider === "none"
+          ? "heuristic"
+          : "exact_match";
+    results.push({
+      prompt: generated.prompt,
+      expected: generated.expected,
+      actual: generated.actual,
+      passed: judged?.passed ?? jsonFieldScore?.passed ?? score === 1,
+      score,
+      reasoning: judged?.reasoning ?? jsonFieldScore?.reasoning ?? (args.inferenceProvider === "none"
+        ? "No inference command configured; recorded an empty local response."
+        : args.scoringMode === "llm_judge"
+          ? "OpenRouter judge unavailable; fell back to normalized exact match."
+          : "Scored by normalized exact match."),
+      latency_ms: generated.latency_ms,
+      scored_by: scoredBy,
+    });
+  }
+
+  const total = results.length;
+  const avgScore = total > 0
+    ? results.reduce((sum, result) => sum + result.score, 0) / total
+    : 0;
+  const passRate = total > 0
+    ? results.filter((result) => result.passed).length / total
+    : 0;
+  const exactMatchRate = total > 0
+    ? results.filter((result) => scoreActual(result.expected, result.actual) === 1).length / total
+    : 0;
+  const avgTokenF1 = total > 0
+    ? results.reduce((sum, result) => sum + tokenF1(result.expected, result.actual), 0) / total
+    : 0;
+  const judgeScored = results.filter((result) => result.scored_by === "llm_judge");
+  const fallbackScoredCount = results.filter((result) => result.scored_by === "exact_match_fallback").length;
+  const judgeOnlyAvgScore = judgeScored.length > 0
+    ? judgeScored.reduce((sum, result) => sum + result.score, 0) / judgeScored.length
+    : null;
+  const avgLatency = total > 0
+    ? Math.round(results.reduce((sum, result) => sum + result.latency_ms, 0) / total)
+    : 0;
+  const scoringMethod = judgeModelId
+    ? "llm_judge"
+    : args.scoringMode === "json_fields"
+      ? "json_fields"
+      : args.inferenceProvider === "command"
+        ? "command"
+        : args.inferenceProvider === "none"
+          ? "heuristic"
+          : "exact_match";
+  const report: EvalReport = {
+    kind: args.kind,
+    model_id: args.modelId,
+    total,
+    eval_examples_total: args.evalExamplesTotal,
+    eval_examples_used: total,
+    eval_truncated: args.evalExamplesTotal > total,
+    eval_split: args.evalSplit,
+    eval_sample_seed: args.evalSampleSeed ?? null,
+    avg_score: avgScore,
+    pass_rate: passRate,
+    exact_match_rate: exactMatchRate,
+    avg_token_f1: avgTokenF1,
+    avg_latency_ms: avgLatency,
+    judge_scored_count: judgeScored.length,
+    fallback_scored_count: fallbackScoredCount,
+    judge_only_avg_score: judgeOnlyAvgScore,
+    results,
+    artifact_uri: fileUri(args.outputPath),
+    scoring_method: scoringMethod,
+    judge_model_id: judgeModelId,
+    inference_provider: args.inferenceProvider,
+    scoring_mode: args.scoringMode,
+    json_field_metrics: args.scoringMode === "json_fields"
+      ? aggregateJsonFieldMetrics(jsonFieldScores, total)
+      : undefined,
+    generation_config: args.generationConfig,
+    log_uri: args.logUri,
+  };
+  await writeJson(args.outputPath, report);
+  return report;
+}
+
 export async function evaluateExamples(args: {
   kind: "baseline" | "candidate";
   modelId: string;
@@ -613,9 +770,6 @@ export async function evaluateExamples(args: {
     kind: args.kind,
     config: args.config,
   });
-  const results: EvalExampleResult[] = [];
-  const jsonFieldScores: JsonFieldScore[] = [];
-  let judgeModelId: string | null = null;
   let generationConfig: Record<string, unknown> | undefined;
 
   // Baseline outputs and scores are fully determined by the cache key inputs,
@@ -670,6 +824,7 @@ export async function evaluateExamples(args: {
     : null;
   generationConfig = inferred?.generation_config;
 
+  const generated: GeneratedEvalResult[] = [];
   for (const [index, example] of selected.entries()) {
     const started = performance.now();
     const commandActual = inferenceProvider === "command" && command
@@ -683,148 +838,77 @@ export async function evaluateExamples(args: {
       : undefined;
     const inferredResult = inferred?.results[index];
     const actual = commandActual ?? inferredResult?.actual ?? "";
-    const exactScore = scoreActual(example.output, actual);
-    const shouldJudge = scoringMode === "llm_judge" && canUseOpenRouterJudge(args.config);
-    if (scoringMode === "llm_judge" && !shouldJudge && args.config.evaluation.scoring.fallback === "fail") {
-      const keyName = args.config.llm?.apiKeyEnv ?? "OPENROUTER_API_KEY";
-      throw new Error(`evaluation.scoring.mode=llm_judge requires ${keyName} or scoring.fallback=exact_match`);
-    }
-    if (shouldJudge && index === 0) {
-      await args.reporter?.onEvent?.({
-        stage: `evaluating_${args.kind}`,
-        status: "running",
-        message: `Scoring ${args.kind} outputs with OpenRouter judge.`,
-        details: { model: args.config.llm?.model, examples: selected.length },
-      });
-    }
-    let judged: { score: number; passed: boolean; reasoning: string; model: string | null } | null = null;
-    let judgeFellBack = false;
-    if (shouldJudge) {
-      try {
-        judged = await judgeWithOpenRouter({
-          prompt: example.input,
-          expected: example.output,
-          actual,
-          taskInstructions: args.system.trim() || undefined,
-          config: args.config,
-        });
-      } catch (error) {
-        // Judge request failed or returned malformed output. With
-        // fallback=exact_match, score this example by exact match instead of
-        // failing the whole run; with fallback=fail, surface the error.
-        if (args.config.evaluation.scoring.fallback === "fail") throw error;
-        const message = error instanceof Error ? error.message : String(error);
-        judgeFellBack = true;
-        judged = {
-          score: exactScore,
-          passed: exactScore === 1,
-          reasoning: `LLM judge failed (${message.slice(0, 300)}); scored by normalized exact match.`,
-          model: null,
-        };
-      }
-    }
-    if (judged?.model) judgeModelId = judged.model;
     const latencyMs = inferredResult?.latency_ms ?? Math.max(0, Math.round(performance.now() - started));
-    const jsonFieldScore = scoringMode === "json_fields"
-      ? scoreJsonFields(example.output, actual, args.config.evaluation.scoring.fields)
-      : null;
-    if (jsonFieldScore) jsonFieldScores.push(jsonFieldScore);
-    const score = judged?.score ?? jsonFieldScore?.score ?? exactScore;
-    const scoredBy: EvalExampleResult["scored_by"] = judged
-      ? (judgeFellBack ? "exact_match_fallback" : "llm_judge")
-      : jsonFieldScore
-        ? "json_fields"
-        : inferenceProvider === "none"
-          ? "heuristic"
-          : "exact_match";
-    results.push({
+    generated.push({
       prompt: example.input,
       expected: example.output,
       actual,
-      passed: judged?.passed ?? jsonFieldScore?.passed ?? score === 1,
-      score,
-      reasoning: judged?.reasoning ?? jsonFieldScore?.reasoning ?? (inferenceProvider === "none"
-        ? "No inference command configured; recorded an empty local response."
-        : scoringMode === "llm_judge"
-          ? "OpenRouter judge unavailable; fell back to normalized exact match."
-          : "Scored by normalized exact match."),
       latency_ms: latencyMs,
-      scored_by: scoredBy,
     });
   }
 
-  const total = results.length;
-  const avgScore = total > 0
-    ? results.reduce((sum, result) => sum + result.score, 0) / total
-    : 0;
-  const passRate = total > 0
-    ? results.filter((result) => result.passed).length / total
-    : 0;
-  const exactMatchRate = total > 0
-    ? results.filter((result) => scoreActual(result.expected, result.actual) === 1).length / total
-    : 0;
-  const avgTokenF1 = total > 0
-    ? results.reduce((sum, result) => sum + tokenF1(result.expected, result.actual), 0) / total
-    : 0;
-  const judgeScored = results.filter((result) => result.scored_by === "llm_judge");
-  const fallbackScoredCount = results.filter((result) => result.scored_by === "exact_match_fallback").length;
-  // Fallback-scored examples mix a different metric into avg_score, so also
-  // report the average over judge-scored examples only.
-  const judgeOnlyAvgScore = judgeScored.length > 0
-    ? judgeScored.reduce((sum, result) => sum + result.score, 0) / judgeScored.length
-    : null;
-  const avgLatency = total > 0
-    ? Math.round(results.reduce((sum, result) => sum + result.latency_ms, 0) / total)
-    : 0;
-  const scoringMethod = judgeModelId
-    ? "llm_judge"
-    : scoringMode === "json_fields"
-      ? "json_fields"
-    : inferenceProvider === "command"
-      ? "command"
-      : inferenceProvider === "none"
-        ? "heuristic"
-        : "exact_match";
-  const report: EvalReport = {
+  const report = await scoreGeneratedEvalResults({
     kind: args.kind,
-    model_id: args.modelId,
-    total,
-    eval_examples_total: args.examples.length,
-    eval_examples_used: total,
-    eval_truncated: args.examples.length > total,
-    eval_split: args.evalSplit,
-    eval_sample_seed: truncated ? sampleSeed : null,
-    avg_score: avgScore,
-    pass_rate: passRate,
-    exact_match_rate: exactMatchRate,
-    avg_token_f1: avgTokenF1,
-    avg_latency_ms: avgLatency,
-    judge_scored_count: judgeScored.length,
-    fallback_scored_count: fallbackScoredCount,
-    judge_only_avg_score: judgeOnlyAvgScore,
-    results,
-    artifact_uri: fileUri(args.outputPath),
-    scoring_method: scoringMethod,
-    judge_model_id: judgeModelId,
-    inference_provider: inferenceProvider,
-    scoring_mode: scoringMode,
-    json_field_metrics: scoringMode === "json_fields"
-      ? aggregateJsonFieldMetrics(jsonFieldScores, total)
-      : undefined,
-    generation_config: generationConfig,
-    log_uri: inferenceProvider === "transformers" || inferenceProvider === "batch_command"
+    modelId: args.modelId,
+    generated,
+    evalExamplesTotal: args.examples.length,
+    config: args.config,
+    outputPath: args.outputPath,
+    scoringMode,
+    inferenceProvider,
+    system: args.system,
+    evalSplit: args.evalSplit,
+    evalSampleSeed: truncated ? sampleSeed : null,
+    generationConfig,
+    logUri: inferenceProvider === "transformers" || inferenceProvider === "batch_command"
       ? fileUri(`${args.outputPath}.inference.log`)
       : undefined,
-  };
-  await writeJson(args.outputPath, report);
+    reporter: args.reporter,
+  });
   if (cacheKey) {
     // Do not cache reports with fallback-scored examples: a transient judge
     // failure would otherwise be replayed into every future run.
-    if (fallbackScoredCount === 0) {
+    if ((report.fallback_scored_count ?? 0) === 0) {
       await writeJson(baselineCachePath(args.config, cacheKey), { ...report, cache_key: cacheKey });
     }
   }
   return report;
+}
+
+export async function rescoreEvalReport(args: {
+  report: EvalReport;
+  config: LocalRunnerConfig;
+  outputPath: string;
+  system?: string;
+  reporter?: LocalRunReporter;
+}): Promise<EvalReport> {
+  const configuredScoringMode = args.config.evaluation.scoring.mode;
+  const scoringMode: "exact_match" | "llm_judge" | "json_fields" =
+    args.config.dryRun && configuredScoringMode === "llm_judge"
+      ? "exact_match"
+      : configuredScoringMode;
+  const inferenceProvider = args.report.inference_provider ?? "none";
+  return scoreGeneratedEvalResults({
+    kind: args.report.kind,
+    modelId: args.report.model_id,
+    generated: args.report.results.map((result) => ({
+      prompt: result.prompt,
+      expected: result.expected,
+      actual: result.actual,
+      latency_ms: result.latency_ms,
+    })),
+    evalExamplesTotal: args.report.eval_examples_total,
+    config: args.config,
+    outputPath: args.outputPath,
+    scoringMode,
+    inferenceProvider,
+    system: args.system,
+    evalSplit: args.report.eval_split,
+    evalSampleSeed: args.report.eval_sample_seed ?? null,
+    generationConfig: args.report.generation_config,
+    logUri: args.report.log_uri,
+    reporter: args.reporter,
+  });
 }
 
 export function compareEvalReports(baseline: EvalReport, candidate: EvalReport) {

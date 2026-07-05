@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { fineTuneRunRequestSchema, localRunnerConfigSchema } from "../src/contracts.js";
-import { runLocalFineTune } from "../src/orchestrator.js";
+import { runLocalFineTune, runLocalFineTuneStage } from "../src/orchestrator.js";
 
 function chatRow(input: string, output: string): string {
   return JSON.stringify({
@@ -14,6 +14,15 @@ function chatRow(input: string, output: string): string {
       { role: "assistant", content: output },
     ],
   });
+}
+
+async function exists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 test("runs a dry local workflow and writes compatible artifacts", async () => {
@@ -509,6 +518,217 @@ writeFileSync(outputPath, JSON.stringify({
 
     const modelText = await readFile(result.report.training.model_artifact_uri.replace(/^file:\/\//, "") + "/model.json", "utf8");
     assert.match(modelText, /tiny-nanogpt-memorizer/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runs a dry workflow one stage at a time and reuses artifacts by default", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-stage-workflow-"));
+  try {
+    const request = fineTuneRunRequestSchema.parse({
+      run_id: "12121212-1212-4212-8212-121212121212",
+      user_id: "local-user",
+      behavior_spec_id: "34343434-3434-4434-8434-343434343434",
+      run_number: 1,
+      spec_snapshot: {
+        name: "Staged",
+        description: "",
+        system_prompt: "Return labels.",
+        guidelines: [],
+        constraints: [],
+        base_model: "Qwen/Qwen3.5-2B",
+        examples: [
+          { input: "Classify: good", output: "positive" },
+          { input: "Classify: bad", output: "negative" },
+        ],
+      },
+      hyperparameters: { n_epochs: 1 },
+    });
+    const config = localRunnerConfigSchema.parse({
+      artifactRoot: join(root, "artifacts"),
+      storeRoot: join(root, "store"),
+      dryRun: true,
+      evaluation: { scoring: { mode: "exact_match" } },
+    });
+
+    const prepared = await runLocalFineTuneStage({ request, config, stage: "prepare" });
+    assert.equal(prepared.stage, "prepare");
+    assert.equal(await exists(prepared.artifacts.training_jsonl), true);
+    assert.equal(await exists(prepared.artifacts.stage_metadata), true);
+    assert.equal(await exists(prepared.artifacts.baseline_eval), false);
+    assert.equal(await exists(prepared.artifacts.training_report), false);
+
+    await runLocalFineTuneStage({ request, config, stage: "baseline" });
+    assert.equal(await exists(prepared.artifacts.baseline_eval), true);
+    assert.equal(await exists(prepared.artifacts.candidate_eval), false);
+    const baseline = JSON.parse(await readFile(prepared.artifacts.baseline_eval, "utf8"));
+    await writeFile(prepared.artifacts.baseline_eval, `${JSON.stringify({ ...baseline, avg_score: 0.5 }, null, 2)}\n`, "utf8");
+
+    await runLocalFineTuneStage({ request, config, stage: "baseline" });
+    const reused = JSON.parse(await readFile(prepared.artifacts.baseline_eval, "utf8"));
+    assert.equal(reused.avg_score, 0.5);
+
+    await runLocalFineTuneStage({ request, config, stage: "baseline", force: true });
+    const recomputed = JSON.parse(await readFile(prepared.artifacts.baseline_eval, "utf8"));
+    assert.equal(recomputed.avg_score, 0);
+
+    await runLocalFineTuneStage({ request, config, stage: "train" });
+    assert.equal(await exists(prepared.artifacts.training_report), true);
+    await runLocalFineTuneStage({ request, config, stage: "candidate" });
+    assert.equal(await exists(prepared.artifacts.candidate_eval), true);
+    await runLocalFineTuneStage({ request, config, stage: "score" });
+    const final = await runLocalFineTuneStage({ request, config, stage: "report" });
+
+    assert.equal(final.report?.status, "completed");
+    assert.equal(await exists(prepared.artifacts.report), true);
+    assert.equal(final.report?.baseline.avg_score, 0);
+    assert.equal(final.report?.candidate.avg_score, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("prepare refreshes stale artifacts when the run input changes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-stage-prepare-refresh-"));
+  try {
+    const baseRequest = {
+      run_id: "13131313-1313-4313-8313-131313131313",
+      user_id: "local-user",
+      behavior_spec_id: "24242424-2424-4424-8424-242424242424",
+      run_number: 1,
+      spec_snapshot: {
+        name: "Refresh",
+        description: "",
+        system_prompt: "Return labels.",
+        guidelines: [],
+        constraints: [],
+        base_model: "Qwen/Qwen3.5-2B",
+        examples: [{ input: "Classify: first", output: "one" }],
+      },
+      hyperparameters: { n_epochs: 1 },
+    };
+    const firstRequest = fineTuneRunRequestSchema.parse(baseRequest);
+    const config = localRunnerConfigSchema.parse({
+      artifactRoot: join(root, "artifacts"),
+      storeRoot: join(root, "store"),
+      dryRun: true,
+      evaluation: { scoring: { mode: "exact_match" } },
+    });
+
+    const prepared = await runLocalFineTuneStage({ request: firstRequest, config, stage: "prepare" });
+    assert.match(await readFile(prepared.artifacts.training_jsonl, "utf8"), /Classify: first/);
+    await runLocalFineTuneStage({ request: firstRequest, config, stage: "baseline" });
+    assert.equal(await exists(prepared.artifacts.baseline_eval), true);
+
+    const secondRequest = fineTuneRunRequestSchema.parse({
+      ...baseRequest,
+      spec_snapshot: {
+        ...baseRequest.spec_snapshot,
+        examples: [{ input: "Classify: second", output: "two" }],
+      },
+    });
+    await runLocalFineTuneStage({ request: secondRequest, config, stage: "prepare" });
+    const refreshed = await readFile(prepared.artifacts.training_jsonl, "utf8");
+    assert.match(refreshed, /Classify: second/);
+    assert.doesNotMatch(refreshed, /Classify: first/);
+    assert.equal(await exists(prepared.artifacts.baseline_eval), false);
+
+    await writeFile(prepared.artifacts.training_jsonl, "stale\n", "utf8");
+    await runLocalFineTuneStage({ request: secondRequest, config, stage: "all", force: true });
+    assert.doesNotMatch(await readFile(prepared.artifacts.training_jsonl, "utf8"), /^stale/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("candidate stage fails clearly when no training artifact is available", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-stage-candidate-missing-"));
+  try {
+    const request = fineTuneRunRequestSchema.parse({
+      run_id: "56565656-5656-4565-8565-565656565656",
+      user_id: "local-user",
+      behavior_spec_id: "78787878-7878-4787-8787-787878787878",
+      run_number: 1,
+      spec_snapshot: {
+        name: "Missing training",
+        description: "",
+        system_prompt: "Return labels.",
+        guidelines: [],
+        constraints: [],
+        base_model: "Qwen/Qwen3.5-2B",
+        examples: [
+          { input: "Classify: good", output: "positive" },
+          { input: "Classify: bad", output: "negative" },
+        ],
+      },
+      hyperparameters: { n_epochs: 1 },
+    });
+    const config = localRunnerConfigSchema.parse({
+      artifactRoot: join(root, "artifacts"),
+      storeRoot: join(root, "store"),
+      dryRun: true,
+    });
+
+    await runLocalFineTuneStage({ request, config, stage: "prepare" });
+    await assert.rejects(
+      runLocalFineTuneStage({ request, config, stage: "candidate" }),
+      /requires training output or --model-artifact/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("candidate stage accepts an external model artifact", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-stage-external-model-"));
+  try {
+    const request = fineTuneRunRequestSchema.parse({
+      run_id: "90909090-9090-4909-8909-909090909090",
+      user_id: "local-user",
+      behavior_spec_id: "abababab-abab-4aba-8aba-abababababab",
+      run_number: 1,
+      spec_snapshot: {
+        name: "External candidate",
+        description: "",
+        system_prompt: "Return labels.",
+        guidelines: [],
+        constraints: [],
+        base_model: "Qwen/Qwen3.5-2B",
+        examples: [
+          { input: "Classify: good", output: "positive" },
+          { input: "Classify: bad", output: "negative" },
+        ],
+      },
+      hyperparameters: { n_epochs: 1 },
+    });
+    const config = localRunnerConfigSchema.parse({
+      artifactRoot: join(root, "artifacts"),
+      storeRoot: join(root, "store"),
+      dryRun: true,
+      evaluation: { scoring: { mode: "exact_match" } },
+    });
+
+    const prepared = await runLocalFineTuneStage({ request, config, stage: "prepare" });
+    await runLocalFineTuneStage({
+      request,
+      config,
+      stage: "candidate",
+      modelArtifact: `file://${join(root, "external-adapter")}`,
+    });
+    const training = JSON.parse(await readFile(prepared.artifacts.training_report, "utf8"));
+    assert.equal(training.metrics.external_model_artifact, true);
+    assert.equal(training.model_artifact_uri, `file://${join(root, "external-adapter")}`);
+    assert.equal(await exists(prepared.artifacts.candidate_eval), true);
+
+    await runLocalFineTuneStage({
+      request,
+      config,
+      stage: "candidate",
+      modelArtifact: `file://${join(root, "replacement-adapter")}`,
+    });
+    const replacement = JSON.parse(await readFile(prepared.artifacts.training_report, "utf8"));
+    assert.equal(replacement.model_artifact_uri, `file://${join(root, "replacement-adapter")}`);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

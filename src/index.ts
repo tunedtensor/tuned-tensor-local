@@ -11,7 +11,8 @@ import { buildSystemMessage } from "./dataset.js";
 import { runLocalLabelingJob } from "./labeling.js";
 import {
   loadLocalRunnerConfig,
-  runLocalFineTune,
+  runLocalFineTuneStage,
+  type LocalRunStage,
 } from "./orchestrator.js";
 import { runDoctor } from "./doctor.js";
 import { createLocalStore } from "./store.js";
@@ -111,7 +112,8 @@ Commands:
   init [--name "My Local Model"] [--model Qwen/Qwen3.5-2B] [--output tunedtensor.json] [--force]
   doctor [--config local-runner.json]
   validate [tunedtensor.json|request.json] [--config local-runner.json]
-  run [tunedtensor.json|request.json] [--config local-runner.json] [--dry-run] [--verbose] [--quiet]
+  run [tunedtensor.json|request.json] [--config local-runner.json] [--stage all|prepare|baseline|train|candidate|score|report]
+      [--run-id uuid] [--model-artifact path-or-file-uri] [--force] [--dry-run] [--verbose] [--quiet]
   label <input.jsonl|input.csv> [--input-column col] [--spec tunedtensor.json] [--system-prompt "..."]
         [--model teacher-model] [--output labeled.jsonl] [--config local-runner.json] [--dry-run]
   serve [--config local-runner.json] [--host 127.0.0.1] [--port 8787]
@@ -135,6 +137,9 @@ const optionNamesWithValues = new Set([
   "--id",
   "--user-id",
   "--run-number",
+  "--run-id",
+  "--stage",
+  "--model-artifact",
   "--input-column",
   "--system-prompt",
   "--spec",
@@ -159,6 +164,22 @@ function readPositionals(argv: string[], startIndex = 3): string[] {
 function readNumberOption(argv: string[], name: string): number | undefined {
   const value = readOption(argv, name);
   return value ? Number(value) : undefined;
+}
+
+function readRunStage(argv: string[]): LocalRunStage {
+  const value = readOption(argv, "--stage") ?? "all";
+  if (
+    value === "prepare"
+    || value === "baseline"
+    || value === "train"
+    || value === "candidate"
+    || value === "score"
+    || value === "report"
+    || value === "all"
+  ) {
+    return value;
+  }
+  throw new Error(`--stage must be one of prepare, baseline, train, candidate, score, report, all; got: ${value}`);
 }
 
 async function configFromArgv(argv: string[]): Promise<LocalRunnerConfig> {
@@ -294,6 +315,7 @@ async function main(argv: string[]): Promise<void> {
       dryRun: hasFlag(argv, "--dry-run") ? true : configInput.dryRun,
     });
     const input = await loadLocalRunInput(inputPath, {
+      runId: readOption(argv, "--run-id"),
       userId: readOption(argv, "--user-id"),
       runNumber: readNumberOption(argv, "--run-number"),
     });
@@ -302,29 +324,49 @@ async function main(argv: string[]): Promise<void> {
         process.stderr.write(`[tt-local] warning: ${warning}\n`);
       }
     }
-    const request = input.request;
-    const result = await runLocalFineTune({
+    const runId = readOption(argv, "--run-id");
+    const request = runId && input.kind === "request"
+      ? fineTuneRunRequestSchema.parse({ ...input.request, run_id: runId })
+      : input.request;
+    const stage = readRunStage(argv);
+    const result = await runLocalFineTuneStage({
       request,
       config,
+      stage,
+      force: hasFlag(argv, "--force"),
+      modelArtifact: readOption(argv, "--model-artifact"),
       reporter: createConsoleReporter({
         verbose: hasFlag(argv, "--verbose"),
         quiet: hasFlag(argv, "--quiet"),
       }),
     });
-    printJson({
-      status: result.report.status,
-      input_kind: input.kind,
-      run_id: result.report.run_id,
-      behavior_spec_id: result.report.behavior_spec_id,
-      report_path: result.reportPath,
-      artifact_dir: result.artifactDir,
-      model_id: `local-${result.report.run_id}`,
-      fine_tuned_model_id: result.report.fine_tuned_model_id,
-      training_log: result.report.training.log_uri,
-      baseline_eval: result.report.artifact_uris.baseline_eval,
-      candidate_eval: result.report.artifact_uris.candidate_eval,
-      comparison: result.report.comparison,
-    });
+    if (result.report) {
+      printJson({
+        status: result.report.status,
+        stage: result.stage,
+        input_kind: input.kind,
+        run_id: result.report.run_id,
+        behavior_spec_id: result.report.behavior_spec_id,
+        report_path: result.reportPath,
+        artifact_dir: result.artifactDir,
+        model_id: `local-${result.report.run_id}`,
+        fine_tuned_model_id: result.report.fine_tuned_model_id,
+        training_log: result.report.training.log_uri,
+        baseline_eval: result.report.artifact_uris.baseline_eval,
+        candidate_eval: result.report.artifact_uris.candidate_eval,
+        comparison: result.report.comparison,
+      });
+    } else {
+      printJson({
+        status: "completed",
+        stage: result.stage,
+        input_kind: input.kind,
+        run_id: result.request.run_id,
+        behavior_spec_id: result.request.behavior_spec_id,
+        artifact_dir: result.artifactDir,
+        artifacts: result.artifacts,
+      });
+    }
     return;
   }
 
