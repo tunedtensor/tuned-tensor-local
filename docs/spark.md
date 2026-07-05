@@ -41,9 +41,11 @@ tt-local run examples/smoke-run-request.json --config examples/local-runner.json
 
 ## Real Training
 
-For real training with the bundled SFT or DPO workflow, set `dryRun: false` and
-configure the uv project. Leave `training.script` unset: the runner chooses the
-bundled script from the run request's `training_method`.
+For real training with the bundled SFT or DPO workflow, install `tt-local`, set
+`dryRun: false`, and leave the uv project pointed at `training/local-runner`.
+That project is bundled in the npm package, so users do not need a local source
+checkout. Leave `training.script` unset: the runner chooses the bundled script
+from the run request's `training_method`.
 
 - `training_method: "sft"` runs `training/local-runner/src/train.py`.
 - `training_method: "dpo"` runs `training/local-runner/src/train_dpo.py`.

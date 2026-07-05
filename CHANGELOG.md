@@ -2,6 +2,17 @@
 
 All notable changes to TT Local will be documented in this file.
 
+## 0.2.6 - 2026-07-05
+
+### Fixed
+
+- Bundled uv training and Transformers evaluation now resolve
+  `training/local-runner` relative to the installed npm package, so users can
+  run real SFT/DPO workflows from `@tuned-tensor/local` without cloning the
+  source repository.
+- Tightened the published package contents to include the bundled runner source
+  and `pyproject.toml` without Python bytecode cache files.
+
 ## 0.2.5 - 2026-07-05
 
 ### Added

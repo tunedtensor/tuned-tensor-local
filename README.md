@@ -18,7 +18,7 @@ npm install -g @tuned-tensor/local
 tt-local info
 ```
 
-The bundled SFT and Transformers evaluator path also needs `uv`:
+The bundled SFT, DPO, and Transformers evaluator path also needs `uv`:
 
 ```bash
 uv --version
@@ -26,6 +26,10 @@ uv --version
 
 Custom training or evaluation workflows can use command entrypoints instead of
 `uv`.
+
+The default uv project is included in the npm package at
+`training/local-runner`; using bundled training does not require cloning this
+repository.
 
 ## DPO
 

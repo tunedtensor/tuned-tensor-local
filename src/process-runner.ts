@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { mkdir } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { dirname, join, resolve } from "node:path";
 import { forwardStreamLines, type LocalRunReporter } from "./run-reporter.js";
 
 export interface UvPythonEntrypointConfig {
@@ -15,20 +16,32 @@ export interface UvPythonEntrypointConfig {
   with?: string[];
 }
 
+const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const bundledLocalRunnerPrefix = "training/local-runner";
+
+function resolveBundledLocalRunnerPath(path: string | undefined): string | undefined {
+  if (!path) return undefined;
+  if (path === bundledLocalRunnerPrefix || path.startsWith(`${bundledLocalRunnerPrefix}/`)) {
+    return join(packageRoot, path);
+  }
+  return path;
+}
+
 export function buildUvPythonArgs(
   entrypoint: UvPythonEntrypointConfig,
   options: { defaultScript?: string; extraArgs?: string[] } = {},
 ): string[] {
   const args: string[] = ["run"];
-  if (entrypoint.project) args.push("--project", entrypoint.project);
+  const project = resolveBundledLocalRunnerPath(entrypoint.project);
+  if (project) args.push("--project", project);
   for (const dependency of entrypoint.with ?? []) args.push("--with", dependency);
   args.push("python");
   if (entrypoint.module) {
     args.push("-m", entrypoint.module);
   } else if (entrypoint.script) {
-    args.push(entrypoint.script);
+    args.push(resolveBundledLocalRunnerPath(entrypoint.script) ?? entrypoint.script);
   } else if (options.defaultScript) {
-    args.push(options.defaultScript);
+    args.push(resolveBundledLocalRunnerPath(options.defaultScript) ?? options.defaultScript);
   } else {
     throw new Error("uv python entrypoint requires module, script, or defaultScript");
   }
