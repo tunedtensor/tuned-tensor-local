@@ -18,6 +18,8 @@ export type LocalRunStatus =
   | "evaluating_baseline"
   | "training"
   | "evaluating_candidate"
+  | "scoring"
+  | "reporting"
   | "completed"
   | "failed"
   | "cancelled";

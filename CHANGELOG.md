@@ -2,6 +2,27 @@
 
 All notable changes to TT Local will be documented in this file.
 
+## 0.2.3 - 2026-07-05
+
+### Added
+
+- Added resumable `tt-local run --stage prepare|baseline|train|candidate|score|report|all`
+  execution so users can rerun a single part of the local workflow without
+  repeating training or inference. Stages reuse existing artifacts by default
+  and accept `--force` to recompute.
+- Added persisted stage artifacts, including `stage-metadata.json` and
+  `training-report.json`, plus `--run-id` resume support and
+  `--model-artifact` for candidate evaluation against an external adapter.
+- Added scoring-only evaluation reuse for `--stage score`, allowing existing
+  generated baseline/candidate outputs to be rescored with the current scorer,
+  including OpenRouter LLM judge, without regenerating outputs.
+
+### Fixed
+
+- Prepared run artifacts now carry a source fingerprint and invalidate
+  downstream baseline, training, candidate, and report artifacts when the input
+  spec, dataset, model, eval seed, or eval limit changes under the same run id.
+
 ## 0.2.2 - 2026-07-04
 
 ### Added

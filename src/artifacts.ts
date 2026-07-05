@@ -6,6 +6,8 @@ export interface RunArtifacts {
   prefix: string;
   runDir: string;
   trainingJsonl: string;
+  stageMetadataJson: string;
+  trainingReportJson: string;
   baselineEvalJson: string;
   candidateEvalJson: string;
   runReportJson: string;
@@ -43,6 +45,8 @@ export function resolveRunArtifacts(args: {
     prefix: safePrefix,
     runDir,
     trainingJsonl: join(runDir, "training.jsonl"),
+    stageMetadataJson: join(runDir, "stage-metadata.json"),
+    trainingReportJson: join(runDir, "training-report.json"),
     baselineEvalJson: join(runDir, "baseline-eval.json"),
     candidateEvalJson: join(runDir, "candidate-eval.json"),
     runReportJson: join(runDir, "run-report.json"),

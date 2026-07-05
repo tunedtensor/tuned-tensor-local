@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { comparisonReportSchema, localRunnerConfigSchema } from "../src/contracts.js";
-import { buildJudgeMessages, classifyJudgeReasoning, compareEvalReports, deriveSampleSeed, evaluateExamples, sampleExamples, splitSpecExamples, tokenF1 } from "../src/evaluation.js";
+import { buildJudgeMessages, classifyJudgeReasoning, compareEvalReports, deriveSampleSeed, evaluateExamples, rescoreEvalReport, sampleExamples, splitSpecExamples, tokenF1 } from "../src/evaluation.js";
 
 async function writeFakeEvaluator(root: string, actual: string): Promise<string> {
   const path = join(root, "fake-evaluate.py");
@@ -555,6 +555,74 @@ test("transformers evaluation can score generated outputs with OpenRouter judge"
     assert.equal(report.results[0]?.score, 0.75);
     assert.equal(report.results[0]?.passed, true);
     assert.equal(report.exact_match_rate, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.OPENROUTER_API_KEY;
+    } else {
+      process.env.OPENROUTER_API_KEY = originalKey;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rescoreEvalReport reuses generated outputs and rewrites scores", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-rescore-test-"));
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.OPENROUTER_API_KEY;
+  try {
+    process.env.OPENROUTER_API_KEY = "test-key";
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      model: "openai/gpt-5.5",
+      choices: [{ message: { content: "{\"score\":0.25,\"passed\":false,\"reasoning\":\"wrong label\"}" } }],
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })) as typeof fetch;
+
+    const exactConfig = localRunnerConfigSchema.parse({
+      dryRun: false,
+      storeRoot: join(root, "store"),
+      evaluation: {
+        inference: { provider: "none" },
+        scoring: { mode: "exact_match" },
+      },
+    });
+    const original = await evaluateExamples({
+      kind: "candidate",
+      modelId: "local-model",
+      examples: [{ input: "Classify: good", output: "positive" }],
+      system: "Return labels.",
+      config: exactConfig,
+      outputPath: join(root, "candidate-eval.json"),
+    });
+    const withActual = {
+      ...original,
+      results: [{ ...original.results[0]!, actual: "mostly positive", latency_ms: 7 }],
+    };
+
+    const judgeConfig = localRunnerConfigSchema.parse({
+      dryRun: false,
+      storeRoot: join(root, "store"),
+      evaluation: {
+        inference: { provider: "none" },
+        scoring: { mode: "llm_judge", fallback: "fail" },
+      },
+      llm: { provider: "openrouter", model: "openai/gpt-5.5", apiKeyEnv: "OPENROUTER_API_KEY" },
+    });
+    const rescored = await rescoreEvalReport({
+      report: withActual,
+      config: judgeConfig,
+      outputPath: join(root, "candidate-eval.json"),
+      system: "Return labels.",
+    });
+
+    assert.equal(rescored.results[0]?.actual, "mostly positive");
+    assert.equal(rescored.results[0]?.score, 0.25);
+    assert.equal(rescored.results[0]?.scored_by, "llm_judge");
+    assert.equal(rescored.judge_model_id, "openai/gpt-5.5");
+    const persisted = JSON.parse(await readFile(join(root, "candidate-eval.json"), "utf8"));
+    assert.equal(persisted.results[0].actual, "mostly positive");
   } finally {
     globalThis.fetch = originalFetch;
     if (originalKey === undefined) {
