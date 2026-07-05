@@ -2,6 +2,15 @@
 
 All notable changes to TT Local will be documented in this file.
 
+## 0.2.7 - 2026-07-05
+
+### Added
+
+- Added `tt-local models prefetch [tunedtensor.json|request.json]` to download
+  the configured Hugging Face base model into `paths.modelCache` before the
+  first real run, making first-time setup explicit instead of hiding the
+  download inside baseline evaluation or training.
+
 ## 0.2.6 - 2026-07-05
 
 ### Fixed

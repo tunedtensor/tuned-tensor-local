@@ -31,6 +31,16 @@ The default uv project is included in the npm package at
 `training/local-runner`; using bundled training does not require cloning this
 repository.
 
+Before the first real run, you can download the configured Hugging Face base
+model into `paths.modelCache` explicitly:
+
+```bash
+tt-local models prefetch tunedtensor.json --config local-runner.json
+```
+
+Without this step, the first non-dry `tt-local run` downloads the base model
+when baseline evaluation or training first loads it.
+
 ## DPO
 
 TT Local supports first-class offline DPO for text causal-LM models. Set

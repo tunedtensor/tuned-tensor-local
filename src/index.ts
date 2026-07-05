@@ -16,6 +16,7 @@ import {
 } from "./orchestrator.js";
 import { runDoctor } from "./doctor.js";
 import { resolveTrainingModel } from "./model-registry.js";
+import { prefetchBaseModel } from "./prefetch.js";
 import { createLocalStore } from "./store.js";
 import { serveLocalDashboard } from "./server.js";
 import {
@@ -34,6 +35,7 @@ export * from "./labeling-sanitize.js";
 export * from "./orchestrator.js";
 export * from "./local-project.js";
 export * from "./openrouter.js";
+export * from "./prefetch.js";
 export * from "./run-reporter.js";
 export * from "./server.js";
 export * from "./store.js";
@@ -120,7 +122,7 @@ Commands:
         [--model teacher-model] [--output labeled.jsonl] [--config local-runner.json] [--dry-run]
   serve [--config local-runner.json] [--host 127.0.0.1] [--port 8787]
   runs list|get|events|watch|report|compare|cancel|reconcile [args] [--config local-runner.json]
-  models list|get [args] [--config local-runner.json]
+  models list|get|prefetch [args] [--config local-runner.json]
   specs list|get|import [args] [--config local-runner.json]
   store rebuild-index [--config local-runner.json]
 
@@ -562,6 +564,31 @@ async function main(argv: string[]): Promise<void> {
       const id = argv[4];
       if (!id) throw new Error("models get requires <model-id>");
       return printJson(await store.getModel(id));
+    }
+    if (subcommand === "prefetch") {
+      const inputPath = resolve(readPositionals(argv, 4)[0] ?? DEFAULT_LOCAL_SPEC_PATH);
+      const input = await loadLocalRunInput(inputPath, {
+        userId: readOption(argv, "--user-id"),
+        runNumber: readNumberOption(argv, "--run-number"),
+      });
+      if (!hasFlag(argv, "--quiet")) {
+        for (const warning of input.warnings) {
+          process.stderr.write(`[tt-local] warning: ${warning}\n`);
+        }
+      }
+      const report = await prefetchBaseModel({
+        request: input.request,
+        config,
+        reporter: createConsoleReporter({
+          verbose: hasFlag(argv, "--verbose"),
+          quiet: hasFlag(argv, "--quiet"),
+        }),
+      });
+      return printJson({
+        ...report,
+        input_kind: input.kind,
+        input_path: input.path,
+      });
     }
     throw new Error(`Unknown models command: ${subcommand}`);
   }
