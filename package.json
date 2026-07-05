@@ -1,6 +1,6 @@
 {
   "name": "@tuned-tensor/local",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "TT Local: tuning tensors locally on hardware you control.",
   "license": "Apache-2.0",
   "private": false,
@@ -20,7 +20,8 @@
     "dist",
     "docs",
     "examples",
-    "training",
+    "training/local-runner/pyproject.toml",
+    "training/local-runner/src/*.py",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
