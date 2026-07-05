@@ -301,7 +301,7 @@ function buildBatchInferenceCommand(config: LocalRunnerConfig, inputPath: string
     );
   }
   return buildEntrypointCommand(config.evaluation.inference, {
-    defaultScript: "training/hf-local/src/evaluate.py",
+    defaultScript: "training/local-runner/src/evaluate.py",
     extraArgs: ["--input", inputPath, "--output", outputPath],
   });
 }

@@ -31,8 +31,8 @@ function buildCommandTrainingHyperparameters(request: FineTuneRunRequest): Recor
 
 function defaultTrainingScript(request: FineTuneRunRequest): string {
   return request.training_method === "dpo"
-    ? "training/hf-local/src/train_dpo.py"
-    : "training/hf-local/src/train.py";
+    ? "training/local-runner/src/train_dpo.py"
+    : "training/local-runner/src/train.py";
 }
 
 function buildDpoHyperparameters(request: FineTuneRunRequest): Record<string, string> {

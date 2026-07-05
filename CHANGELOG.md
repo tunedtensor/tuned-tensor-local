@@ -19,7 +19,7 @@ All notable changes to TT Local will be documented in this file.
 ### Changed
 
 - Renamed the bundled uv training project from `training/sft-local` to
-  `training/hf-local` now that it hosts both SFT and DPO workflows.
+  `training/local-runner` now that it hosts both SFT and DPO workflows.
 - Prebuilt local run preparation now fingerprints dataset file contents so
   stale staged artifacts are refreshed when prebuilt training, validation, or
   test files change under the same run id.

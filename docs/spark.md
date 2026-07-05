@@ -45,8 +45,8 @@ For real training with the bundled SFT or DPO workflow, set `dryRun: false` and
 configure the uv project. Leave `training.script` unset: the runner chooses the
 bundled script from the run request's `training_method`.
 
-- `training_method: "sft"` runs `training/hf-local/src/train.py`.
-- `training_method: "dpo"` runs `training/hf-local/src/train_dpo.py`.
+- `training_method: "sft"` runs `training/local-runner/src/train.py`.
+- `training_method: "dpo"` runs `training/local-runner/src/train_dpo.py`.
 
 Set `training.script` only when you want to override that selection with a
 specific custom uv script.
@@ -57,7 +57,7 @@ specific custom uv script.
   "dryRun": false,
   "training": {
     "backend": "uv",
-    "project": "training/hf-local"
+    "project": "training/local-runner"
   },
   "paths": {
     "modelCache": "/home/eve/.cache/huggingface"
