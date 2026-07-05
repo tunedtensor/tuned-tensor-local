@@ -82,6 +82,16 @@ that same base model plus the fine-tuned artifact from the run directory. Set
 `paths.modelCache` to a persistent Spark-local cache so training and evaluation
 reuse downloads.
 
+To make the first large download explicit, prefetch the base model after
+creating `tunedtensor.json` and the runner config:
+
+```bash
+tt-local models prefetch tunedtensor.json --config spark-runner.json
+```
+
+If you skip this step, the first real `tt-local run` still downloads through
+Transformers automatically.
+
 Custom workflows such as a from-scratch nanoGPT trainer can use command
 entrypoints instead:
 
