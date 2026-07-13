@@ -12,14 +12,58 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-import torch
-from peft import PeftModel
-from PIL import Image
-from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
+MAX_ARCHIVE_MEMBERS = 20_000
+MAX_ARCHIVE_EXPANDED_BYTES = 20 * 1024 * 1024 * 1024
 
 
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
+
+
+def configure_hugging_face_cache(cache_home: str | None) -> None:
+    """Treat model_cache as HF_HOME and keep legacy overrides consistent."""
+    if not cache_home:
+        return
+    # Preserve the lexical absolute path chosen by the Node runner rather than
+    # canonicalizing platform symlinks such as macOS /var -> /private/var.
+    home = Path(cache_home).expanduser().absolute()
+    hub = home / "hub"
+    os.environ.update({
+        "HF_HOME": str(home),
+        "HF_HUB_CACHE": str(hub),
+        "HUGGINGFACE_HUB_CACHE": str(hub),
+    })
+    for deprecated in (
+        "TRANSFORMERS_CACHE",
+        "PYTORCH_TRANSFORMERS_CACHE",
+        "PYTORCH_PRETRAINED_BERT_CACHE",
+    ):
+        os.environ.pop(deprecated, None)
+
+
+def import_runtime_dependencies() -> None:
+    """Import libraries that read Hugging Face cache settings at import time."""
+    global torch, PeftModel, Image
+    global AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
+
+    import torch as torch_module
+    from peft import PeftModel as peft_model
+    from PIL import Image as pil_image
+    from transformers import (
+        AutoModelForCausalLM as auto_model_for_causal_lm,
+        AutoModelForImageTextToText as auto_model_for_image_text_to_text,
+        AutoProcessor as auto_processor,
+        AutoTokenizer as auto_tokenizer,
+    )
+
+    torch = torch_module
+    PeftModel = peft_model
+    Image = pil_image
+    Image.MAX_IMAGE_PIXELS = 20_000_000
+    AutoModelForCausalLM = auto_model_for_causal_lm
+    AutoModelForImageTextToText = auto_model_for_image_text_to_text
+    AutoProcessor = auto_processor
+    AutoTokenizer = auto_tokenizer
 
 
 def strip_file_uri(value: str | None) -> str | None:
@@ -39,10 +83,20 @@ def resolve_adapter_path(value: str | None, tmp: Path) -> str | None:
         extracted = tmp / "adapter"
         extracted.mkdir(parents=True, exist_ok=True)
         with tarfile.open(path, "r:gz") as tar:
-            for member in tar.getmembers():
+            members = tar.getmembers()
+            if len(members) > MAX_ARCHIVE_MEMBERS:
+                raise ValueError(f"Model archive exceeds {MAX_ARCHIVE_MEMBERS} members")
+            expanded_bytes = sum(max(0, member.size) for member in members if member.isfile())
+            if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
+                raise ValueError("Model archive exceeds the 20 GiB expanded-size limit")
+            for member in members:
                 destination = (extracted / member.name).resolve()
-                if not str(destination).startswith(str(extracted.resolve())):
+                try:
+                    destination.relative_to(extracted.resolve())
+                except ValueError:
                     raise ValueError(f"Unsafe archive member: {member.name}")
+                if member.issym() or member.islnk() or member.isdev():
+                    raise ValueError(f"Unsafe archive member type: {member.name}")
             tar.extractall(extracted)
         candidates = [candidate for candidate in extracted.rglob("adapter_config.json")]
         if candidates:
@@ -129,11 +183,17 @@ def load_text_model(payload: dict[str, Any], adapter_path: str | None):
     trust_remote_code = bool(payload.get("trust_remote_code", True))
     device = resolve_device(str(payload.get("device", "auto")))
     token = os.getenv("HF_TOKEN")
+    revision = payload.get("base_model_revision")
+    source_kwargs: dict[str, Any] = {
+        "trust_remote_code": trust_remote_code,
+        "token": token,
+    }
+    if revision and not Path(base_model).exists():
+        source_kwargs["revision"] = revision
 
     tokenizer = AutoTokenizer.from_pretrained(
         base_model,
-        trust_remote_code=trust_remote_code,
-        token=token,
+        **source_kwargs,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -142,10 +202,7 @@ def load_text_model(payload: dict[str, Any], adapter_path: str | None):
     if device == "cuda":
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-    kwargs: dict[str, Any] = {
-        "trust_remote_code": trust_remote_code,
-        "token": token,
-    }
+    kwargs: dict[str, Any] = dict(source_kwargs)
     if dtype is not None:
         kwargs["torch_dtype"] = dtype
     if device == "cuda":
@@ -165,11 +222,17 @@ def load_multimodal_model(payload: dict[str, Any], adapter_path: str | None):
     trust_remote_code = bool(payload.get("trust_remote_code", True))
     device = resolve_device(str(payload.get("device", "auto")))
     token = os.getenv("HF_TOKEN")
+    revision = payload.get("base_model_revision")
+    source_kwargs: dict[str, Any] = {
+        "trust_remote_code": trust_remote_code,
+        "token": token,
+    }
+    if revision and not Path(base_model).exists():
+        source_kwargs["revision"] = revision
 
     processor = AutoProcessor.from_pretrained(
         base_model,
-        trust_remote_code=trust_remote_code,
-        token=token,
+        **source_kwargs,
     )
     if getattr(processor, "tokenizer", None) is not None and processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
@@ -177,10 +240,7 @@ def load_multimodal_model(payload: dict[str, Any], adapter_path: str | None):
     dtype = None
     if device == "cuda":
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    kwargs: dict[str, Any] = {
-        "trust_remote_code": trust_remote_code,
-        "token": token,
-    }
+    kwargs: dict[str, Any] = dict(source_kwargs)
     if dtype is not None:
         kwargs["torch_dtype"] = dtype
     if device == "cuda":
@@ -307,8 +367,8 @@ def main() -> None:
     args = parser.parse_args()
 
     payload = load_json(Path(args.input))
-    if payload.get("model_cache"):
-        os.environ["HF_HOME"] = str(payload["model_cache"])
+    configure_hugging_face_cache(payload.get("model_cache"))
+    import_runtime_dependencies()
 
     with TemporaryDirectory() as tmp_dir:
         adapter_path = resolve_adapter_path(payload.get("adapter_path"), Path(tmp_dir))

@@ -1,4 +1,7 @@
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { BehaviorSpecExample, SpecSnapshot } from "./contracts.js";
 
 export interface ChatJsonlRow {
@@ -7,6 +10,86 @@ export interface ChatJsonlRow {
     content: string | Array<Record<string, unknown>>;
   }>;
   images?: string[];
+}
+
+interface NormalizedChatJsonl {
+  rows: ChatJsonlRow[];
+  jsonl: string;
+  localAssetPaths: string[];
+}
+
+function normalizeAssetReference(value: string, baseDirectory: string): string {
+  if (value.startsWith("~/")) return join(homedir(), value.slice(2));
+  if (!value || isAbsolute(value) || /^[a-z][a-z0-9+.-]*:/i.test(value)) return value;
+  return resolve(baseDirectory, value);
+}
+
+function localAssetPath(value: string): string | null {
+  if (value.startsWith("file://")) {
+    try {
+      return fileURLToPath(new URL(value));
+    } catch {
+      return null;
+    }
+  }
+  return /^[a-z][a-z0-9+.-]*:/i.test(value) ? null : value;
+}
+
+async function loadNormalizedChatJsonl(path: string): Promise<NormalizedChatJsonl> {
+  const text = await readFile(path, "utf8");
+  const baseDirectory = dirname(resolve(path));
+  const rows: ChatJsonlRow[] = [];
+  const jsonLines: string[] = [];
+  const localAssets = new Set<string>();
+  const normalize = (value: unknown): unknown => {
+    if (typeof value !== "string" || !value) return value;
+    const normalized = normalizeAssetReference(value, baseDirectory);
+    const local = localAssetPath(normalized);
+    if (local) localAssets.add(resolve(local));
+    return normalized;
+  };
+  for (const [index, line] of text.split(/\r?\n/).entries()) {
+    if (!line.trim()) continue;
+    let row: ChatJsonlRow;
+    try {
+      row = JSON.parse(line) as ChatJsonlRow;
+    } catch (error) {
+      throw new Error(`Invalid chat JSONL row ${index + 1}: malformed JSON`, { cause: error });
+    }
+    if (Array.isArray(row.images)) row.images = row.images.map((value) => normalize(value) as string);
+    if (Array.isArray(row.messages)) {
+      for (const message of row.messages) {
+        if (!Array.isArray(message.content)) continue;
+        for (const part of message.content) {
+          if (!part || typeof part !== "object" || (part.type !== "image" && part.type !== "image_url")) continue;
+          for (const key of ["image", "path", "uri", "data_uri"] as const) {
+            if (part[key] !== undefined) part[key] = normalize(part[key]);
+          }
+          if (typeof part.image_url === "string") part.image_url = normalize(part.image_url);
+          if (part.image_url && typeof part.image_url === "object" && !Array.isArray(part.image_url)) {
+            const imageUrl = part.image_url as Record<string, unknown>;
+            if (imageUrl.url !== undefined) imageUrl.url = normalize(imageUrl.url);
+          }
+        }
+      }
+    }
+    rows.push(row);
+    jsonLines.push(JSON.stringify(row));
+  }
+  return {
+    rows,
+    jsonl: jsonLines.join("\n"),
+    localAssetPaths: [...localAssets].sort(),
+  };
+}
+
+/** Rewrites relative image references so a copied training JSONL stays valid. */
+export async function normalizeChatJsonlForRelocation(path: string): Promise<string> {
+  return (await loadNormalizedChatJsonl(path)).jsonl;
+}
+
+export async function localAssetPathsFromChatJsonl(path: string): Promise<string[]> {
+  return (await loadNormalizedChatJsonl(path)).localAssetPaths;
 }
 
 export function buildSystemMessage(spec: SpecSnapshot): string {
@@ -53,11 +136,9 @@ export function examplesFromSpec(spec: SpecSnapshot): BehaviorSpecExample[] {
 }
 
 export async function examplesFromChatJsonl(path: string): Promise<BehaviorSpecExample[]> {
-  const text = await readFile(path, "utf8");
+  const normalized = await loadNormalizedChatJsonl(path);
   const examples: BehaviorSpecExample[] = [];
-  for (const [index, line] of text.split(/\r?\n/).entries()) {
-    if (!line.trim()) continue;
-    const row = JSON.parse(line) as ChatJsonlRow;
+  for (const [index, row] of normalized.rows.entries()) {
     const user = row.messages.find((message) => message.role === "user");
     const assistant = [...row.messages].reverse().find((message) => message.role === "assistant");
     if (!user || !assistant || typeof assistant.content !== "string") {

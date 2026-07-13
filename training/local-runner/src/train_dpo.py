@@ -23,6 +23,8 @@ HYPERPARAMETERS_PATH = Path(
 )
 MODEL_DIR = Path(os.environ.get("SM_MODEL_DIR", "/opt/ml/model"))
 OUTPUT_DIR = Path(os.environ.get("SM_OUTPUT_DIR", "/opt/ml/output"))
+MAX_ARCHIVE_MEMBERS = 20_000
+MAX_ARCHIVE_EXPANDED_BYTES = 20 * 1024 * 1024 * 1024
 
 
 def load_hyperparameters() -> dict[str, str]:
@@ -57,6 +59,11 @@ def hp_bool(name: str, default: bool) -> bool:
     return (hp(name, str(default)) or "").lower() in {"1", "true", "yes", "y"}
 
 
+def model_revision_kwargs(model_source: str) -> dict[str, str]:
+    revision = hp("base_model_revision")
+    return {"revision": revision} if revision and not Path(model_source).exists() else {}
+
+
 def supported_kwargs(callable_obj: Any, values: dict[str, Any]) -> dict[str, Any]:
     accepted = set(inspect.signature(callable_obj).parameters)
     return {key: value for key, value in values.items() if key in accepted}
@@ -81,22 +88,36 @@ def load_preference_rows() -> list[dict[str, str]]:
     return rows
 
 
-def resolve_model_source() -> str:
+def safe_extract_archive(path: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    destination_root = destination.resolve()
+    with tarfile.open(path, "r:gz") as tar:
+        members = tar.getmembers()
+        if len(members) > MAX_ARCHIVE_MEMBERS:
+            raise ValueError(f"Model archive exceeds {MAX_ARCHIVE_MEMBERS} members")
+        expanded_bytes = sum(max(0, member.size) for member in members if member.isfile())
+        if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
+            raise ValueError("Model archive exceeds the 20 GiB expanded-size limit")
+        for member in members:
+            destination_path = (destination / member.name).resolve()
+            try:
+                destination_path.relative_to(destination_root)
+            except ValueError:
+                raise ValueError(f"Unsafe archive member: {member.name}")
+            if member.issym() or member.islnk() or member.isdev():
+                raise ValueError(f"Unsafe archive member type: {member.name}")
+        tar.extractall(destination)
+
+
+def resolve_model_source(tmp: Path) -> str:
     archive = BASE_MODEL_DIR / "model.tar.gz"
     if archive.is_file():
-        extracted = Path("/tmp/base-model")
-        extracted.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(archive, "r:gz") as tar:
-            extracted_root = extracted.resolve()
-            for member in tar.getmembers():
-                destination = (extracted / member.name).resolve()
-                try:
-                    destination.relative_to(extracted_root)
-                except ValueError:
-                    raise ValueError(f"Unsafe archive member: {member.name}")
-            tar.extractall(extracted)
+        extracted = tmp / "base-model"
+        safe_extract_archive(archive, extracted)
         candidates = [path for path in extracted.iterdir() if path.is_dir()]
         return str(candidates[0] if len(candidates) == 1 else extracted)
+    if BASE_MODEL_DIR.is_dir() and any(BASE_MODEL_DIR.iterdir()):
+        return str(BASE_MODEL_DIR)
     return hp("base_model") or "Qwen/Qwen3.5-2B"
 
 
@@ -115,16 +136,7 @@ def resolve_adapter_path(value: str | None, tmp: Path) -> str | None:
     path = Path(path_value)
     if path.is_file() and path.name.endswith(".tar.gz"):
         extracted = tmp / "parent-adapter"
-        extracted.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(path, "r:gz") as tar:
-            extracted_root = extracted.resolve()
-            for member in tar.getmembers():
-                destination = (extracted / member.name).resolve()
-                try:
-                    destination.relative_to(extracted_root)
-                except ValueError:
-                    raise ValueError(f"Unsafe archive member: {member.name}")
-            tar.extractall(extracted)
+        safe_extract_archive(path, extracted)
         candidates = [candidate for candidate in extracted.rglob("adapter_config.json")]
         if candidates:
             return str(candidates[0].parent)
@@ -138,6 +150,7 @@ def create_model_and_tokenizer(model_source: str):
     token = os.getenv("HF_TOKEN")
     tokenizer = AutoTokenizer.from_pretrained(
         model_source,
+        **model_revision_kwargs(model_source),
         trust_remote_code=trust_remote_code,
         token=token,
     )
@@ -147,6 +160,7 @@ def create_model_and_tokenizer(model_source: str):
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
     model = AutoModelForCausalLM.from_pretrained(
         model_source,
+        **model_revision_kwargs(model_source),
         trust_remote_code=trust_remote_code,
         token=token,
         torch_dtype=dtype if torch.cuda.is_available() else None,
@@ -246,14 +260,16 @@ def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     rows = load_preference_rows()
-    model_source = resolve_model_source()
-    metrics = run_training(rows, model_source)
+    with TemporaryDirectory(prefix="tt-local-base-model-") as base_tmp:
+        model_source = resolve_model_source(Path(base_tmp))
+        metrics = run_training(rows, model_source)
 
     archive_path = create_model_archive()
     output_metrics = {
         "training_method": "dpo",
         "preference_rows": len(rows),
-        "model_source": model_source,
+        "model_source": str(BASE_MODEL_DIR) if BASE_MODEL_DIR.is_dir() and any(BASE_MODEL_DIR.iterdir()) else hp("base_model"),
+        "base_model_revision": hp("base_model_revision"),
         "parent_model_artifact": hp("parent_model_artifact"),
         "dpo_beta": hp_float("dpo_beta", 0.1),
         "dpo_loss_type": hp("dpo_loss_type", "sigmoid"),

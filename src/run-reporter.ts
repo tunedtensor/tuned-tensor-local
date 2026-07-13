@@ -17,6 +17,16 @@ export interface LocalRunReporter {
   onLog?(log: LocalRunProgressLog): void | Promise<void>;
 }
 
+/** Optional high-volume reporting must never crash or orphan the workload. */
+export function reportInBackground(action: () => void | Promise<void>): void {
+  try {
+    void Promise.resolve(action()).catch(() => undefined);
+  } catch {
+    // Progress/log reporting is best effort. Cancellation is enforced through
+    // the process runner's explicit polling callback.
+  }
+}
+
 export function sanitizeLogLine(line: string): string {
   return line
     .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[redacted]")

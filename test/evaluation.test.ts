@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { comparisonReportSchema, localRunnerConfigSchema } from "../src/contracts.js";
-import { buildJudgeMessages, classifyJudgeReasoning, compareEvalReports, deriveSampleSeed, evaluateExamples, rescoreEvalReport, sampleExamples, splitSpecExamples, tokenF1 } from "../src/evaluation.js";
+import { baselineCacheKey, buildJudgeMessages, classifyJudgeReasoning, compareEvalReports, deriveSampleSeed, evaluateExamples, rescoreEvalReport, sampleExamples, splitSpecExamples, tokenF1 } from "../src/evaluation.js";
 
 async function writeFakeEvaluator(root: string, actual: string): Promise<string> {
   const path = join(root, "fake-evaluate.py");
@@ -60,6 +60,7 @@ test("transformers evaluation adapter records generated outputs and exact-match 
       kind: "candidate",
       modelId: `file://${join(root, "adapter")}`,
       baseModelId: "Qwen/Qwen3.5-2B",
+      baseModelRevision: "0123456789abcdef",
       adapterPath: `file://${join(root, "adapter")}`,
       examples: [{ input: "Classify: good", output: "positive" }],
       system: "Return labels.",
@@ -73,9 +74,80 @@ test("transformers evaluation adapter records generated outputs and exact-match 
     assert.equal(report.avg_score, 1);
     assert.equal(report.exact_match_rate, 1);
     assert.ok(report.log_uri);
+    const inferencePayload = JSON.parse(
+      await readFile(`${join(root, "candidate-eval.json")}.inference-input.json`, "utf8"),
+    ) as Record<string, unknown>;
+    assert.equal(inferencePayload.base_model_revision, "0123456789abcdef");
     const logText = await readFile(report.log_uri.replace(/^file:\/\//, ""), "utf8");
     assert.match(logText, /fake evaluator started/);
     assert.match(logText, /fake evaluator loading model/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("transformers evaluation inherits the configured HF_HOME hub layout", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-cache-env-test-"));
+  try {
+    const script = join(root, "cache-env-evaluate.py");
+    await writeFile(script, `
+import argparse, json, os
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--output", required=True)
+args = parser.parse_args()
+payload = json.load(open(args.input))
+print(json.dumps({key: os.environ.get(key) for key in [
+  "HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE"
+]}))
+json.dump({
+  "provider": "transformers",
+  "model_id": payload["model_id"],
+  "results": [
+    {"prompt": e["input"], "expected": e["output"], "actual": e["output"], "latency_ms": 1}
+    for e in payload["examples"]
+  ]
+}, open(args.output, "w"))
+`, "utf8");
+    const modelCache = join(root, "huggingface");
+    const outputPath = join(root, "baseline-eval.json");
+    const config = localRunnerConfigSchema.parse({
+      dryRun: false,
+      paths: { modelCache },
+      evaluation: {
+        inference: {
+          provider: "transformers",
+          script,
+          env: {
+            HF_HOME: "/wrong/home",
+            HF_HUB_CACHE: "/wrong/hub",
+            HUGGINGFACE_HUB_CACHE: "/wrong/legacy",
+            TRANSFORMERS_CACHE: "/wrong/transformers",
+            PYTORCH_TRANSFORMERS_CACHE: "/wrong/pytorch-transformers",
+            PYTORCH_PRETRAINED_BERT_CACHE: "/wrong/pytorch-bert",
+          },
+        },
+        scoring: { mode: "exact_match" },
+      },
+    });
+    await evaluateExamples({
+      kind: "baseline",
+      modelId: "Qwen/Qwen3.5-2B",
+      baseModelId: "Qwen/Qwen3.5-2B",
+      examples: [{ input: "Classify: good", output: "positive" }],
+      system: "Return labels.",
+      config,
+      outputPath,
+    });
+
+    const inferenceInput = JSON.parse(await readFile(`${outputPath}.inference-input.json`, "utf8"));
+    assert.equal(inferenceInput.model_cache, modelCache);
+    const log = await readFile(`${outputPath}.inference.log`, "utf8");
+    const cacheEnv = JSON.parse(log.trim()) as Record<string, string>;
+    assert.equal(cacheEnv.HF_HOME, modelCache);
+    assert.equal(cacheEnv.HF_HUB_CACHE, join(modelCache, "hub"));
+    assert.equal(cacheEnv.HUGGINGFACE_HUB_CACHE, join(modelCache, "hub"));
+    assert.equal(cacheEnv.TRANSFORMERS_CACHE, null);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -693,6 +765,225 @@ json.dump({
   return { script, countPath };
 }
 
+test("default scoring is runnable exact_match while explicit llm_judge defaults to fail", () => {
+  const config = localRunnerConfigSchema.parse({});
+  assert.equal(config.evaluation.scoring.mode, "exact_match");
+  assert.equal(config.evaluation.scoring.fallback, "fail");
+
+  const judgeConfig = localRunnerConfigSchema.parse({
+    evaluation: { scoring: { mode: "llm_judge" } },
+  });
+  assert.equal(judgeConfig.evaluation.scoring.mode, "llm_judge");
+  assert.equal(judgeConfig.evaluation.scoring.fallback, "fail");
+});
+
+test("llm_judge missing config or API key fails before inference", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-judge-preflight-test-"));
+  const originalKey = process.env.TT_LOCAL_MISSING_JUDGE_KEY;
+  try {
+    delete process.env.TT_LOCAL_MISSING_JUDGE_KEY;
+    const { script, countPath } = await writeCountingEvaluator(root, "positive");
+    const baseArgs = {
+      kind: "baseline" as const,
+      modelId: "Qwen/Qwen3.5-2B",
+      baseModelId: "Qwen/Qwen3.5-2B",
+      examples: [{ input: "Classify: good", output: "positive" }],
+      system: "Return labels.",
+    };
+    const missingConfig = localRunnerConfigSchema.parse({
+      dryRun: false,
+      evaluation: {
+        inference: { provider: "transformers", script },
+        scoring: { mode: "llm_judge" },
+      },
+    });
+    await assert.rejects(evaluateExamples({
+      ...baseArgs,
+      config: missingConfig,
+      outputPath: join(root, "missing-config.json"),
+    }), /cannot start because the llm OpenRouter configuration is missing/);
+
+    const missingKey = localRunnerConfigSchema.parse({
+      dryRun: false,
+      evaluation: {
+        inference: { provider: "transformers", script },
+        scoring: { mode: "llm_judge" },
+      },
+      llm: {
+        provider: "openrouter",
+        model: "openai/gpt-5.5",
+        apiKeyEnv: "TT_LOCAL_MISSING_JUDGE_KEY",
+      },
+    });
+    await assert.rejects(evaluateExamples({
+      ...baseArgs,
+      config: missingKey,
+      outputPath: join(root, "missing-key.json"),
+    }), /TT_LOCAL_MISSING_JUDGE_KEY is not set/);
+
+    await assert.rejects(readFile(countPath, "utf8"), /ENOENT/, "preflight must run before model inference");
+  } finally {
+    if (originalKey === undefined) {
+      delete process.env.TT_LOCAL_MISSING_JUDGE_KEY;
+    } else {
+      process.env.TT_LOCAL_MISSING_JUDGE_KEY = originalKey;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("explicit judge fallback is marked and never enters the baseline cache", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-judge-unavailable-cache-test-"));
+  try {
+    const { script, countPath } = await writeCountingEvaluator(root, "positive");
+    const config = localRunnerConfigSchema.parse({
+      dryRun: false,
+      storeRoot: join(root, "store"),
+      evaluation: {
+        inference: { provider: "transformers", script },
+        scoring: { mode: "llm_judge", fallback: "exact_match" },
+      },
+    });
+    const args = {
+      kind: "baseline" as const,
+      modelId: "Qwen/Qwen3.5-2B",
+      baseModelId: "Qwen/Qwen3.5-2B",
+      baseModelRevision: "revision-test",
+      examples: [{ input: "Classify: good", output: "positive" }],
+      system: "Return labels.",
+      config,
+    };
+    const first = await evaluateExamples({ ...args, outputPath: join(root, "baseline-1.json") });
+    const second = await evaluateExamples({ ...args, outputPath: join(root, "baseline-2.json") });
+
+    for (const report of [first, second]) {
+      assert.notEqual(report.cached, true);
+      assert.equal(report.results[0]?.scored_by, "exact_match_fallback");
+      assert.match(report.results[0]?.reasoning ?? "", /LLM judge unavailable/);
+      assert.equal(report.fallback_scored_count, 1);
+      assert.equal(report.judge_scored_count, 0);
+    }
+    assert.equal((await readFile(countPath, "utf8")).length, 2, "fallback result must not suppress later inference");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("baseline cache key includes judge configuration and key availability", () => {
+  const originalKey = process.env.TT_LOCAL_CACHE_JUDGE_KEY;
+  try {
+    delete process.env.TT_LOCAL_CACHE_JUDGE_KEY;
+    const config = localRunnerConfigSchema.parse({
+      evaluation: {
+        scoring: { mode: "llm_judge", fallback: "exact_match" },
+      },
+      llm: {
+        provider: "openrouter",
+        model: "openai/gpt-5.5",
+        apiKeyEnv: "TT_LOCAL_CACHE_JUDGE_KEY",
+      },
+    });
+    const args = {
+      modelId: "Qwen/Qwen3.5-2B",
+      system: "Return labels.",
+      examples: [{ input: "Classify: good", output: "positive" }],
+      config,
+      packageVersion: "test",
+    };
+    const unavailable = baselineCacheKey(args);
+    process.env.TT_LOCAL_CACHE_JUDGE_KEY = "secret-not-hashed";
+    const available = baselineCacheKey(args);
+    assert.notEqual(available, unavailable);
+
+    const otherModel = baselineCacheKey({
+      ...args,
+      config: localRunnerConfigSchema.parse({
+        evaluation: {
+          scoring: { mode: "llm_judge", fallback: "exact_match" },
+        },
+        llm: {
+          provider: "openrouter",
+          model: "anthropic/claude-sonnet-4",
+          apiKeyEnv: "TT_LOCAL_CACHE_JUDGE_KEY",
+        },
+      }),
+    });
+    assert.notEqual(otherModel, available);
+    assert.notEqual(
+      baselineCacheKey({ ...args, baseModelRevision: "revision-a" }),
+      baselineCacheKey({ ...args, baseModelRevision: "revision-b" }),
+    );
+    assert.notEqual(
+      baselineCacheKey({ ...args, sourceFingerprint: "source-a" }),
+      baselineCacheKey({ ...args, sourceFingerprint: "source-b" }),
+    );
+  } finally {
+    if (originalKey === undefined) {
+      delete process.env.TT_LOCAL_CACHE_JUDGE_KEY;
+    } else {
+      process.env.TT_LOCAL_CACHE_JUDGE_KEY = originalKey;
+    }
+  }
+});
+
+test("transient judge fallback is retried instead of cached as a judge result", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-judge-transient-cache-test-"));
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.TT_LOCAL_TRANSIENT_JUDGE_KEY;
+  let fetchCalls = 0;
+  try {
+    process.env.TT_LOCAL_TRANSIENT_JUDGE_KEY = "test-key";
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      if (fetchCalls === 1) throw new Error("temporary judge outage");
+      return new Response(JSON.stringify({
+        model: "openai/gpt-5.5",
+        choices: [{ message: { content: "{\"score\":0.8,\"passed\":true,\"reasoning\":\"good\"}" } }],
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as typeof fetch;
+    const { script, countPath } = await writeCountingEvaluator(root, "mostly positive");
+    const config = localRunnerConfigSchema.parse({
+      dryRun: false,
+      storeRoot: join(root, "store"),
+      evaluation: {
+        inference: { provider: "transformers", script },
+        scoring: { mode: "llm_judge", fallback: "exact_match" },
+      },
+      llm: {
+        provider: "openrouter",
+        model: "openai/gpt-5.5",
+        apiKeyEnv: "TT_LOCAL_TRANSIENT_JUDGE_KEY",
+      },
+    });
+    const args = {
+      kind: "baseline" as const,
+      modelId: "Qwen/Qwen3.5-2B",
+      baseModelId: "Qwen/Qwen3.5-2B",
+      baseModelRevision: "revision-test",
+      examples: [{ input: "Classify: good", output: "positive" }],
+      system: "Return labels.",
+      config,
+    };
+    const first = await evaluateExamples({ ...args, outputPath: join(root, "baseline-1.json") });
+    const second = await evaluateExamples({ ...args, outputPath: join(root, "baseline-2.json") });
+
+    assert.equal(first.results[0]?.scored_by, "exact_match_fallback");
+    assert.notEqual(second.cached, true);
+    assert.equal(second.results[0]?.scored_by, "llm_judge");
+    assert.equal(second.results[0]?.score, 0.8);
+    assert.equal((await readFile(countPath, "utf8")).length, 2);
+    assert.equal(fetchCalls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.TT_LOCAL_TRANSIENT_JUDGE_KEY;
+    } else {
+      process.env.TT_LOCAL_TRANSIENT_JUDGE_KEY = originalKey;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("baseline evaluation cache reuses the prior report for identical inputs", async () => {
   const root = await mkdtemp(join(tmpdir(), "tt-local-eval-cache-test-"));
   try {
@@ -709,9 +1000,11 @@ test("baseline evaluation cache reuses the prior report for identical inputs", a
       kind: "baseline" as const,
       modelId: "Qwen/Qwen3.5-2B",
       baseModelId: "Qwen/Qwen3.5-2B",
+      baseModelRevision: "revision-test",
       examples: [{ input: "Classify: good", output: "positive" }],
       system: "Return labels.",
       config,
+      sourceFingerprint: "source-a",
     };
     const first = await evaluateExamples({ ...args, outputPath: join(root, "baseline-1.json") });
     assert.notEqual(first.cached, true);
@@ -723,6 +1016,14 @@ test("baseline evaluation cache reuses the prior report for identical inputs", a
     assert.deepEqual(second.results, first.results);
     assert.ok(second.cache_key);
     assert.equal((await readFile(countPath, "utf8")).length, 1, "evaluator must run only once");
+
+    const changedSource = await evaluateExamples({
+      ...args,
+      sourceFingerprint: "source-b",
+      outputPath: join(root, "baseline-changed-source.json"),
+    });
+    assert.notEqual(changedSource.cached, true);
+    assert.equal((await readFile(countPath, "utf8")).length, 2, "changed input bytes must bypass the old cache key");
 
     // The candidate kind and disabled cache both bypass the cache.
     const noCacheConfig = localRunnerConfigSchema.parse({
@@ -736,7 +1037,7 @@ test("baseline evaluation cache reuses the prior report for identical inputs", a
     });
     const third = await evaluateExamples({ ...args, config: noCacheConfig, outputPath: join(root, "baseline-3.json") });
     assert.notEqual(third.cached, true);
-    assert.equal((await readFile(countPath, "utf8")).length, 2);
+    assert.equal((await readFile(countPath, "utf8")).length, 3);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

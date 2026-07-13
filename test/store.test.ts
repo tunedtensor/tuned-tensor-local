@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fineTuneRunRequestSchema, runReportSchema } from "../src/contracts.js";
-import { createLocalStore, type LocalStore } from "../src/store.js";
+import { createLocalStore, isTerminalRunState, type LocalStore } from "../src/store.js";
 
 const runId = "33333333-3333-4333-8333-333333333333";
 const specId = "44444444-4444-4444-8444-444444444444";
@@ -79,7 +79,7 @@ function reportFixture(reportPath: string) {
       provider: "local-uv",
       training_job_name: "test-job",
       model_artifact_uri: `file://${reportPath}`,
-      metrics: { dry_run: true },
+      metrics: { loss: 0.1 },
       exit_code: 0,
       log_uri: `file://${reportPath}`,
     },
@@ -147,7 +147,7 @@ test("local store persists runs, events, reports, specs, and model records", asy
     const runs = await store.listRuns();
     assert.equal(runs[0]?.status, "completed");
     assert.equal((await store.getRun(runId.slice(0, 8))).id, runId);
-    assert.equal((await store.getRunEvents(runId)).length, 3);
+    assert.equal((await store.getRunEvents(runId)).length, 4);
     assert.equal((await store.getRunReport(runId)).run_id, runId);
     assert.equal((await store.listModels())[0]?.run_id, runId);
     assert.equal((await store.getSpec(specId.slice(0, 8))).spec.name, "Local Store Spec");
@@ -183,14 +183,108 @@ test("local store rebuilds SQLite metadata from canonical files", async () => {
 
     await removeMetadataDb(store);
     assert.equal((await store.listRuns()).length, 0);
-    assert.equal((await store.getRunEvents(runId)).length, 3);
+    assert.equal((await store.getRunEvents(runId)).length, 4);
 
     await store.rebuildIndexes();
     assert.equal((await store.listRuns())[0]?.id, runId);
-    assert.equal((await store.getRunEvents(runId)).length, 3);
+    assert.equal((await store.getRunEvents(runId)).length, 4);
     assert.equal((await store.listSpecs())[0]?.id, specId);
     assert.equal((await store.listModels())[0]?.id, `local-${runId}`);
     assert.equal(await exists(join(store.root, "catalog")), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("dry-run completion does not create a model record", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-store-dry-model-"));
+  try {
+    const store = createLocalStore(join(root, "store"));
+    const request = requestFixture();
+    const artifactDir = join(root, "artifacts", runId);
+    const reportPath = join(artifactDir, "run-report.json");
+    await store.startRun({ request, artifactDir });
+    const real = reportFixture(reportPath);
+    const report = runReportSchema.parse({
+      ...real,
+      training: { ...real.training, metrics: { dry_run: true } },
+    });
+    await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+    const state = await store.completeRun(report, artifactDir, reportPath);
+    assert.equal(state.model_id, undefined);
+    assert.equal((await store.listModels()).length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resuming work clears stale failure and completion fields", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-store-resume-"));
+  try {
+    const store = createLocalStore(join(root, "store"));
+    const request = requestFixture();
+    const artifactDir = join(root, "artifacts", runId);
+    await store.startRun({ request, artifactDir });
+    const failed = await store.failRun(runId, "old failure");
+    assert.equal(failed.error, "old failure");
+    assert.ok(failed.completed_at);
+
+    const resumed = await store.updateRun({
+      runId,
+      status: "preparing",
+      stage: "preparing",
+      message: "Resuming.",
+    });
+    assert.equal(resumed.error, undefined);
+    assert.equal(resumed.completed_at, undefined);
+    const persisted = await store.getRun(runId);
+    assert.equal(persisted.error, undefined);
+    assert.equal(persisted.completed_at, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a cancellation marker wins over late progress, failure, and completion writes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-store-cancel-race-"));
+  try {
+    const store = createLocalStore(join(root, "store"));
+    const request = requestFixture();
+    const artifactDir = join(root, "artifacts", runId);
+    const reportPath = join(artifactDir, "run-report.json");
+    await store.startRun({ request, artifactDir });
+    await store.cancelRun(runId);
+
+    const progressed = await store.updateRun({
+      runId,
+      status: "training",
+      stage: "training",
+      message: "Late training update.",
+    });
+    assert.equal(progressed.status, "cancelled");
+    assert.equal(progressed.current_stage, "cancel_requested");
+    assert.equal(isTerminalRunState(progressed), false);
+
+    const failed = await store.failRun(runId, "late failure");
+    assert.equal(failed.status, "cancelled");
+    assert.equal(failed.error, undefined);
+
+    const report = reportFixture(reportPath);
+    await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+    const completed = await store.completeRun(report, artifactDir, reportPath);
+    assert.equal(completed.status, "cancelled");
+    assert.equal(completed.current_stage, "cancel_requested");
+    assert.equal((await store.listModels()).length, 0);
+
+    const finalized = await store.finalizeCancellation(runId);
+    assert.equal(finalized.current_stage, "cancelled");
+    assert.equal(isTerminalRunState(finalized), true);
+    await store.cancelRun(runId);
+    const unchanged = await store.getRun(runId);
+    assert.equal(unchanged.status, finalized.status);
+    assert.equal(unchanged.current_stage, finalized.current_stage);
+    assert.equal(unchanged.updated_at, finalized.updated_at);
+    assert.equal(unchanged.completed_at, finalized.completed_at);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

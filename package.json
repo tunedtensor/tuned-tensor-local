@@ -21,6 +21,7 @@
     "docs",
     "examples",
     "training/local-runner/pyproject.toml",
+    "training/local-runner/uv.lock",
     "training/local-runner/src/*.py",
     "README.md",
     "CHANGELOG.md",
@@ -28,6 +29,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test \"test/**/*.test.ts\""
   },

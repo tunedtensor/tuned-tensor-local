@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -9,8 +9,11 @@ import {
 } from "../src/contracts.js";
 import {
   initLocalSpecFile,
+  initLocalRunnerConfigFile,
+  assertLocalRunInputReady,
   loadLocalRunInput,
   runRequestFromLocalSpec,
+  resolveLocalRunInputPaths,
   unknownHyperparameterWarnings,
 } from "../src/local-project.js";
 import { parseDotEnv } from "../src/index.js";
@@ -27,6 +30,7 @@ test("initializes a standalone local spec file and converts it to a run request"
     assert.equal(spec.name, "Standalone Local");
     assert.equal(spec.base_model, "Qwen/Qwen3.5-2B");
     assert.ok(spec.id);
+    assert.equal(spec.hyperparameters?.n_epochs, 1);
 
     const input = await loadLocalRunInput(path, {
       userId: "local-test-user",
@@ -40,6 +44,36 @@ test("initializes a standalone local spec file and converts it to a run request"
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("spark profile writes a safe durable local runner config", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-profile-test-"));
+  try {
+    const path = join(root, "local-runner.json");
+    await initLocalRunnerConfigFile({ outputPath: path, profile: "spark" });
+    const config = JSON.parse(await readFile(path, "utf8")) as Record<string, any>;
+    assert.equal(config.storeRoot, ".tt-local/store");
+    assert.equal(config.training.project, "training/local-runner");
+    assert.equal(config.evaluation.inference.project, "training/local-runner");
+    assert.equal(config.evaluation.inference.device, "cuda");
+    assert.equal(config.evaluation.scoring.mode, "exact_match");
+    assert.equal(config.evaluation.timeoutMs, 1_800_000);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("unchanged init placeholders are rejected before training", () => {
+  const request = runRequestFromLocalSpec(localBehaviorSpecFileSchema.parse({
+    name: "Placeholder",
+    base_model: "Qwen/Qwen3.5-2B",
+    system_prompt: "Describe the behavior this local model should learn.",
+    examples: [{
+      input: "Replace this with a representative input.",
+      output: "Replace this with the expected output.",
+    }],
+  }));
+  assert.throws(() => assertLocalRunInputReady(request), /Edit the generated behavior spec/);
 });
 
 test("runRequestFromLocalSpec preserves local spec metadata", () => {
@@ -189,6 +223,24 @@ test("loadLocalRunInput surfaces unknown hyperparameter warnings", async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("local dataset and image paths resolve from the input file directory", () => {
+  const inputPath = join(tmpdir(), "project", "tunedtensor.json");
+  const resolved = resolveLocalRunInputPaths({
+    dataset_prebuilt: {
+      training: "data/train.jsonl",
+      validation: "file:///shared/validation.jsonl",
+    },
+    examples: [{
+      input: "read",
+      output: "ok",
+      input_assets: [{ type: "image", path: "images/page.png" }],
+    }],
+  }, inputPath) as any;
+  assert.equal(resolved.dataset_prebuilt.training, join(tmpdir(), "project", "data", "train.jsonl"));
+  assert.equal(resolved.dataset_prebuilt.validation, "file:///shared/validation.jsonl");
+  assert.equal(resolved.examples[0].input_assets[0].path, join(tmpdir(), "project", "images", "page.png"));
 });
 
 test("parseDotEnv parses simple KEY=VALUE lines", () => {

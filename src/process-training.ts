@@ -1,11 +1,12 @@
-import { access, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import type { FineTuneRunRequest, LocalRunnerConfig, TrainingReport } from "./contracts.js";
 import type { RunArtifacts } from "./artifacts.js";
 import { copyDatasetToTrainingChannel, fileUri, writeJson } from "./artifacts.js";
 import { isExternalTrainingModel, resolveTrainingModel } from "./model-registry.js";
 import { buildEntrypointCommand, runLoggedProcess } from "./process-runner.js";
-import type { LocalRunReporter } from "./run-reporter.js";
+import { reportInBackground, type LocalRunReporter } from "./run-reporter.js";
+import { minimalMachineLearningEnvironment, withHuggingFaceCacheEnvironment } from "./huggingface-cache.js";
 
 function serializeHyperparameter(value: unknown): string {
   if (typeof value === "string") return value;
@@ -14,7 +15,10 @@ function serializeHyperparameter(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function buildCommandTrainingHyperparameters(request: FineTuneRunRequest): Record<string, string> {
+function buildCommandTrainingHyperparameters(
+  request: FineTuneRunRequest,
+  baseModelRevision?: string,
+): Record<string, string> {
   const hyperparameters = Object.fromEntries(
     Object.entries(request.hyperparameters)
       .filter(([, value]) => value !== undefined)
@@ -26,6 +30,7 @@ function buildCommandTrainingHyperparameters(request: FineTuneRunRequest): Recor
     base_model: request.spec_snapshot.base_model,
     training_method: request.training_method,
     model_mode: isExternalTrainingModel(request.spec_snapshot.base_model) ? "external" : "supported",
+    ...(baseModelRevision ? { base_model_revision: baseModelRevision } : {}),
   };
 }
 
@@ -50,9 +55,14 @@ function buildDpoHyperparameters(request: FineTuneRunRequest): Record<string, st
 
 export function buildTrainingHyperparameters(
   request: FineTuneRunRequest,
-  options: { backend?: LocalRunnerConfig["training"]["backend"] } = {},
+  options: {
+    backend?: LocalRunnerConfig["training"]["backend"];
+    baseModelRevision?: string;
+  } = {},
 ): Record<string, string> {
-  if (options.backend === "command") return buildCommandTrainingHyperparameters(request);
+  if (options.backend === "command") {
+    return buildCommandTrainingHyperparameters(request, options.baseModelRevision);
+  }
 
   const model = resolveTrainingModel(request.spec_snapshot.base_model);
   if (request.training_method === "dpo" && model.loader === "image_text_to_text") {
@@ -65,6 +75,7 @@ export function buildTrainingHyperparameters(
     model_family: model.family,
     model_loader: model.loader,
     training_method: request.training_method,
+    ...(options.baseModelRevision ? { base_model_revision: options.baseModelRevision } : {}),
     n_epochs: String(hyper.n_epochs),
     learning_rate: String(hyper.learning_rate ?? model.defaultLearningRate),
     per_device_train_batch_size: String(hyper.batch_size ?? model.defaultPerDeviceBatchSize),
@@ -117,6 +128,10 @@ function numberFromMetric(value: string | undefined): number | undefined {
 }
 
 export function parseTrainingProgressLine(line: string): TrainingProgressSnapshot | null {
+  // Transformers uses tqdm while loading checkpoint shards. Those counters
+  // describe model startup, not optimizer steps, and previously appeared as
+  // misleading "Training progress 320/320" events.
+  if (/loading (?:checkpoint )?shards|loading weights/i.test(line)) return null;
   const snapshot: TrainingProgressSnapshot = {};
   const metricMatches = [...line.matchAll(/'([^']+)':\s*'([^']*)'/g)];
   for (const match of metricMatches) {
@@ -145,7 +160,7 @@ export function parseTrainingProgressLine(line: string): TrainingProgressSnapsho
   return Object.keys(snapshot).length > 0 ? snapshot : null;
 }
 
-function createTrainingProgressForwarder(reporter?: LocalRunReporter): (line: string) => void {
+export function createTrainingProgressForwarder(reporter?: LocalRunReporter): (line: string) => void {
   let lastPercent = -1;
   let lastStep = -1;
   let lastEmittedAt = 0;
@@ -170,14 +185,14 @@ function createTrainingProgressForwarder(reporter?: LocalRunReporter): (line: st
     lastEmittedAt = now;
     if (percent !== undefined) lastPercent = percent;
     if (step !== undefined) lastStep = step;
-    void reporter?.onEvent?.({
+    reportInBackground(() => reporter?.onEvent?.({
       stage: "training",
       status: "running",
       message: step !== undefined && totalSteps !== undefined
         ? `Training progress ${step}/${totalSteps}${percent !== undefined ? ` (${percent}%)` : ""}.`
         : `Training progress${percent !== undefined ? ` ${percent}%` : ""}.`,
       details: latestMetrics as Record<string, unknown>,
-    });
+    }));
   };
 }
 
@@ -185,14 +200,19 @@ export async function launchProcessTraining(args: {
   request: FineTuneRunRequest;
   artifacts: RunArtifacts;
   config: LocalRunnerConfig;
+  baseModelRevision?: string;
   reporter?: LocalRunReporter;
+  shouldCancel?: () => boolean | Promise<boolean>;
 }): Promise<TrainingReport> {
   const { request, artifacts, config } = args;
   const jobName = `tt-local-${request.run_id}`;
   const parentModelArtifact = request.hyperparameters.parent_model_artifact;
   await mkdir(artifacts.trainingDir, { recursive: true });
   await copyDatasetToTrainingChannel(artifacts);
-  const hyperparameters = buildTrainingHyperparameters(request, { backend: config.training.backend });
+  const hyperparameters = buildTrainingHyperparameters(request, {
+    backend: config.training.backend,
+    baseModelRevision: args.baseModelRevision,
+  });
   await writeJson(join(artifacts.trainingConfigDir, "hyperparameters.json"), hyperparameters);
 
   if (config.dryRun) {
@@ -221,8 +241,14 @@ export async function launchProcessTraining(args: {
   const entrypoint = buildEntrypointCommand(config.training, { defaultScript: defaultTrainingScript(request) });
   const command = entrypoint.displayCommand;
   const provider = entrypoint.kind === "uv" ? "local-uv" : "local-command";
-  const childEnv: NodeJS.ProcessEnv = {
-    ...process.env,
+  const resolvedModel = entrypoint.kind === "uv"
+    ? resolveTrainingModel(request.spec_snapshot.base_model)
+    : undefined;
+  const inheritedEnv = entrypoint.kind === "uv"
+    ? minimalMachineLearningEnvironment(process.env, { includeHfToken: resolvedModel?.requiresHfToken })
+    : process.env;
+  const childEnv: NodeJS.ProcessEnv = withHuggingFaceCacheEnvironment({
+    ...inheritedEnv,
     ...config.training.env,
     BACKEND: "local",
     SM_CHANNEL_TRAINING: resolve(artifacts.trainingInputDir),
@@ -230,13 +256,12 @@ export async function launchProcessTraining(args: {
     SM_MODEL_DIR: resolve(artifacts.trainingModelDir),
     SM_OUTPUT_DIR: resolve(artifacts.trainingOutputDir),
     TT_HYPERPARAMETERS_PATH: resolve(artifacts.trainingConfigDir, "hyperparameters.json"),
-    HF_HOME: config.paths.modelCache ? resolve(config.paths.modelCache) : process.env.HF_HOME,
-  };
+  }, config.paths.modelCache);
   for (const [key, value] of Object.entries(childEnv)) {
     if (value === undefined) delete childEnv[key];
   }
 
-  if (config.paths.modelCache) await mkdir(config.paths.modelCache, { recursive: true });
+  if (config.paths.modelCache) await mkdir(resolve(config.paths.modelCache), { recursive: true });
 
   await args.reporter?.onEvent?.({
     stage: "training",
@@ -260,6 +285,7 @@ export async function launchProcessTraining(args: {
     reporter: args.reporter,
     stage: "training",
     onLine: (line) => forwardTrainingProgress(line),
+    shouldCancel: args.shouldCancel,
   });
 
   const metricsPath = join(artifacts.trainingModelDir, "training-metrics.json");
@@ -275,10 +301,6 @@ export async function launchProcessTraining(args: {
   const modelUri = await pathExists(modelTarPath)
     ? fileUri(modelTarPath)
     : fileUri(artifacts.trainingModelDir);
-  if (await pathExists(modelTarPath)) {
-    await copyFile(modelTarPath, join(artifacts.runDir, "model.tar.gz")).catch(() => undefined);
-  }
-
   await args.reporter?.onEvent?.({
     stage: "training",
     status: "running",

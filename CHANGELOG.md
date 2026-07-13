@@ -2,6 +2,57 @@
 
 All notable changes to TT Local will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- Added strict side-effect-free CLI help, `--version`, exact-runtime `doctor`
+  checks, and a Spark initialization profile.
+- Added atomic artifact manifests, `tt-local models verify`, and local
+  OpenAI-compatible serving of verified PEFT adapters.
+- Added local-only `tt-local models verify-base` snapshot validation and made
+  deliberately staged runs terminate as `stage_completed`.
+- Added process-group cancellation and immediate post-training model
+  registration so a valid model survives later evaluation/report failures.
+- Included the bundled Python `uv.lock` in the npm package.
+- Added durable run/artifact ownership claims, workflow locks, detached runs,
+  terminal stage/cancellation states, and `runs watch` lifecycle handling.
+
+### Changed
+
+- Standardized `paths.modelCache` as Hugging Face `HF_HOME` across prefetch,
+  training, evaluation, doctor, and serving; prefetch now reports the resolved
+  snapshot revision, file count, and byte size.
+- Made `exact_match` the runnable scoring default. Explicit LLM-judge mode now
+  requires valid configuration/credentials unless exact-match fallback was
+  deliberately selected, and fallback results are never cached as judge data.
+- Resume invalidation now fingerprints the complete request and effective
+  runner configuration, local data/assets/base snapshot, immutable model
+  revision, parent artifact, and bundled runtime rather than reusing outputs
+  trained with stale inputs.
+- Relative config paths resolve from the config file and relative spec data
+  paths resolve from the spec/request file.
+- Stored parent models now verify their artifact and immutable base identity;
+  continuation runs inherit the recorded base revision and reject conflicts.
+- Baseline caching now requires stable content identity and bypasses mutable
+  remote models/assets. Optional progress reporters can no longer crash or
+  orphan child processes.
+
+### Fixed
+
+- Prevented help, unknown flags, missing values, and option typos from starting
+  work accidentally.
+- Rejected empty or corrupt model outputs before registration and cleared stale
+  terminal errors after successful retries.
+- Rejected incomplete PEFT/full-model contracts, optimizer-only payloads,
+  artifact-prefix collisions, and symlink escapes before publication.
+- Disabled optional PyTorch native JIT kernels by default for bundled ML
+  processes so packaged CUDA inference does not require system Python headers;
+  explicit runner environments can opt back in.
+- Made interactive model-server shutdown close cleanly without a Python
+  traceback.
+- Stopped reporting model checkpoint shard loading as optimizer progress.
+
 ## 0.2.7 - 2026-07-05
 
 ### Added
