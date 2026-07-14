@@ -73,7 +73,7 @@ export function getLocalRunnerInfo(): LocalRunnerInfo {
   return {
     name: "tuned-tensor-local",
     status: "local-runner-preview",
-    description: "Local fine-tuning runner for single-GPU uv/Python hosts.",
+    description: "Local-first fine-tuning with baseline-vs-tuned evaluation for small open-weight models.",
     version: TT_LOCAL_VERSION,
   };
 }
@@ -229,7 +229,7 @@ const COMMAND_DEFINITIONS: Record<string, CliCommandDefinition> = {
   },
   run: {
     usage: "tt-local run [tunedtensor.json|request.json] [options]",
-    description: "Run the local fine-tuning workflow.",
+    description: "Run the baseline, fine-tuning, tuned evaluation, and report workflow.",
     options: [
       CONFIG_OPTION,
       USER_ID_OPTION,
@@ -287,7 +287,7 @@ const COMMAND_GROUPS: Record<string, CliCommandGroup> = {
       get: { usage: "tt-local runs get <run-id> [--config path]", description: "Get a local run.", options: [CONFIG_OPTION], minPositionals: 1, maxPositionals: 1, missingPositionalsMessage: "runs get requires <run-id>" },
       events: { usage: "tt-local runs events <run-id> [--config path]", description: "List run events.", options: [CONFIG_OPTION], minPositionals: 1, maxPositionals: 1, missingPositionalsMessage: "runs events requires <run-id>" },
       watch: { usage: "tt-local runs watch <run-id> [--config path]", description: "Watch a run until it finishes.", options: [CONFIG_OPTION], minPositionals: 1, maxPositionals: 1, missingPositionalsMessage: "runs watch requires <run-id>" },
-      report: { usage: "tt-local runs report <run-id> [--config path]", description: "Get a run comparison report.", options: [CONFIG_OPTION], minPositionals: 1, maxPositionals: 1, missingPositionalsMessage: "runs report requires <run-id>" },
+      report: { usage: "tt-local runs report <run-id> [--config path]", description: "Show the baseline-vs-tuned report, including deltas and regressions.", options: [CONFIG_OPTION], minPositionals: 1, maxPositionals: 1, missingPositionalsMessage: "runs report requires <run-id>" },
       compare: { usage: "tt-local runs compare <run-id-a> <run-id-b> [--config path]", description: "Compare two run reports.", options: [CONFIG_OPTION], minPositionals: 2, maxPositionals: 2, missingPositionalsMessage: "runs compare requires <run-id-a> <run-id-b>" },
       cancel: { usage: "tt-local runs cancel <run-id> [--config path]", description: "Request cancellation of a run.", options: [CONFIG_OPTION], minPositionals: 1, maxPositionals: 1, missingPositionalsMessage: "runs cancel requires <run-id>" },
       reconcile: { usage: "tt-local runs reconcile [--config path]", description: "Rebuild local store indexes.", options: [CONFIG_OPTION], maxPositionals: 0 },

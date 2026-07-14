@@ -3,8 +3,11 @@
 [![CI](https://github.com/tunedtensor/tuned-tensor-local/actions/workflows/ci.yml/badge.svg)](https://github.com/tunedtensor/tuned-tensor-local/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/@tuned-tensor/local)](https://www.npmjs.com/package/@tuned-tensor/local)
 
-TT Local runs Tuned Tensor-style fine-tuning jobs on your own machine. It keeps
-specs, datasets, model artifacts, events, reports, and dashboard state on local
+TT Local is local-first fine-tuning with built-in evaluation for small
+open-weight models. On a compatible NVIDIA GPU on Linux, it turns a behavior
+spec into a fine-tuned model and a paired, inspectable report comparing the run
+baseline with the tuned candidate on representative evaluation cases. Specs,
+datasets, model artifacts, events, reports, and dashboard state stay on local
 disk.
 
 Usage docs:
@@ -82,13 +85,16 @@ tt-local runs watch <run-id> --config local-runner.json
 The detached command returns the persisted run ID, process ID, log path, and
 copy-paste watch/cancel commands before model work begins.
 
-After training:
+Inspect the evidence after the run:
 
 ```bash
 tt-local runs list --config local-runner.json
 tt-local runs report <run-id> --config local-runner.json
 tt-local models verify local-<run-id> --config local-runner.json
 ```
+
+Treat the report as evidence on this run's evaluation cases, not as a
+guarantee of live application improvement.
 
 The model is registered immediately after its artifact passes verification,
 so it remains discoverable if candidate evaluation or report generation later
