@@ -2,7 +2,7 @@
 
 All notable changes to TT Local will be documented in this file.
 
-## Unreleased
+## 0.2.8 - 2026-07-14
 
 ### Added
 
