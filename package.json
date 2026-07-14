@@ -1,7 +1,7 @@
 {
   "name": "@tuned-tensor/local",
   "version": "0.2.8",
-  "description": "TT Local: tuning tensors locally on hardware you control.",
+  "description": "Local-first fine-tuning with baseline-vs-tuned evaluation for small open-weight models.",
   "license": "Apache-2.0",
   "private": false,
   "repository": {
