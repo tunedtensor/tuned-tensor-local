@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildTrainingHyperparameters, parseTrainingProgressLine } from "../src/process-training.js";
+import {
+  buildTrainingHyperparameters,
+  createTrainingProgressForwarder,
+  parseTrainingProgressLine,
+} from "../src/process-training.js";
 import { fineTuneRunRequestSchema } from "../src/contracts.js";
 
 test("parses trainer metric dictionaries as progress snapshots", () => {
@@ -28,6 +32,23 @@ test("parses tqdm progress lines as progress snapshots", () => {
   });
 });
 
+test("does not report checkpoint shard loading as training progress", () => {
+  assert.equal(
+    parseTrainingProgressLine("Loading checkpoint shards: 100%|████| 320/320 [00:02<00:00, 150it/s]"),
+    null,
+  );
+});
+
+test("progress reporter rejections are contained while cancellation polling owns teardown", async () => {
+  const forward = createTrainingProgressForwarder({
+    async onEvent() {
+      throw new Error("cancellation raced progress reporting");
+    },
+  });
+  assert.doesNotThrow(() => forward("100%|██████████| 1/1 [00:01<00:00, 1.00s/it]"));
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+});
+
 test("builds text and multimodal model loader hyperparameters", () => {
   const base = {
     run_id: "11111111-1111-4111-8111-111111111111",
@@ -44,8 +65,11 @@ test("builds text and multimodal model loader hyperparameters", () => {
   };
 
   const textRequest = fineTuneRunRequestSchema.parse(base);
-  const textHyperparameters = buildTrainingHyperparameters(textRequest);
+  const textHyperparameters = buildTrainingHyperparameters(textRequest, {
+    baseModelRevision: "0123456789abcdef",
+  });
   assert.equal(textHyperparameters.model_loader, "causal_lm");
+  assert.equal(textHyperparameters.base_model_revision, "0123456789abcdef");
   assert.equal(textHyperparameters.dpo_beta, undefined);
 
   const multimodalRequest = fineTuneRunRequestSchema.parse({

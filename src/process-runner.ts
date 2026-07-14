@@ -3,7 +3,7 @@ import { createWriteStream } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
-import { forwardStreamLines, type LocalRunReporter } from "./run-reporter.js";
+import { forwardStreamLines, reportInBackground, type LocalRunReporter } from "./run-reporter.js";
 
 export interface UvPythonEntrypointConfig {
   backend?: "uv" | "command";
@@ -81,6 +81,13 @@ export interface LoggedProcessResult {
   stderr: string;
 }
 
+export class ProcessCancelledError extends Error {
+  constructor(message = "Process cancelled.") {
+    super(message);
+    this.name = "ProcessCancelledError";
+  }
+}
+
 export async function runLoggedProcess(args: {
   command: string;
   commandArgs: string[];
@@ -92,6 +99,8 @@ export async function runLoggedProcess(args: {
   reporter?: LocalRunReporter;
   stage: string;
   onLine?: (line: string, stream: "stdout" | "stderr") => void;
+  shouldCancel?: () => boolean | Promise<boolean>;
+  cancelPollMs?: number;
 }): Promise<LoggedProcessResult> {
   if (args.logPath) await mkdir(dirname(args.logPath), { recursive: true });
   const logStream = args.logPath ? createWriteStream(args.logPath, { flags: "w" }) : null;
@@ -103,15 +112,73 @@ export async function runLoggedProcess(args: {
         cwd: args.cwd ? resolve(args.cwd) : process.cwd(),
         stdio: ["ignore", "pipe", "pipe"],
         env: args.env ?? process.env,
+        detached: process.platform !== "win32",
       });
       let timedOut = false;
+      let cancelled = false;
+      let cancellationError: unknown;
+      let cancellationCheckRunning = false;
+      let forceKillTimer: NodeJS.Timeout | null = null;
+      const killProcessGroup = (signal: NodeJS.Signals) => {
+        if (child.pid && process.platform !== "win32") {
+          try {
+            process.kill(-child.pid, signal);
+            return;
+          } catch {
+            // The child may have exited between the check and signal.
+          }
+        }
+        child.kill(signal);
+      };
+      const requestStop = (signal: NodeJS.Signals = "SIGTERM") => {
+        killProcessGroup(signal);
+        if (!forceKillTimer) {
+          forceKillTimer = setTimeout(() => killProcessGroup("SIGKILL"), 5_000);
+          forceKillTimer.unref();
+        }
+      };
+      const onSigint = () => {
+        cancelled = true;
+        requestStop("SIGINT");
+      };
+      const onSigterm = () => {
+        cancelled = true;
+        requestStop("SIGTERM");
+      };
+      process.once("SIGINT", onSigint);
+      process.once("SIGTERM", onSigterm);
       const timer = args.timeoutMs
         ? setTimeout(() => {
             timedOut = true;
-            child.kill("SIGTERM");
-            reject(new Error(args.timeoutMessage ?? `${args.command} timed out after ${args.timeoutMs}ms`));
+            requestStop();
           }, args.timeoutMs)
         : null;
+      const cancellationTimer = args.shouldCancel
+        ? setInterval(() => {
+            if (cancellationCheckRunning || cancelled) return;
+            cancellationCheckRunning = true;
+            Promise.resolve(args.shouldCancel?.())
+              .then((requested) => {
+                if (!requested || cancelled) return;
+                cancelled = true;
+                requestStop();
+              })
+              .catch((error) => {
+                cancellationError = error;
+                requestStop();
+              })
+              .finally(() => { cancellationCheckRunning = false; });
+          }, args.cancelPollMs ?? 250)
+        : null;
+      cancellationTimer?.unref();
+
+      const clearProcessTimers = () => {
+        if (timer) clearTimeout(timer);
+        if (cancellationTimer) clearInterval(cancellationTimer);
+        if (forceKillTimer) clearTimeout(forceKillTimer);
+        process.off("SIGINT", onSigint);
+        process.off("SIGTERM", onSigterm);
+      };
 
       if (logStream) {
         child.stdout.pipe(logStream, { end: false });
@@ -121,23 +188,36 @@ export async function runLoggedProcess(args: {
       forwardStreamLines(child.stdout, (line) => {
         args.onLine?.(line, "stdout");
         if (args.reporter?.verbose) {
-          void args.reporter.onLog?.({ stage: args.stage, stream: "stdout", message: line });
+          reportInBackground(() => args.reporter?.onLog?.({ stage: args.stage, stream: "stdout", message: line }));
         }
       });
       forwardStreamLines(child.stderr, (line) => {
         stderr += `${line}\n`;
         args.onLine?.(line, "stderr");
         if (args.reporter?.verbose) {
-          void args.reporter.onLog?.({ stage: args.stage, stream: "stderr", message: line });
+          reportInBackground(() => args.reporter?.onLog?.({ stage: args.stage, stream: "stderr", message: line }));
         }
       });
       child.on("error", (error) => {
-        if (timer) clearTimeout(timer);
-        reject(error);
+        clearProcessTimers();
+        reject(timedOut
+          ? new Error(args.timeoutMessage ?? `${args.command} timed out after ${args.timeoutMs}ms`)
+          : error);
       });
       child.on("close", (code) => {
-        if (timer) clearTimeout(timer);
-        if (timedOut) return;
+        clearProcessTimers();
+        if (timedOut) {
+          reject(new Error(args.timeoutMessage ?? `${args.command} timed out after ${args.timeoutMs}ms`));
+          return;
+        }
+        if (cancellationError) {
+          reject(cancellationError);
+          return;
+        }
+        if (cancelled) {
+          reject(new ProcessCancelledError(`${args.stage} was cancelled.`));
+          return;
+        }
         resolvePromise(code ?? 1);
       });
     });
@@ -157,33 +237,105 @@ export async function runJsonStdInCommand(args: {
   timeoutMs: number;
   timeoutMessage: string;
   errorPrefix: string;
+  shouldCancel?: () => boolean | Promise<boolean>;
+  cancelPollMs?: number;
 }): Promise<string> {
   const [cmd, ...cmdArgs] = args.command;
+  if (!cmd) throw new Error(`${args.errorPrefix} has no executable.`);
   return await new Promise((resolvePromise, reject) => {
     const child = spawn(cmd, cmdArgs, {
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
+      detached: process.platform !== "win32",
     });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let cancelled = false;
+    let cancellationCheckRunning = false;
+    let cancellationError: unknown;
+    let forceKillTimer: NodeJS.Timeout | null = null;
+    const killProcessGroup = (signal: NodeJS.Signals) => {
+      if (child.pid && process.platform !== "win32") {
+        try {
+          process.kill(-child.pid, signal);
+          return;
+        } catch {
+          // Fall through when the process group has already exited.
+        }
+      }
+      child.kill(signal);
+    };
+    const requestStop = (signal: NodeJS.Signals = "SIGTERM") => {
+      killProcessGroup(signal);
+      if (!forceKillTimer) {
+        forceKillTimer = setTimeout(() => killProcessGroup("SIGKILL"), 5_000);
+        forceKillTimer.unref();
+      }
+    };
+    const onSigint = () => {
+      cancelled = true;
+      requestStop("SIGINT");
+    };
+    const onSigterm = () => {
+      cancelled = true;
+      requestStop("SIGTERM");
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      reject(new Error(args.timeoutMessage));
+      requestStop();
     }, args.timeoutMs);
+    timer.unref();
+    const cancellationTimer = args.shouldCancel
+      ? setInterval(() => {
+          if (cancellationCheckRunning || cancelled) return;
+          cancellationCheckRunning = true;
+          Promise.resolve(args.shouldCancel?.())
+            .then((requested) => {
+              if (!requested || cancelled) return;
+              cancelled = true;
+              requestStop();
+            })
+            .catch((error) => {
+              cancellationError = error;
+              requestStop();
+            })
+            .finally(() => { cancellationCheckRunning = false; });
+        }, args.cancelPollMs ?? 250)
+      : null;
+    cancellationTimer?.unref();
+    process.once("SIGINT", onSigint);
+    process.once("SIGTERM", onSigterm);
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (cancellationTimer) clearInterval(cancellationTimer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      process.off("SIGINT", onSigint);
+      process.off("SIGTERM", onSigterm);
+    };
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", (error) => {
-      clearTimeout(timer);
+      cleanup();
       reject(error);
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
-      if (timedOut) return;
+      cleanup();
+      if (timedOut) {
+        reject(new Error(args.timeoutMessage));
+        return;
+      }
+      if (cancellationError) {
+        reject(cancellationError);
+        return;
+      }
+      if (cancelled) {
+        reject(new ProcessCancelledError(`${args.errorPrefix} was cancelled.`));
+        return;
+      }
       if (code !== 0) {
         reject(new Error(`${args.errorPrefix} exited ${code}: ${stderr.slice(0, 1000)}`));
         return;
@@ -197,6 +349,7 @@ export async function runJsonStdInCommand(args: {
         resolvePromise(trimmed);
       }
     });
+    child.stdin.on("error", () => undefined);
     child.stdin.end(JSON.stringify(args.payload));
   });
 }

@@ -1,10 +1,10 @@
-import { appendFile, copyFile, mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import type BetterSqlite3 from "better-sqlite3";
-import type { FineTuneRunRequest, RunReport, SpecSnapshot } from "./contracts.js";
+import type { FineTuneRunRequest, RunReport, SpecSnapshot, TrainingReport } from "./contracts.js";
 
 const require = createRequire(import.meta.url);
 const BetterSqlite = require("better-sqlite3") as typeof BetterSqlite3;
@@ -20,6 +20,7 @@ export type LocalRunStatus =
   | "evaluating_candidate"
   | "scoring"
   | "reporting"
+  | "stage_completed"
   | "completed"
   | "failed"
   | "cancelled";
@@ -42,6 +43,15 @@ export interface LocalRunState {
   updated_at: string;
   started_at?: string;
   completed_at?: string;
+}
+
+export function isTerminalRunState(
+  state: Pick<LocalRunState, "status" | "current_stage" | "completed_at">,
+): boolean {
+  return state.status === "stage_completed"
+    || state.status === "completed"
+    || state.status === "failed"
+    || (state.status === "cancelled" && state.current_stage === "cancelled" && Boolean(state.completed_at));
 }
 
 export interface LocalRunEvent {
@@ -84,6 +94,7 @@ export interface LocalStore {
   listSpecs(): Promise<LocalSpecRecord[]>;
   getSpec(id: string): Promise<LocalSpecRecord & { spec: SpecSnapshot }>;
   startRun(args: { request: FineTuneRunRequest; artifactDir: string }): Promise<LocalRunState>;
+  syncRunRequest(request: FineTuneRunRequest, artifactDir?: string): Promise<LocalRunState>;
   updateRun(args: {
     runId: string;
     status: LocalRunStatus;
@@ -92,8 +103,17 @@ export interface LocalStore {
     details?: Record<string, unknown>;
   }): Promise<LocalRunState>;
   completeRun(report: RunReport, artifactDir: string, reportPath: string): Promise<LocalRunState>;
+  registerModel(args: {
+    request: FineTuneRunRequest;
+    training: TrainingReport;
+    artifactDir: string;
+    createdAt?: string;
+  }): Promise<LocalModelRecord | null>;
+  invalidateRunOutputs(runId: string, options: { report?: boolean; model?: boolean }): Promise<LocalRunState>;
   failRun(runId: string, error: string): Promise<LocalRunState>;
   cancelRun(runId: string): Promise<void>;
+  finalizeCancellation(runId: string): Promise<LocalRunState>;
+  isCancellationRequested(runId: string): Promise<boolean>;
   listRuns(): Promise<LocalRunState[]>;
   getRun(id: string): Promise<LocalRunState>;
   getRunEvents(id: string): Promise<LocalRunEvent[]>;
@@ -472,6 +492,7 @@ export function createLocalStore(root = defaultLocalHome()): LocalStore {
   const runEventsPath = (id: string) => join(runDir(id), "progress.jsonl");
   const runRequestPath = (id: string) => join(runDir(id), "request.json");
   const runReportPath = (id: string) => join(runDir(id), "run-report.json");
+  const cancellationPath = (id: string) => join(runDir(id), "cancel.requested");
   const specDir = (id: string) => join(paths.specsDir, id);
   const specPath = (id: string) => join(specDir(id), "spec.json");
   const modelPath = (id: string) => join(paths.modelsDir, id, "model.json");
@@ -510,6 +531,42 @@ export function createLocalStore(root = defaultLocalHome()): LocalStore {
     withMetadataDb(paths, (db) => insertEvent(db, row));
   }
 
+  async function finalizeCancellationState(runId: string): Promise<LocalRunState> {
+    const previous = await getRun(runId);
+    if (previous.status === "cancelled" && previous.current_stage === "cancelled" && previous.completed_at) {
+      return previous;
+    }
+    const now = new Date().toISOString();
+    const cancelled: LocalRunState = {
+      ...previous,
+      status: "cancelled",
+      current_stage: "cancelled",
+      status_message: "Run cancelled.",
+      error: undefined,
+      completed_at: now,
+      updated_at: now,
+    };
+    await writeRunState(cancelled);
+    await appendRunEvent(cancelled, { stage: "cancelled", status: "cancelled", message: "Run cancelled." });
+    return cancelled;
+  }
+
+  async function preserveCancellationRequestState(runId: string): Promise<LocalRunState> {
+    const previous = await getRun(runId);
+    if (isTerminalRunState(previous)) return previous;
+    if (previous.status === "cancelled" && previous.current_stage === "cancel_requested") return previous;
+    const requested: LocalRunState = {
+      ...previous,
+      status: "cancelled",
+      current_stage: "cancel_requested",
+      status_message: "Cancellation requested; waiting for the active worker to stop.",
+      error: undefined,
+      completed_at: undefined,
+      updated_at: new Date().toISOString(),
+    };
+    return writeRunState(requested);
+  }
+
   async function resolveRunId(id: string): Promise<string> {
     await ensure();
     if (await exists(runStatePath(id))) return id;
@@ -523,6 +580,51 @@ export function createLocalStore(root = defaultLocalHome()): LocalStore {
 
   async function getRun(id: string): Promise<LocalRunState> {
     return readJson<LocalRunState>(runStatePath(await resolveRunId(id)));
+  }
+
+  async function registerModelRecord(args: {
+    request: FineTuneRunRequest;
+    training: TrainingReport;
+    artifactDir: string;
+    createdAt?: string;
+  }): Promise<LocalModelRecord | null> {
+    if (!args.training.model_artifact_uri || args.training.metrics?.dry_run === true) return null;
+    const previous = await getRun(args.request.run_id);
+    const modelId = `local-${args.request.run_id}`;
+    const existingModel = withMetadataDb(paths, (db) =>
+      db.prepare("SELECT * FROM models WHERE id = ?").get(modelId) as ModelRow | undefined
+    );
+    const now = new Date().toISOString();
+    const model: LocalModelRecord = {
+      id: modelId,
+      run_id: args.request.run_id,
+      behavior_spec_id: args.request.behavior_spec_id,
+      name: `${args.request.spec_snapshot.base_model} (${args.request.run_id.slice(0, 8)})`,
+      provider: args.training.provider,
+      base_model: args.request.spec_snapshot.base_model,
+      artifact_uri: args.training.model_artifact_uri,
+      artifact_dir: args.artifactDir,
+      metrics: args.training.metrics,
+      created_at: existingModel?.created_at ?? args.createdAt ?? now,
+    };
+    await writeJsonAtomic(modelPath(model.id), model);
+    withMetadataDb(paths, (db) => upsertModel(db, model));
+    const alreadyRegistered = previous.model_id === modelId;
+    const state: LocalRunState = {
+      ...previous,
+      model_id: modelId,
+      updated_at: now,
+    };
+    await writeRunState(state);
+    if (!alreadyRegistered) {
+      await appendRunEvent(state, {
+        stage: "model_registered",
+        status: "running",
+        message: "Local model artifact registered.",
+        details: { model_id: modelId, artifact_uri: model.artifact_uri },
+      });
+    }
+    return model;
   }
 
   return {
@@ -588,63 +690,131 @@ export function createLocalStore(root = defaultLocalHome()): LocalStore {
       return state;
     },
 
+    async syncRunRequest(request, artifactDir) {
+      const previous = await getRun(request.run_id);
+      if (
+        previous.behavior_spec_id !== request.behavior_spec_id
+        || previous.user_id !== request.user_id
+        || previous.run_number !== request.run_number
+      ) {
+        throw new Error(
+          `Run ${request.run_id} cannot be reused with different user, behavior spec, or run number identity.`,
+        );
+      }
+      await this.importSpec(request.behavior_spec_id, request.spec_snapshot);
+      await writeJsonAtomic(runRequestPath(request.run_id), request);
+      const state: LocalRunState = {
+        ...previous,
+        artifact_dir: artifactDir ?? previous.artifact_dir,
+        base_model: request.spec_snapshot.base_model,
+        spec_name: request.spec_snapshot.name,
+        updated_at: new Date().toISOString(),
+      };
+      await writeRunState(state);
+      return state;
+    },
+
     async updateRun({ runId, status, stage, message, details }) {
       const previous = await getRun(runId);
+      if (status !== "cancelled" && await exists(cancellationPath(previous.id))) {
+        return preserveCancellationRequestState(previous.id);
+      }
+      const active = status !== "stage_completed" && status !== "completed" && status !== "failed" && status !== "cancelled";
+      const successful = status === "stage_completed" || status === "completed";
+      const now = new Date().toISOString();
       const state: LocalRunState = {
         ...previous,
         status,
         current_stage: stage,
         status_message: message,
-        updated_at: new Date().toISOString(),
+        ...(active
+          ? { error: undefined, completed_at: undefined }
+          : successful
+            ? { error: undefined, completed_at: now }
+            : {}),
+        updated_at: now,
       };
       await writeRunState(state);
-      await appendRunEvent(state, { stage, status: status === "completed" ? "completed" : "running", message, details });
+      if (status !== "cancelled" && await exists(cancellationPath(previous.id))) {
+        return preserveCancellationRequestState(previous.id);
+      }
+      await appendRunEvent(state, {
+        stage,
+        status: successful ? "completed" : status === "failed" ? "failed" : "running",
+        message,
+        details,
+      });
       return state;
     },
 
     async completeRun(report, artifactDir, reportPath) {
-      const previous = await getRun(report.run_id);
-      const modelId = `local-${report.run_id}`;
+      if (await exists(cancellationPath(report.run_id))) {
+        return preserveCancellationRequestState(report.run_id);
+      }
+      const request = await readJson<FineTuneRunRequest>(runRequestPath(report.run_id));
       const completedAt = report.created_at ?? new Date().toISOString();
+      const model = await registerModelRecord({
+        request,
+        training: report.training,
+        artifactDir,
+        createdAt: completedAt,
+      });
+      if (!model) {
+        await rm(join(paths.modelsDir, `local-${report.run_id}`), { recursive: true, force: true });
+        withMetadataDb(paths, (db) => db.prepare("DELETE FROM models WHERE run_id = ?").run(report.run_id));
+      }
+      const previous = await getRun(report.run_id);
       const state: LocalRunState = {
         ...previous,
         status: "completed",
         current_stage: "completed",
         status_message: "Run completed successfully.",
         report_path: reportPath,
-        model_id: modelId,
+        model_id: model?.id,
+        error: undefined,
         completed_at: completedAt,
         updated_at: completedAt,
       };
       await writeRunState(state);
+      if (await exists(cancellationPath(report.run_id))) {
+        return preserveCancellationRequestState(report.run_id);
+      }
       await copyIfExists(reportPath, runReportPath(report.run_id));
       await appendRunEvent(state, {
         stage: "completed",
         status: "completed",
         message: "Run completed successfully.",
-        details: { report_path: reportPath, model_id: modelId },
+        details: { report_path: reportPath, ...(model ? { model_id: model.id } : {}) },
       });
-
-      const model: LocalModelRecord = {
-        id: modelId,
-        run_id: report.run_id,
-        behavior_spec_id: report.behavior_spec_id,
-        name: `${report.run_metadata?.base_model ?? report.base_model} (${report.run_id.slice(0, 8)})`,
-        provider: report.training.provider,
-        base_model: report.base_model,
-        artifact_uri: report.fine_tuned_model_id,
-        artifact_dir: artifactDir,
-        metrics: report.training.metrics,
-        created_at: completedAt,
-      };
-      await writeJsonAtomic(modelPath(model.id), model);
-      withMetadataDb(paths, (db) => upsertModel(db, model));
       return state;
+    },
+
+    registerModel: registerModelRecord,
+
+    async invalidateRunOutputs(runId, options) {
+      const previous = await getRun(runId);
+      if (options.report) await rm(runReportPath(previous.id), { force: true });
+      if (options.model) {
+        await rm(join(paths.modelsDir, `local-${previous.id}`), { recursive: true, force: true });
+        withMetadataDb(paths, (db) => db.prepare("DELETE FROM models WHERE run_id = ?").run(previous.id));
+      }
+      const state: LocalRunState = {
+        ...previous,
+        ...(options.report ? { report_path: undefined } : {}),
+        ...(options.model ? { model_id: undefined } : {}),
+        error: undefined,
+        completed_at: undefined,
+        updated_at: new Date().toISOString(),
+      };
+      return writeRunState(state);
     },
 
     async failRun(runId, error) {
       const previous = await getRun(runId);
       const now = new Date().toISOString();
+      if (await exists(cancellationPath(previous.id))) {
+        return preserveCancellationRequestState(previous.id);
+      }
       const state: LocalRunState = {
         ...previous,
         status: "failed",
@@ -655,22 +825,44 @@ export function createLocalStore(root = defaultLocalHome()): LocalStore {
         updated_at: now,
       };
       await writeRunState(state);
+      if (await exists(cancellationPath(previous.id))) {
+        return preserveCancellationRequestState(previous.id);
+      }
       await appendRunEvent(state, { stage: "failed", status: "failed", message: error });
       return state;
     },
 
     async cancelRun(runId) {
       const state = await getRun(runId);
-      await writeFile(join(runDir(state.id), "cancel.requested"), `${new Date().toISOString()}\n`, "utf8");
+      if (isTerminalRunState(state) || (state.status === "cancelled" && state.current_stage === "cancel_requested")) {
+        return;
+      }
+      await writeFile(cancellationPath(state.id), `${new Date().toISOString()}\n`, "utf8");
+      const latest = await getRun(state.id);
+      if (isTerminalRunState(latest)) {
+        if (latest.status !== "cancelled") await rm(cancellationPath(state.id), { force: true });
+        return;
+      }
       const updated: LocalRunState = {
-        ...state,
+        ...latest,
         status: "cancelled",
         current_stage: "cancel_requested",
-        status_message: "Cancellation requested.",
+        status_message: "Cancellation requested; waiting for the active worker to stop.",
+        error: undefined,
+        completed_at: undefined,
         updated_at: new Date().toISOString(),
       };
       await writeRunState(updated);
       await appendRunEvent(updated, { stage: "cancel_requested", status: "cancelled", message: "Cancellation requested." });
+    },
+
+    async finalizeCancellation(runId) {
+      return finalizeCancellationState(runId);
+    },
+
+    async isCancellationRequested(runId) {
+      const state = await getRun(runId);
+      return state.status === "cancelled" || await exists(cancellationPath(state.id));
     },
 
     async listRuns() {

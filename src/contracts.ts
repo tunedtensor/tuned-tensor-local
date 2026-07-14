@@ -61,6 +61,8 @@ export const fineTuneHyperparametersSchema = z.object({
   dpo_reference_free: z.boolean().optional(),
   max_prompt_length: z.number().int().min(1).optional(),
   max_completion_length: z.number().int().min(1).optional(),
+  /** Immutable Hugging Face commit/revision used for reproducible loading. */
+  base_model_revision: z.string().min(1).optional(),
   parent_model_artifact: z.string().min(1).optional(),
 }).passthrough();
 
@@ -299,7 +301,7 @@ export const localRunnerConfigSchema = z.object({
     backend: z.enum(["uv", "command"]).default("uv"),
     command: commandSchema.optional(),
     artifact: modelArtifactMetadataSchema.optional(),
-    project: z.string().optional(),
+    project: z.string().default("training/local-runner"),
     cwd: z.string().optional(),
     module: z.string().optional(),
     script: z.string().optional(),
@@ -308,6 +310,7 @@ export const localRunnerConfigSchema = z.object({
     env: z.record(z.string(), z.string()).default({}),
   }).default({
     backend: "uv",
+    project: "training/local-runner",
     args: [],
     with: [],
     env: {},
@@ -322,7 +325,7 @@ export const localRunnerConfigSchema = z.object({
     inference: z.object({
       provider: z.enum(["transformers", "batch_command", "command", "none"]).default("transformers"),
       command: commandSchema.optional(),
-      project: z.string().optional(),
+      project: z.string().default("training/local-runner"),
       cwd: z.string().optional(),
       module: z.string().optional(),
       script: z.string().default("training/local-runner/src/evaluate.py"),
@@ -337,6 +340,7 @@ export const localRunnerConfigSchema = z.object({
       chatTemplateKwargs: z.record(z.string(), z.unknown()).optional(),
     }).default({
       provider: "transformers",
+      project: "training/local-runner",
       script: "training/local-runner/src/evaluate.py",
       args: [],
       with: [],
@@ -348,14 +352,14 @@ export const localRunnerConfigSchema = z.object({
       device: "auto",
     }),
     scoring: z.object({
-      mode: z.enum(["exact_match", "llm_judge", "json_fields"]).default("llm_judge"),
-      fallback: z.enum(["exact_match", "fail"]).default("exact_match"),
+      mode: z.enum(["exact_match", "llm_judge", "json_fields"]).default("exact_match"),
+      fallback: z.enum(["exact_match", "fail"]).default("fail"),
       fields: z.array(z.string().min(1)).optional(),
     }).default({
-      mode: "llm_judge",
-      fallback: "exact_match",
+      mode: "exact_match",
+      fallback: "fail",
     }),
-    timeoutMs: z.number().int().min(100).default(120_000),
+    timeoutMs: z.number().int().min(100).default(1_800_000),
     maxExamples: z.number().int().min(1).optional(),
     sampleSeed: z.number().int().optional(),
     allowPrebuiltTrainingEval: z.boolean().default(false),
@@ -363,6 +367,7 @@ export const localRunnerConfigSchema = z.object({
   }).default({
     inference: {
       provider: "transformers",
+      project: "training/local-runner",
       script: "training/local-runner/src/evaluate.py",
       args: [],
       with: [],
@@ -374,10 +379,10 @@ export const localRunnerConfigSchema = z.object({
       device: "auto",
     },
     scoring: {
-      mode: "llm_judge",
-      fallback: "exact_match",
+      mode: "exact_match",
+      fallback: "fail",
     },
-    timeoutMs: 120_000,
+    timeoutMs: 1_800_000,
     allowPrebuiltTrainingEval: false,
     baselineCache: true,
   }),

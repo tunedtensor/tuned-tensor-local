@@ -28,6 +28,12 @@ packaged as a standalone CLI.
   and hosted environments.
 - Dashboard/API server: serves local run/model/spec metadata from the local
   state store and accepts local run submissions.
+- Artifact verifier: validates the trained adapter/full-model contract, writes
+  an atomic SHA-256 manifest, and registers the model before downstream
+  evaluation so successful training survives later-stage failures.
+- Model inference server: loads the recorded base model plus the verified local
+  adapter and exposes localhost `/health`, `/v1/models`, and OpenAI-compatible
+  `/v1/chat/completions` endpoints.
 
 ## Repository Boundary
 
@@ -53,6 +59,7 @@ The first runnable milestone should support:
 - uv-based or command-based training;
 - native Transformers/PEFT, batch-command, or per-example command evaluation
   with optional OpenRouter judge scoring;
+- verified model manifests and local adapter serving;
 - local dashboard and CLI inspection commands;
 - a tiny smoke-run fixture that finishes quickly.
 
@@ -83,6 +90,19 @@ same `--input`/`--output` JSON files as the bundled Transformers evaluator, so a
 custom workflow can load any artifact format as long as it writes compatible
 evaluation results.
 
+`paths.modelCache` is a single cache contract: it is passed as Hugging Face
+`HF_HOME`, and Hub snapshots live beneath `<modelCache>/hub`. The environment
+is finalized before importing Hugging Face or Transformers in every bundled
+Python process. Prefetch records the resolved snapshot revision, file count,
+and byte count; `models verify-base` performs a local-only structural check of
+the cached config, tokenizer, weights, and indexed shards.
+
+An explicitly configured `paths.baseModel` is a complete Hugging Face snapshot
+directory, never a generic weights file or archive. Its file contents are
+fingerprinted for stage identity. Remote runs should set an immutable
+`base_model_revision`; baseline caching is bypassed when the model or a remote
+input lacks stable content identity.
+
 ## Local State Layout
 
 The local store is intentionally transparent and easy to back up:
@@ -94,6 +114,18 @@ The local store is intentionally transparent and easy to back up:
 - `runs/<run-id>/progress.jsonl`
 - `runs/<run-id>/run-report.json`
 - `models/<model-id>/model.json`
+
+Each successful real training stage also writes `artifact-manifest.json` with
+the model contract and SHA-256/size entries for immutable files. Dry runs do
+not create model records. `tt-local models verify` accepts a model ID, exact
+artifact path, or its manifest path and re-hashes the model before it is served
+or handed off.
+
+The default Transformers/PEFT contract requires exact adapter weights plus a
+non-empty `adapter_config.json`; a full-model contract requires recognized
+Transformers model weights. Command backends may publish another layout only
+with an explicit framework/format contract, and such artifacts are not
+implicitly servable.
 
 SQLite is the primary metadata index for CLI and dashboard listings. The
 per-object JSON files remain the recoverable source for artifacts and

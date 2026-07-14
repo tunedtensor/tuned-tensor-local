@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildEntrypointCommand, buildUvPythonArgs } from "../src/process-runner.js";
+import {
+  buildEntrypointCommand,
+  buildUvPythonArgs,
+  ProcessCancelledError,
+  runJsonStdInCommand,
+  runLoggedProcess,
+} from "../src/process-runner.js";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -44,4 +50,77 @@ test("command entrypoints do not rewrite bundled-looking arguments", () => {
   });
 
   assert.deepEqual(command.commandArgs, ["training/local-runner/src/train.py"]);
+});
+
+test("logged processes terminate their process group when cancellation is requested", async () => {
+  let requested = false;
+  const timer = setTimeout(() => { requested = true; }, 50);
+  try {
+    await assert.rejects(
+      runLoggedProcess({
+        command: process.execPath,
+        commandArgs: ["-e", "setInterval(() => {}, 1000)"],
+        stage: "training",
+        shouldCancel: () => requested,
+        cancelPollMs: 10,
+        timeoutMs: 2_000,
+      }),
+      ProcessCancelledError,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
+test("process timeouts wait for child shutdown before returning", async () => {
+  const started = performance.now();
+  await assert.rejects(
+    runLoggedProcess({
+      command: process.execPath,
+      commandArgs: [
+        "-e",
+        "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 100)); setInterval(() => {}, 1000)",
+      ],
+      stage: "evaluation",
+      timeoutMs: 500,
+    }),
+    /timed out after 500ms/,
+  );
+  assert.ok(performance.now() - started >= 550, "timeout returned before the child exited");
+});
+
+test("JSON command inference terminates its process group when cancelled", async () => {
+  let requested = false;
+  const timer = setTimeout(() => { requested = true; }, 50);
+  try {
+    await assert.rejects(
+      runJsonStdInCommand({
+        command: [process.execPath, "-e", "process.stdin.resume(); setInterval(() => {}, 1000)"],
+        payload: { input: "hello" },
+        timeoutMs: 2_000,
+        timeoutMessage: "inference timeout",
+        errorPrefix: "inference",
+        shouldCancel: () => requested,
+        cancelPollMs: 10,
+      }),
+      ProcessCancelledError,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
+test("optional log reporter failures do not crash the child process", async () => {
+  const result = await runLoggedProcess({
+    command: process.execPath,
+    commandArgs: ["-e", "console.log('progress')"],
+    stage: "training",
+    reporter: {
+      verbose: true,
+      async onLog() {
+        throw new Error("reporter unavailable");
+      },
+    },
+  });
+  assert.equal(result.exitCode, 0);
 });

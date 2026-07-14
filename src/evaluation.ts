@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
   evalReportSchema,
@@ -16,6 +16,7 @@ import { openRouterChat } from "./openrouter.js";
 import { buildEntrypointCommand, runJsonStdInCommand, runLoggedProcess } from "./process-runner.js";
 import type { LocalRunReporter } from "./run-reporter.js";
 import { defaultLocalHome } from "./store.js";
+import { minimalMachineLearningEnvironment, withHuggingFaceCacheEnvironment } from "./huggingface-cache.js";
 
 function normalize(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLowerCase();
@@ -265,6 +266,7 @@ async function runInferenceCommand(args: {
   system: string;
   expected: string;
   timeoutMs: number;
+  shouldCancel?: () => boolean | Promise<boolean>;
 }): Promise<string> {
   return runJsonStdInCommand({
     command: args.command,
@@ -276,6 +278,7 @@ async function runInferenceCommand(args: {
     timeoutMs: args.timeoutMs,
     timeoutMessage: `Inference command timed out after ${args.timeoutMs}ms`,
     errorPrefix: "Inference command",
+    shouldCancel: args.shouldCancel,
   });
 }
 
@@ -310,12 +313,14 @@ async function runBatchInference(args: {
   kind: "baseline" | "candidate";
   modelId: string;
   baseModelId: string;
+  baseModelRevision?: string;
   adapterPath?: string;
   examples: BehaviorSpecExample[];
   system: string;
   config: LocalRunnerConfig;
   outputPath: string;
   reporter?: LocalRunReporter;
+  shouldCancel?: () => boolean | Promise<boolean>;
 }): Promise<BatchInferenceResult> {
   const provider = args.config.evaluation.inference.provider === "batch_command" ? "batch_command" : "transformers";
   const label = provider === "batch_command" ? "batch command" : "Transformers";
@@ -333,6 +338,7 @@ async function runBatchInference(args: {
     kind: args.kind,
     model_id: args.modelId,
     base_model: args.baseModelId,
+    base_model_revision: args.baseModelRevision,
     model_loader: modelLoader,
     adapter_path: fileUriToPath(args.adapterPath),
     system: args.system,
@@ -350,6 +356,17 @@ async function runBatchInference(args: {
 
   const entrypoint = buildBatchInferenceCommand(args.config, inputPath, outputPath);
   const command = entrypoint.displayCommand;
+  const inheritedEnv = provider === "transformers"
+    ? minimalMachineLearningEnvironment(process.env, {
+        includeHfToken: (() => {
+          try {
+            return resolveTrainingModel(args.baseModelId).requiresHfToken;
+          } catch {
+            return false;
+          }
+        })(),
+      })
+    : process.env;
   await args.reporter?.onEvent?.({
     stage: `evaluating_${args.kind}`,
     status: "running",
@@ -365,15 +382,16 @@ async function runBatchInference(args: {
     command: entrypoint.command,
     commandArgs: entrypoint.commandArgs,
     cwd: args.config.evaluation.inference.cwd,
-    env: {
-      ...process.env,
+    env: withHuggingFaceCacheEnvironment({
+      ...inheritedEnv,
       ...args.config.evaluation.inference.env,
-    },
+    }, args.config.paths.modelCache),
     logPath,
     timeoutMs: args.config.evaluation.timeoutMs,
     timeoutMessage: `${label} inference timed out after ${args.config.evaluation.timeoutMs}ms`,
     reporter: args.reporter,
     stage: `evaluating_${args.kind}`,
+    shouldCancel: args.shouldCancel,
   });
   if (result.exitCode !== 0) {
     throw new Error(`${label} inference exited ${result.exitCode}: ${result.stderr.slice(0, 1000)}`);
@@ -458,8 +476,45 @@ async function judgeWithOpenRouter(args: {
   };
 }
 
-function canUseOpenRouterJudge(config: LocalRunnerConfig): boolean {
-  return Boolean(config.llm && process.env[config.llm.apiKeyEnv]);
+export interface EvaluationJudgeAvailability {
+  available: boolean;
+  reason?: string;
+}
+
+export function evaluationJudgeAvailability(config: LocalRunnerConfig): EvaluationJudgeAvailability {
+  if (!config.llm) {
+    return {
+      available: false,
+      reason: "the llm OpenRouter configuration is missing",
+    };
+  }
+  if (!process.env[config.llm.apiKeyEnv]?.trim()) {
+    return {
+      available: false,
+      reason: `${config.llm.apiKeyEnv} is not set`,
+    };
+  }
+  return { available: true };
+}
+
+/**
+ * Fail before model inference when judge scoring cannot run. Exact-match
+ * fallback is allowed only when the user opted into it explicitly in config.
+ */
+export function assertEvaluationScoringReady(
+  config: LocalRunnerConfig,
+  scoringMode: "exact_match" | "llm_judge" | "json_fields" = config.evaluation.scoring.mode,
+): EvaluationJudgeAvailability {
+  if (scoringMode !== "llm_judge") return { available: false };
+  const availability = evaluationJudgeAvailability(config);
+  if (!availability.available && config.evaluation.scoring.fallback !== "exact_match") {
+    throw new Error(
+      `evaluation.scoring.mode=llm_judge cannot start because ${availability.reason}. `
+      + "Configure llm and its API key, or explicitly set "
+      + "evaluation.scoring.fallback=exact_match.",
+    );
+  }
+  return availability;
 }
 
 export type RegressionCategory = "factual" | "omission" | "style" | "fallback" | "other";
@@ -495,15 +550,20 @@ export function classifyJudgeReasoning(reasoning: string | null, scoredBy?: stri
  */
 export function baselineCacheKey(args: {
   modelId: string;
+  baseModelRevision?: string;
+  sourceFingerprint?: string;
   system: string;
   examples: BehaviorSpecExample[];
   config: LocalRunnerConfig;
   packageVersion: string;
 }): string {
+  const judgeAvailability = evaluationJudgeAvailability(args.config);
   const payload = {
-    v: 1,
+    v: 3,
     package_version: args.packageVersion,
     model_id: args.modelId,
+    base_model_revision: args.baseModelRevision ?? null,
+    source_fingerprint: args.sourceFingerprint ?? null,
     system: args.system,
     examples: args.examples.map((example) => ({
       input: example.input,
@@ -515,11 +575,52 @@ export function baselineCacheKey(args: {
     inference: args.config.evaluation.inference,
     scoring: {
       mode: args.config.evaluation.scoring.mode,
+      fallback: args.config.evaluation.scoring.fallback,
       fields: args.config.evaluation.scoring.fields ?? null,
-      judgeModel: args.config.llm?.model ?? null,
+      judge: args.config.llm ?? null,
+      judge_available: judgeAvailability.available,
     },
   };
   return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+}
+
+function clearlyLocalReference(value: string): boolean {
+  return value.startsWith("file://")
+    || isAbsolute(value)
+    || value.startsWith("./")
+    || value.startsWith("../")
+    || value === "~"
+    || value.startsWith("~/");
+}
+
+/**
+ * A cache hit is safe only when every mutable input has a content identity.
+ * Remote model branches and remote image URLs may change while retaining the
+ * same string, so those evaluations deliberately bypass the shared cache.
+ */
+function baselineInputsAreCacheStable(args: {
+  modelId: string;
+  baseModelId?: string;
+  baseModelRevision?: string;
+  adapterPath?: string;
+  sourceFingerprint?: string;
+  examples: BehaviorSpecExample[];
+  config: LocalRunnerConfig;
+}): boolean {
+  const baseModel = args.baseModelId ?? args.modelId;
+  const localBase = Boolean(args.config.paths.baseModel) || clearlyLocalReference(baseModel);
+  if (localBase ? !args.sourceFingerprint : !args.baseModelRevision) return false;
+  if (args.adapterPath && !args.sourceFingerprint) return false;
+
+  for (const example of args.examples) {
+    for (const asset of example.input_assets ?? []) {
+      const reference = asset.image ?? asset.data_uri ?? asset.uri ?? asset.path;
+      if (!reference || reference.startsWith("data:")) continue;
+      if (/^[a-z][a-z0-9+.-]*:/i.test(reference) && !reference.startsWith("file://")) return false;
+      if (!args.sourceFingerprint) return false;
+    }
+  }
+  return true;
 }
 
 function baselineCachePath(config: LocalRunnerConfig, key: string): string {
@@ -608,11 +709,8 @@ async function scoreGeneratedEvalResults(args: {
   const results: EvalExampleResult[] = [];
   const jsonFieldScores: JsonFieldScore[] = [];
   let judgeModelId: string | null = null;
-  const shouldJudge = args.scoringMode === "llm_judge" && canUseOpenRouterJudge(args.config);
-  if (args.scoringMode === "llm_judge" && !shouldJudge && args.config.evaluation.scoring.fallback === "fail") {
-    const keyName = args.config.llm?.apiKeyEnv ?? "OPENROUTER_API_KEY";
-    throw new Error(`evaluation.scoring.mode=llm_judge requires ${keyName} or scoring.fallback=exact_match`);
-  }
+  const judgeAvailability = assertEvaluationScoringReady(args.config, args.scoringMode);
+  const shouldJudge = args.scoringMode === "llm_judge" && judgeAvailability.available;
 
   for (const [index, generated] of args.generated.entries()) {
     const exactScore = scoreActual(generated.expected, generated.actual);
@@ -626,7 +724,15 @@ async function scoreGeneratedEvalResults(args: {
     }
     let judged: { score: number; passed: boolean; reasoning: string; model: string | null } | null = null;
     let judgeFellBack = false;
-    if (shouldJudge) {
+    if (args.scoringMode === "llm_judge" && !shouldJudge) {
+      judgeFellBack = true;
+      judged = {
+        score: exactScore,
+        passed: exactScore === 1,
+        reasoning: `LLM judge unavailable (${judgeAvailability.reason}); scored by normalized exact match.`,
+        model: null,
+      };
+    } else if (shouldJudge) {
       try {
         judged = await judgeWithOpenRouter({
           prompt: generated.prompt,
@@ -743,6 +849,8 @@ export async function evaluateExamples(args: {
   kind: "baseline" | "candidate";
   modelId: string;
   baseModelId?: string;
+  baseModelRevision?: string;
+  sourceFingerprint?: string;
   adapterPath?: string;
   examples: BehaviorSpecExample[];
   system: string;
@@ -752,6 +860,7 @@ export async function evaluateExamples(args: {
   maxExamples?: number;
   evalSplit?: EvalSplit;
   sampleSeed?: number;
+  shouldCancel?: () => boolean | Promise<boolean>;
 }): Promise<EvalReport> {
   // Explicit config takes precedence over the per-run request hyperparameter
   // (passed by the orchestrator via args.maxExamples).
@@ -770,6 +879,7 @@ export async function evaluateExamples(args: {
     kind: args.kind,
     config: args.config,
   });
+  const judgeAvailability = assertEvaluationScoringReady(args.config, scoringMode);
   let generationConfig: Record<string, unknown> | undefined;
 
   // Baseline outputs and scores are fully determined by the cache key inputs,
@@ -778,10 +888,22 @@ export async function evaluateExamples(args: {
   const cacheEligible = args.kind === "baseline"
     && args.config.evaluation.baselineCache
     && !args.config.dryRun
-    && inferenceProvider === "transformers";
+    && inferenceProvider === "transformers"
+    && (scoringMode !== "llm_judge" || judgeAvailability.available)
+    && baselineInputsAreCacheStable({
+      modelId: args.modelId,
+      baseModelId: args.baseModelId,
+      baseModelRevision: args.baseModelRevision,
+      adapterPath: args.adapterPath,
+      sourceFingerprint: args.sourceFingerprint,
+      examples: selected,
+      config: args.config,
+    });
   const cacheKey = cacheEligible
     ? baselineCacheKey({
         modelId: args.modelId,
+        baseModelRevision: args.baseModelRevision,
+        sourceFingerprint: args.sourceFingerprint,
         system: args.system,
         examples: selected,
         config: args.config,
@@ -814,12 +936,14 @@ export async function evaluateExamples(args: {
         kind: args.kind,
         modelId: args.modelId,
         baseModelId: args.baseModelId ?? args.modelId,
+        baseModelRevision: args.baseModelRevision,
         adapterPath: args.adapterPath,
         examples: selected,
         system: args.system,
         config: args.config,
         outputPath: args.outputPath,
         reporter: args.reporter,
+        shouldCancel: args.shouldCancel,
       })
     : null;
   generationConfig = inferred?.generation_config;
@@ -834,6 +958,7 @@ export async function evaluateExamples(args: {
           system: args.system,
           expected: example.output,
           timeoutMs: args.config.evaluation.timeoutMs,
+          shouldCancel: args.shouldCancel,
         })
       : undefined;
     const inferredResult = inferred?.results[index];
@@ -868,7 +993,8 @@ export async function evaluateExamples(args: {
   if (cacheKey) {
     // Do not cache reports with fallback-scored examples: a transient judge
     // failure would otherwise be replayed into every future run.
-    if ((report.fallback_scored_count ?? 0) === 0) {
+    if ((report.fallback_scored_count ?? 0) === 0
+      && (scoringMode !== "llm_judge" || report.judge_scored_count === report.total)) {
       await writeJson(baselineCachePath(args.config, cacheKey), { ...report, cache_key: cacheKey });
     }
   }

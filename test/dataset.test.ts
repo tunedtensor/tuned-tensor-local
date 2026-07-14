@@ -69,7 +69,7 @@ test("compiles and reads multimodal chat JSONL image assets", async () => {
     assert.equal(examples[0]?.output, "42");
     assert.deepEqual(examples[0]?.input_assets, [{
       type: "image",
-      image: "charts/example.png",
+      image: join(root, "charts", "example.png"),
       mime_type: "image/png",
     }]);
 
@@ -83,7 +83,7 @@ test("compiles and reads multimodal chat JSONL image assets", async () => {
     const topLevelExamples = await examplesFromChatJsonl(path);
     assert.deepEqual(topLevelExamples[0]?.input_assets, [{
       type: "image",
-      image: "charts/top-level.png",
+      image: join(root, "charts", "top-level.png"),
     }]);
   } finally {
     await rm(root, { recursive: true, force: true });
