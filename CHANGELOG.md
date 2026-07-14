@@ -2,6 +2,14 @@
 
 All notable changes to TT Local will be documented in this file.
 
+## 0.2.9 - 2026-07-14
+
+### Changed
+
+- Reframed TT Local as local-first fine-tuning with paired baseline-vs-tuned
+  evaluation for small open-weight models, and aligned the README, package
+  metadata, and CLI help with that positioning.
+
 ## 0.2.8 - 2026-07-14
 
 ### Added
