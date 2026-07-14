@@ -1,8 +1,8 @@
 # TT Local end-to-end workflow and UX review
 
-Date: 2026-07-13  
-Reviewed release: `@tuned-tensor/local@0.2.7`  
-Repository commit: `3b18464` (`main`)  
+Date: 2026-07-13
+Reviewed release: `@tuned-tensor/local@0.2.7`
+Repository commit: `3b18464` (`main`)
 Scope: install, init, preflight, validation, base-model download, real fine-tuning,
 evaluation, reports, persisted state, recovery, dashboard, and the handoff to model
 inference.
@@ -456,4 +456,3 @@ The Spark audit intentionally did not delete generated data:
 
 No existing project, run, or model was overwritten or deleted. Cleanup should be a
 separate deliberate action after the cache-location fix is understood.
-

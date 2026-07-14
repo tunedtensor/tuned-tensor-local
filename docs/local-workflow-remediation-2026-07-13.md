@@ -1,7 +1,7 @@
 # TT Local workflow remediation
 
-Date: 2026-07-13  
-Source review: `docs/local-workflow-ux-review-2026-07-13.md`  
+Date: 2026-07-13
+Source review: `docs/local-workflow-ux-review-2026-07-13.md`
 Scope: the current, unreleased working-tree patch
 
 This document records what the patch changes, how the intended first-run flow
