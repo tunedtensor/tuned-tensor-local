@@ -201,6 +201,7 @@ test("spec runs hold out ~20% of examples for evaluation deterministically", asy
 function prebuiltRequest(options: {
   runId: string;
   trainingPath: string;
+  validationPath?: string;
   testPath?: string;
   maxEvalExamples?: number;
 }) {
@@ -223,6 +224,7 @@ function prebuiltRequest(options: {
       : {}),
     dataset_prebuilt: {
       training: `file://${options.trainingPath}`,
+      ...(options.validationPath ? { validation: `file://${options.validationPath}` } : {}),
       ...(options.testPath ? { test: `file://${options.testPath}` } : {}),
       format: "chat_jsonl",
     },
@@ -387,6 +389,40 @@ test("uses prebuilt test split for evaluation while preserving training artifact
   }
 });
 
+test("prefers prebuilt validation over test for iterative evaluation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-prebuilt-eval-validation-"));
+  try {
+    const trainingPath = join(root, "train.chat.jsonl");
+    const validationPath = join(root, "validation.chat.jsonl");
+    const testPath = join(root, "test.chat.jsonl");
+    await writeFile(trainingPath, `${chatRow("train input", "train output")}\n`, "utf8");
+    await writeFile(validationPath, `${chatRow("validation input", "validation output")}\n`, "utf8");
+    await writeFile(testPath, `${chatRow("test input", "test output")}\n`, "utf8");
+    const request = prebuiltRequest({
+      runId: "39393939-3939-4939-8939-393939393939",
+      trainingPath,
+      validationPath,
+      testPath,
+    });
+    const config = localRunnerConfigSchema.parse({
+      artifactRoot: join(root, "artifacts"),
+      storeRoot: join(root, "store"),
+      dryRun: true,
+    });
+
+    const result = await runLocalFineTune({ request, config });
+
+    assert.equal(result.report.baseline.eval_split, "prebuilt_validation");
+    assert.equal(result.report.run_metadata.eval_split, "prebuilt_validation");
+    assert.equal(result.report.baseline.results[0]?.prompt, "validation input");
+    assert.equal(result.report.candidate.results[0]?.expected, "validation output");
+    assert.equal(result.report.baseline.results.some((entry) => entry.prompt === "test input"), false);
+    assert.equal(result.report.candidate.results.some((entry) => entry.prompt === "test input"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("DPO dry run trains on preference JSONL and evaluates spec examples", async () => {
   const root = await mkdtemp(join(tmpdir(), "tt-local-dpo-spec-eval-"));
   try {
@@ -442,7 +478,7 @@ test("DPO dry run trains on preference JSONL and evaluates spec examples", async
   }
 });
 
-test("DPO evaluation prefers prebuilt test over validation and never uses preference rows", async () => {
+test("DPO evaluation prefers prebuilt validation over test and never uses preference rows", async () => {
   const root = await mkdtemp(join(tmpdir(), "tt-local-dpo-test-eval-"));
   try {
     const trainingPath = join(root, "preferences.jsonl");
@@ -483,10 +519,23 @@ test("DPO evaluation prefers prebuilt test over validation and never uses prefer
 
     const result = await runLocalFineTune({ request, config });
 
-    assert.equal(result.report.baseline.eval_split, "prebuilt_test");
-    assert.equal(result.report.baseline.results[0]?.prompt, "test prompt");
-    assert.equal(result.report.baseline.results[0]?.expected, "test answer");
+    assert.equal(result.report.baseline.eval_split, "prebuilt_validation");
+    assert.equal(result.report.baseline.results[0]?.prompt, "validation prompt");
+    assert.equal(result.report.baseline.results[0]?.expected, "validation answer");
     assert.notEqual(result.report.baseline.results[0]?.prompt, "preference prompt");
+
+    const testOnlyRequest = fineTuneRunRequestSchema.parse({
+      ...request,
+      run_id: "53535353-5353-4553-8553-535353535353",
+      dataset_prebuilt: {
+        training: `file://${trainingPath}`,
+        test: `file://${testPath}`,
+        format: "preference_jsonl",
+      },
+    });
+    const testOnlyResult = await runLocalFineTune({ request: testOnlyRequest, config });
+    assert.equal(testOnlyResult.report.baseline.eval_split, "prebuilt_test");
+    assert.equal(testOnlyResult.report.baseline.results[0]?.prompt, "test prompt");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

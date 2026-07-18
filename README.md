@@ -96,6 +96,10 @@ tt-local models verify local-<run-id> --config local-runner.json
 Treat the report as evidence on this run's evaluation cases, not as a
 guarantee of live application improvement.
 
+When a prebuilt dataset provides both validation and test files, normal runs
+evaluate the validation split. The test split remains a separate holdout.
+A dataset with only a test split continues to evaluate that test split.
+
 The model is registered immediately after its artifact passes verification,
 so it remains discoverable if candidate evaluation or report generation later
 fails.
@@ -202,7 +206,7 @@ string fields:
 
 DPO v1 is text-only for the bundled `uv` trainer. Validation and reporting still
 use the existing baseline-vs-candidate evaluation loop, so provide
-`dataset_prebuilt.test`, `dataset_prebuilt.validation`, or normal
+`dataset_prebuilt.validation`, `dataset_prebuilt.test`, or normal
 `spec_snapshot.examples` with reference outputs for evaluation.
 
 Command-backed workflows may use external model ids by setting
