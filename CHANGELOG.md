@@ -17,6 +17,9 @@ All notable changes to TT Local will be documented in this file.
   target-free validation data, accepts strict ID-keyed positive-class
   probabilities, and computes trusted AP, ROC AUC, and fixed-threshold F1
   reports without exposing the test split to the command protocol.
+- Added a bundled numeric logistic-regression Study runner with median
+  imputation, missingness indicators, feature scaling, strict parameters, a
+  small isolated locked scikit-learn runtime, and hashed model artifacts.
 
 ### Changed
 

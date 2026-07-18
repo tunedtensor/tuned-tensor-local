@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  buildStudyTrialRunnerCommand,
   runStudyTrial,
   studyTrialSpecSchema,
   type StudyTrialSpec,
@@ -218,6 +219,280 @@ test("defaults to the trial directory and reserves protocol-owned command flags"
     },
     parameters: { learning_rate: Number.POSITIVE_INFINITY },
   }).success, false);
+});
+
+test("accepts only the declared bundled runner shape and resolves its locked script", () => {
+  const runner = {
+    builtin: "numeric_logistic_regression" as const,
+    timeout_ms: 300_000,
+  };
+  assert.equal(studyTrialSpecSchema.safeParse({
+    schema_version: 1,
+    id: "numeric-logreg",
+    name: "Bundled numeric logistic regression",
+    runner,
+    parameters: {
+      c: 1,
+      class_weight: "balanced",
+      max_iter: 1_000,
+      random_seed: 42,
+    },
+  }).success, true);
+  assert.equal(studyTrialSpecSchema.safeParse({
+    schema_version: 1,
+    id: "numeric-logreg-with-cwd",
+    name: "Invalid bundled runner",
+    runner: { ...runner, cwd: "." },
+    parameters: {},
+  }).success, false);
+  assert.equal(studyTrialSpecSchema.safeParse({
+    schema_version: 1,
+    id: "mixed-runner",
+    name: "Invalid mixed runner",
+    runner: { ...runner, command: ["python3", "runner.py"] },
+    parameters: {},
+  }).success, false);
+
+  const command = buildStudyTrialRunnerCommand(runner);
+  assert.equal(command.command, "uv");
+  assert.deepEqual(command.reportCommand, ["builtin:numeric_logistic_regression"]);
+  assert.equal(command.baseArgs[0], "run");
+  assert.equal(command.baseArgs[1], "--locked");
+  assert.match(
+    command.baseArgs[2]!,
+    /training[/\\]study-runner[/\\]numeric_logistic_regression\.py$/,
+  );
+  assert.deepEqual(command.requiredFiles, [
+    command.baseArgs[2],
+    `${command.baseArgs[2]}.lock`,
+  ]);
+});
+
+test("runs the bundled numeric logistic-regression trial deterministically", async () => {
+  await withTrialFixture(async ({ root, studyPath, outputRoot }) => {
+    const header = "id,spread_bps,volume,big_move,future_mid\n";
+    await writeFile(
+      join(root, "data", "training.csv"),
+      `${header}`
+      + "train-1,1.0,100,0,0.10\n"
+      + "train-2,1.3,,0,0.20\n"
+      + "train-3,2.0,80,0,0.30\n"
+      + "train-4,7.0,20,1,0.80\n"
+      + "train-5,8.0,,1,0.90\n",
+      "utf8",
+    );
+    await writeFile(
+      join(root, "data", "validation.csv"),
+      `${header}`
+      + "validation-1,1.2,,0,0.15\n"
+      + "validation-2,7.5,15,1,0.85\n",
+      "utf8",
+    );
+    await writeFile(
+      join(root, "data", "test.csv"),
+      `${header}test-1,1.1,90,0,0.12\ntest-2,7.8,10,1,0.88\n`,
+      "utf8",
+    );
+    const study = JSON.parse(await readFile(studyPath, "utf8")) as {
+      task: { input_columns: string[] };
+    };
+    study.task.input_columns = ["spread_bps", "volume"];
+    await writeFile(studyPath, `${JSON.stringify(study, null, 2)}\n`, "utf8");
+    await writeStudyBenchmarkLock({ studyPath, force: true });
+
+    const writeBuiltinTrial = async (id: string): Promise<string> => {
+      const trialPath = join(root, `${id}.trial.json`);
+      await writeFile(trialPath, `${JSON.stringify({
+        schema_version: 1,
+        id,
+        name: "Balanced numeric logistic regression",
+        runner: {
+          builtin: "numeric_logistic_regression",
+          timeout_ms: 120_000,
+        },
+        parameters: {
+          c: 1,
+          class_weight: "balanced",
+          max_iter: 1_000,
+          random_seed: 42,
+        },
+      }, null, 2)}\n`, "utf8");
+      return trialPath;
+    };
+
+    const first = await runStudyTrial({
+      studyPath,
+      trialPath: await writeBuiltinTrial("numeric-logreg-v1"),
+      outputRoot,
+    });
+    const second = await runStudyTrial({
+      studyPath,
+      trialPath: await writeBuiltinTrial("numeric-logreg-v2"),
+      outputRoot,
+    });
+
+    assert.equal(first.report.evaluation.primary_score, 1);
+    assert.deepEqual(first.report.evaluation.metrics, {
+      average_precision: 1,
+      roc_auc: 1,
+      f1_at_0_5: 1,
+    });
+    assert.deepEqual(
+      first.report.execution.command,
+      ["builtin:numeric_logistic_regression"],
+    );
+    assert.equal(
+      first.report.evaluation.predictions_sha256,
+      second.report.evaluation.predictions_sha256,
+    );
+    assert.equal(
+      existsSync(join(first.trialDirectory, "model", "model.joblib")),
+      true,
+    );
+    const manifest = JSON.parse(
+      await readFile(
+        join(first.trialDirectory, "model", "runner-manifest.json"),
+        "utf8",
+      ),
+    ) as {
+      runner: { name: string; version: number };
+      training: {
+        class_counts: { negative: number; positive: number };
+        missing_counts: Record<string, number>;
+      };
+      model: { sha256: string; size_bytes: number };
+    };
+    assert.deepEqual(manifest.runner, {
+      name: "numeric_logistic_regression",
+      version: 1,
+    });
+    assert.deepEqual(manifest.training.class_counts, {
+      negative: 3,
+      positive: 2,
+    });
+    assert.deepEqual(manifest.training.missing_counts, {
+      spread_bps: 0,
+      volume: 2,
+    });
+    assert.equal(
+      (await readFile(join(first.trialDirectory, "training.csv"), "utf8"))
+        .includes("future_mid"),
+      false,
+    );
+    assert.equal(
+      (await readFile(join(first.trialDirectory, "validation.csv"), "utf8"))
+        .includes("big_move"),
+      false,
+    );
+    assert.match(manifest.model.sha256, /^[0-9a-f]{64}$/);
+    assert.ok(manifest.model.size_bytes > 0);
+  });
+});
+
+test("bundled numeric trials fail clearly on invalid parameters and features", async () => {
+  await withTrialFixture(async ({ root, studyPath, outputRoot }) => {
+    const writeBuiltinTrial = async (
+      id: string,
+      parameters: Record<string, unknown>,
+    ): Promise<string> => {
+      const trialPath = join(root, `${id}.trial.json`);
+      await writeFile(trialPath, `${JSON.stringify({
+        schema_version: 1,
+        id,
+        name: `Invalid fixture ${id}`,
+        runner: {
+          builtin: "numeric_logistic_regression",
+          timeout_ms: 120_000,
+        },
+        parameters,
+      }, null, 2)}\n`, "utf8");
+      return trialPath;
+    };
+    const validParameters = {
+      c: 1,
+      class_weight: "balanced",
+      max_iter: 1_000,
+      random_seed: 42,
+    };
+    const expectRunnerFailure = async (
+      id: string,
+      parameters: Record<string, unknown>,
+      expectedLog: RegExp,
+    ): Promise<void> => {
+      await assert.rejects(
+        runStudyTrial({
+          studyPath,
+          trialPath: await writeBuiltinTrial(id, parameters),
+          outputRoot,
+        }),
+        /exited with code 1/,
+      );
+      assert.match(
+        await readFile(join(outputRoot, id, "trial.log"), "utf8"),
+        expectedLog,
+      );
+      assert.equal(existsSync(join(outputRoot, id, "predictions.json")), false);
+    };
+    const expectSpecFailure = async (
+      id: string,
+      parameters: Record<string, unknown>,
+      expectedError: RegExp,
+    ): Promise<void> => {
+      await assert.rejects(
+        runStudyTrial({
+          studyPath,
+          trialPath: await writeBuiltinTrial(id, parameters),
+          outputRoot,
+        }),
+        expectedError,
+      );
+      assert.equal(existsSync(join(outputRoot, id)), false);
+    };
+
+    await expectSpecFailure(
+      "unknown-parameter",
+      { ...validParameters, solver: "lbfgs" },
+      /parameters: unrecognized key.*solver/i,
+    );
+    await expectSpecFailure(
+      "invalid-c",
+      { ...validParameters, c: 0 },
+      /parameters\.c: too small/i,
+    );
+    await expectRunnerFailure(
+      "nonnumeric-feature",
+      validParameters,
+      /column "note" has nonnumeric value "quiet"/,
+    );
+
+    const header = "id,spread_bps,note,big_move,future_mid\n";
+    await writeFile(
+      join(root, "data", "training.csv"),
+      `${header}train-1,1.2,,0,0.10\ntrain-2,8.4,,1,0.90\n`,
+      "utf8",
+    );
+    await writeFile(
+      join(root, "data", "validation.csv"),
+      `${header}validation-1,1.4,,0,0.20\nvalidation-2,7.9,,1,0.80\n`,
+      "utf8",
+    );
+    await writeFile(
+      join(root, "data", "test.csv"),
+      `${header}test-1,1.1,,0,0.30\ntest-2,8.1,,1,0.70\n`,
+      "utf8",
+    );
+    const study = JSON.parse(await readFile(studyPath, "utf8")) as {
+      task: { input_columns: string[] };
+    };
+    study.task.input_columns = ["note"];
+    await writeFile(studyPath, `${JSON.stringify(study, null, 2)}\n`, "utf8");
+    await writeStudyBenchmarkLock({ studyPath, force: true });
+    await expectRunnerFailure(
+      "all-missing-feature",
+      validParameters,
+      /training numeric features are entirely missing: "note"/,
+    );
+  });
 });
 
 test("rejects malformed, incomplete, forged, and non-regular prediction outputs", async () => {
