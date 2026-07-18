@@ -97,6 +97,7 @@ test("command and nested-command help never execute work", async () => {
       { args: ["models", "serve", "--help"], usage: "tt-local models serve" },
       { args: ["runs", "report", "--help"], usage: "tt-local runs report" },
       { args: ["models", "--help"], usage: "tt-local models <command>" },
+      { args: ["studies", "run", "--help"], usage: "tt-local studies run" },
       { args: ["studies", "validate", "--help"], usage: "tt-local studies validate" },
       { args: ["studies", "--help"], usage: "tt-local studies <command>" },
     ];
@@ -150,6 +151,54 @@ test("study benchmark lock and validation run end to end without opening the loc
     const validated = runCli(["studies", "validate", studyPath], root);
     assert.equal(validated.status, 0, validated.stderr);
     assert.equal(JSON.parse(validated.stdout).ok, true);
+
+    const runnerPath = join(root, "trial-runner.mjs");
+    await writeFile(runnerPath, `
+      import { readFileSync, writeFileSync } from "node:fs";
+      const arg = (name) => process.argv[process.argv.indexOf(name) + 1];
+      const input = JSON.parse(readFileSync(arg("--input"), "utf8"));
+      const validation = readFileSync(input.datasets.validation_csv, "utf8");
+      if (validation !== "id,spread_bps\\nvalidation-1,1.4\\nvalidation-2,7.9\\n") {
+        throw new Error("validation projection contains unexpected data");
+      }
+      writeFileSync(arg("--output"), JSON.stringify({
+        protocol_version: 1,
+        predictions: [
+          { id: "validation-2", probability: 0.9 },
+          { id: "validation-1", probability: 0.1 }
+        ]
+      }));
+    `, "utf8");
+    const trialPath = join(root, "logreg.trial.json");
+    await writeFile(trialPath, `${JSON.stringify({
+      schema_version: 1,
+      id: "logreg-v1",
+      name: "Logistic regression",
+      runner: {
+        command: [process.execPath, runnerPath],
+        cwd: ".",
+        timeout_ms: 10_000,
+      },
+      parameters: { c: 1 },
+    }, null, 2)}\n`, "utf8");
+    const trialOutputRoot = join(root, "trial-output");
+    const trial = runCli([
+      "studies",
+      "run",
+      studyPath,
+      trialPath,
+      "--output-root",
+      trialOutputRoot,
+    ], root);
+    assert.equal(trial.status, 0, trial.stderr);
+    const trialResult = JSON.parse(trial.stdout) as {
+      ok: boolean;
+      trial_report: { evaluation: { primary_score: number } };
+      report_path: string;
+    };
+    assert.equal(trialResult.ok, true);
+    assert.equal(trialResult.trial_report.evaluation.primary_score, 1);
+    assert.equal(existsSync(trialResult.report_path), true);
 
     await writeFile(
       join(dataRoot, "validation.csv"),

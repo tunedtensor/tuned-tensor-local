@@ -14,6 +14,9 @@ packaged as a standalone CLI.
 - Study benchmark validator: keeps classic ML task/data contracts separate
   from fine-tuning requests and writes deterministic integrity locks for
   predefined training, validation, and test CSVs.
+- Study trial runner: projects one locked benchmark into a command-facing
+  training CSV and label-blind validation CSV, validates ID-keyed
+  probabilities, and writes trusted validation metrics and trial artifacts.
 - Artifact store: writes datasets, logs, model outputs, and reports beneath a
   configured local artifact root.
 - Local state store: keeps a SQLite metadata index for specs, runs, progress
@@ -80,8 +83,7 @@ settings, model cache paths, OpenRouter judge settings, and timeout limits.
 another variant of the fine-tuning run request. Its initial task is binary
 classification with explicit ID, input, target, label, and primary-metric
 fields. Algorithms, hyperparameters, trials, and search policy belong to later
-trial records, not the benchmark definition. V1 does not train, select, or
-score a model.
+trial records, not the benchmark definition.
 
 `tt-local studies lock` validates three explicit CSV splits and writes an
 adjacent deterministic lock. The lock contains the canonical StudySpec hash
@@ -100,6 +102,49 @@ near duplicates, feature causality, class balance, or command access to test
 files. Test data remains readable. Those need dedicated temporal-split and
 isolated-evaluation contracts before an autonomous research loop can claim a
 sealed test result.
+
+`tt-local studies run` executes one versioned trial spec without opening the
+fine-tuning run store. Each trial has a filesystem-safe immutable ID, direct
+argv command, relative working directory, finite timeout, and free-form
+parameter record. TT Local claims a new directory for that ID and records its
+projected inputs, command log, raw predictions, optional model files, and
+atomic report. The ID is write-once within that output root; a failed ID is
+retained for diagnosis and never reused. By default the child starts in this
+directory. Explicit working directories resolve from the trial-spec
+directory.
+
+TT Local passes the child only:
+
+- training CSV: ID, explicitly allowlisted inputs, and a target encoded as
+  `0` or `1`;
+- validation CSV: ID and explicitly allowlisted inputs, with no target;
+- a model-artifact directory and caller-provided trial/task semantics.
+
+The child does not receive the StudySpec, benchmark lock, original split
+paths, validation labels, or any test path, hash, rows, or labels. It returns a
+strict protocol-v1 JSON object containing exactly one positive-class
+probability for every declared validation ID. Results are joined by ID, never
+position. IDs are not audited for embedded label or future information. TT
+Local rejects candidate labels and metrics, computes
+tie-independent average precision and ROC AUC plus F1 at the fixed `0.5`
+threshold, and publishes only aggregate metrics in the report.
+
+The runner uses direct process arguments, process-group timeout teardown, a
+reduced machine-learning environment, bounded prediction JSON, and
+post-command input hashes. These are protocol and provenance safeguards, not
+an execution sandbox or credential/network isolation: same-user code can
+inspect the host filesystem, escape the process group, or repeatedly query
+aggregate validation scores. Names, parameters, and command arguments are
+persisted and must not contain secrets. Strong
+process isolation, validation query budgets, temporal split certification,
+and one-shot sealed test evaluation remain separate future boundaries.
+
+Reports bind the StudySpec, benchmark lock, source snapshot, projected inputs,
+predictions, and declared trial configuration. They do not yet hash or
+snapshot runner source, dependency locks, runtime environment, or model
+artifacts, so they are evidence of an attempt rather than a full
+reproducibility attestation. The benchmark is verified before launch; a
+source change during a same-user command is detected by the next trial.
 
 ## Evaluation Loop
 
