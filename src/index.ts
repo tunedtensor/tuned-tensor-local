@@ -38,10 +38,8 @@ import {
   validateStudyBenchmark,
   writeStudyBenchmarkLock,
 } from "./studies.js";
-import {
-  promoteStudyTrialCandidate,
-  runStudyTrial,
-} from "./study-trials.js";
+import { promoteStudyTrialCandidate } from "./study-candidates.js";
+import { runStudyTrial } from "./study-trials.js";
 
 export * from "./compare.js";
 export * from "./contracts.js";
@@ -57,6 +55,7 @@ export * from "./run-reporter.js";
 export * from "./server.js";
 export * from "./store.js";
 export * from "./study-metrics.js";
+export * from "./study-candidates.js";
 export * from "./study-trials.js";
 export * from "./studies.js";
 
