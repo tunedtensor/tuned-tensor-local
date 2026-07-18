@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -87,6 +90,77 @@ test("process timeouts wait for child shutdown before returning", async () => {
     /timed out after 500ms/,
   );
   assert.ok(performance.now() - started >= 550, "timeout returned before the child exited");
+});
+
+test("process timeouts force-kill descendants that outlive the direct child", async () => {
+  if (process.platform === "win32") return;
+  const root = await mkdtemp(join(tmpdir(), "tt-local-process-group-test-"));
+  const marker = join(root, "descendant-survived");
+  const descendant = `
+    const { writeFileSync } = require("node:fs");
+    process.on("SIGTERM", () => {});
+    setTimeout(() => {
+      writeFileSync(${JSON.stringify(marker)}, "survived");
+      process.exit(0);
+    }, 1000);
+  `;
+  const parent = `
+    require("node:child_process").spawn(
+      process.execPath,
+      ["-e", ${JSON.stringify(descendant)}],
+      { stdio: "ignore" }
+    );
+    setInterval(() => {}, 1000);
+  `;
+  try {
+    await assert.rejects(
+      runLoggedProcess({
+        command: process.execPath,
+        commandArgs: ["-e", parent],
+        stage: "study-trial",
+        timeoutMs: 500,
+      }),
+      /timed out after 500ms/,
+    );
+    await new Promise((resolveWait) => setTimeout(resolveWait, 700));
+    assert.equal(existsSync(marker), false, "timed-out descendant survived its process group");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("logged processes can clean up descendants after a successful direct child", async () => {
+  if (process.platform === "win32") return;
+  const root = await mkdtemp(join(tmpdir(), "tt-local-process-exit-test-"));
+  const marker = join(root, "descendant-survived");
+  const descendant = `
+    const { writeFileSync } = require("node:fs");
+    setTimeout(() => {
+      writeFileSync(${JSON.stringify(marker)}, "survived");
+      process.exit(0);
+    }, 500);
+  `;
+  const parent = `
+    const child = require("node:child_process").spawn(
+      process.execPath,
+      ["-e", ${JSON.stringify(descendant)}],
+      { stdio: "ignore" }
+    );
+    child.unref();
+  `;
+  try {
+    const result = await runLoggedProcess({
+      command: process.execPath,
+      commandArgs: ["-e", parent],
+      stage: "study-trial",
+      terminateProcessGroupOnExit: true,
+    });
+    assert.equal(result.exitCode, 0);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 600));
+    assert.equal(existsSync(marker), false, "successful child left a descendant running");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("JSON command inference terminates its process group when cancelled", async () => {
