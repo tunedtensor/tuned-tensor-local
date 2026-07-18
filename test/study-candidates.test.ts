@@ -19,10 +19,10 @@ import { fileURLToPath } from "node:url";
 import {
   defaultStudyCandidateDirectory,
   promoteStudyTrialCandidate,
-  runStudyTrial,
   studyCandidateLockSchema,
   verifyStudyCandidateArtifacts,
-} from "../src/study-trials.js";
+} from "../src/study-candidates.js";
+import { runStudyTrial } from "../src/study-trials.js";
 import { writeStudyBenchmarkLock } from "../src/studies.js";
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));

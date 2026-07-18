@@ -39,6 +39,8 @@ All notable changes to TT Local will be documented in this file.
   command or batch evaluators. Batch evaluators must echo each opaque input
   `id` with string `actual` and non-negative integer `latency_ms`. TT Local
   validates predictions and joins them to trusted references before scoring.
+- Split shared Study trial contracts, trial execution, and candidate promotion
+  into focused acyclic modules without changing the public package API.
 
 ### Fixed
 
