@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare deterministic, purged TT Local Study splits from collector CSV."""
+"""Prepare deterministic, purged TT Local Study splits from a source CSV."""
 
 from __future__ import annotations
 

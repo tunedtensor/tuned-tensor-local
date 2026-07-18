@@ -8,49 +8,30 @@ a one-shot held-out test.
 
 It is a reproducibility example, not a trading recommendation.
 
-## 1. Collect and label public data
+## 1. Prepare a labeled source CSV
 
-Clone the
-[Hedge Layer data collector](https://github.com/hedge-layer/data-collector),
-install it with `uv sync`, and collect at least 25 hours of snapshots so a
-one-hour future label is available across multiple time splits:
+Start with timestamped market snapshots from a source you are authorized to
+use. The file should span at least 25 hours so a one-hour future label is
+available across multiple time splits.
 
-```bash
-uv run hl-data-collector collect \
-  --limit 100 \
-  --workers 12 \
-  --require-two-sided \
-  --min-mid 0.02 \
-  --max-mid 0.98 \
-  --no-price-history \
-  --no-last-trade \
-  --quality-every 1440 \
-  --interval-sec 60 \
-  --db data/snapshots.sqlite
-```
+Save the file as `data/labeled.csv`. It must contain:
 
-Stop the collector after enough history exists, then create the future-move
-label and export CSV:
+- A unique `id` for every row.
+- `observed_at` and `future_observed_at` RFC 3339 UTC timestamps.
+- `has_two_sided_book` and `mid` fields for quality filtering.
+- The six numeric model inputs listed in `polymarket.study.json`.
+- A `big_move` label containing `0` or `1`.
 
-```bash
-uv run hl-data-collector label \
-  --db data/snapshots.sqlite \
-  --horizon-min 60 \
-  --threshold-bps 500
-
-uv run hl-data-collector export \
-  --db data/snapshots.sqlite \
-  --out data/labeled.csv
-```
-
-`threshold-bps 500` means a 5% absolute midpoint move. The feature projection
-in this example uses only values observable at prediction time.
+Here, `big_move=1` means the outcome midpoint moved by at least 500 basis
+points—an absolute 5 percentage-point move—during the following hour. Compute
+that label from later observations, and keep all model input fields restricted
+to values available at `observed_at`.
 
 ## 2. Prepare purged time splits
 
 Copy or link `labeled.csv` into this example's `data/` directory. The dates
 below reproduce the July 3–4, 2026 Spark run; choose boundaries inside your own
-collection window. Both gaps exceed the one-hour label horizon plus the
+source time range. Both gaps exceed the one-hour label horizon plus the
 five-minute embargo:
 
 ```bash
