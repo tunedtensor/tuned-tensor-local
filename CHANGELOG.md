@@ -23,6 +23,9 @@ All notable changes to TT Local will be documented in this file.
 - Added deterministic Study trial provenance for declared runner source,
   dependency locks, immutable implementation snapshots, and independently
   inventoried model artifacts.
+- Added optional temporal Study certification for strict UTC event and label
+  windows, declared horizon-and-embargo purge boundaries, deterministic lock
+  evidence, and trial-report provenance.
 
 ### Changed
 

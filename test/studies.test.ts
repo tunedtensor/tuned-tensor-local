@@ -71,6 +71,49 @@ async function withTemporaryStudy(
   }
 }
 
+async function configureTemporalStudy(args: {
+  studyPath: string;
+  splitPath: (split: "training" | "validation" | "test") => string;
+  labelHorizonSeconds?: number;
+  embargoSeconds?: number;
+}): Promise<void> {
+  const header = "id,spread_bps,note,big_move,observed_at,future_observed_at";
+  await writeFile(args.splitPath("training"), [
+    header,
+    "train-1,1.2,quiet,0,2026-07-03T00:10:00.123456Z,2026-07-03T01:10:00.123456Z",
+    "train-2,8.4,move,1,2026-07-03T00:00:00Z,2026-07-03T00:30:00Z",
+  ].join("\n") + "\n", "utf8");
+  await writeFile(args.splitPath("validation"), [
+    header,
+    "validation-1,1.4,quiet,0,2026-07-03T02:00:00Z,2026-07-03T02:30:00Z",
+    "validation-2,7.9,move,1,2026-07-03T02:10:00.123456Z,2026-07-03T02:40:00.123456Z",
+  ].join("\n") + "\n", "utf8");
+  await writeFile(args.splitPath("test"), [
+    header,
+    "test-1,1.1,quiet,0,2026-07-03T04:00:00Z,2026-07-03T04:30:00Z",
+    "test-2,8.1,move,1,2026-07-03T04:10:00.123456Z,2026-07-03T04:40:00.123456Z",
+  ].join("\n") + "\n", "utf8");
+  const raw = JSON.parse(await readFile(args.studyPath, "utf8")) as {
+    dataset: {
+      temporal?: {
+        policy: string;
+        event_time_column: string;
+        label_end_time_column: string;
+        label_horizon_seconds: number;
+        embargo_seconds: number;
+      };
+    };
+  };
+  raw.dataset.temporal = {
+    policy: "ordered_purged",
+    event_time_column: "observed_at",
+    label_end_time_column: "future_observed_at",
+    label_horizon_seconds: args.labelHorizonSeconds ?? 3_600,
+    embargo_seconds: args.embargoSeconds ?? 300,
+  };
+  await writeFile(args.studyPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+}
+
 test("builds a deterministic benchmark lock from relative CSV splits", async () => {
   await withTemporaryStudy(async ({ root, studyPath }) => {
     const first = await buildStudyBenchmarkLock(studyPath);
@@ -85,7 +128,239 @@ test("builds a deterministic benchmark lock from relative CSV splits", async () 
     assert.equal(first.dataset.splits.training.path, "data/training.csv");
     assert.equal(JSON.stringify(first).includes(root), false);
     assert.equal(JSON.stringify(first).includes("class_count"), false);
+    assert.equal("temporal" in first.dataset, false);
     assert.equal(defaultStudyLockPath(studyPath), join(root, "portfolio.study.lock.json"));
+  });
+});
+
+test("certifies declared label horizons and purged temporal split boundaries", async () => {
+  await withTemporaryStudy(async ({ root, studyPath, splitPath }) => {
+    await configureTemporalStudy({ studyPath, splitPath });
+    const first = await buildStudyBenchmarkLock(studyPath);
+    const second = await buildStudyBenchmarkLock(studyPath);
+
+    assert.deepEqual(first, second);
+    assert.deepEqual(first.dataset.temporal, {
+      policy: "ordered_purged",
+      event_time_column: "observed_at",
+      label_end_time_column: "future_observed_at",
+      label_horizon_seconds: 3_600,
+      embargo_seconds: 300,
+      splits: {
+        training: {
+          event_time: {
+            min: "2026-07-03T00:00:00Z",
+            max: "2026-07-03T00:10:00.123456Z",
+          },
+          label_end_time: {
+            min: "2026-07-03T00:30:00Z",
+            max: "2026-07-03T01:10:00.123456Z",
+          },
+        },
+        validation: {
+          event_time: {
+            min: "2026-07-03T02:00:00Z",
+            max: "2026-07-03T02:10:00.123456Z",
+          },
+          label_end_time: {
+            min: "2026-07-03T02:30:00Z",
+            max: "2026-07-03T02:40:00.123456Z",
+          },
+        },
+        test: {
+          event_time: {
+            min: "2026-07-03T04:00:00Z",
+            max: "2026-07-03T04:10:00.123456Z",
+          },
+          label_end_time: {
+            min: "2026-07-03T04:30:00Z",
+            max: "2026-07-03T04:40:00.123456Z",
+          },
+        },
+      },
+    });
+    assert.equal(JSON.stringify(first).includes(root), false);
+  });
+});
+
+test("rejects malformed temporal evidence and label windows outside the declaration", async () => {
+  await withTemporaryStudy(async ({ studyPath, splitPath }) => {
+    await configureTemporalStudy({ studyPath, splitPath });
+    const training = await readFile(splitPath("training"), "utf8");
+
+    for (const invalid of [
+      "2026-07-03T00:00:00+00:00",
+      "2026-07-03T00:00:00",
+      "2026-07-03T00:00:00.1234567890Z",
+      " 2026-07-03T00:00:00Z",
+    ]) {
+      await writeFile(
+        splitPath("training"),
+        training.replace("2026-07-03T00:00:00Z", invalid),
+        "utf8",
+      );
+      await assert.rejects(
+        buildStudyBenchmarkLock(studyPath),
+        /RFC 3339 UTC timestamp ending in Z/i,
+      );
+    }
+
+    for (const invalid of [
+      "2026-02-30T00:00:00Z",
+      "2026-07-03T24:00:00Z",
+      "2026-07-03T00:00:60Z",
+    ]) {
+      await writeFile(
+        splitPath("training"),
+        training.replace("2026-07-03T00:00:00Z", invalid),
+        "utf8",
+      );
+      await assert.rejects(
+        buildStudyBenchmarkLock(studyPath),
+        /not a valid UTC calendar timestamp/i,
+      );
+    }
+
+    await writeFile(
+      splitPath("training"),
+      training.replace(
+        "2026-07-03T00:30:00Z",
+        "2026-07-03T00:00:00Z",
+      ),
+      "utf8",
+    );
+    await assert.rejects(
+      buildStudyBenchmarkLock(studyPath),
+      /label end time.*must be after event time/i,
+    );
+
+    await writeFile(
+      splitPath("training"),
+      training.replace(
+        "2026-07-03T01:10:00.123456Z",
+        "2026-07-03T01:10:00.123457Z",
+      ),
+      "utf8",
+    );
+    await assert.rejects(
+      buildStudyBenchmarkLock(studyPath),
+      /exceeds the declared 3600-second label horizon/i,
+    );
+
+    await writeFile(
+      splitPath("training"),
+      training.replace(",future_observed_at", ",future_time"),
+      "utf8",
+    );
+    await assert.rejects(
+      buildStudyBenchmarkLock(studyPath),
+      /training dataset is missing required column "future_observed_at"/i,
+    );
+  });
+});
+
+test("rejects invalid or inverted temporal ranges in a benchmark lock", async () => {
+  await withTemporaryStudy(async ({ studyPath, splitPath }) => {
+    await configureTemporalStudy({ studyPath, splitPath });
+    const invalidCalendar = await buildStudyBenchmarkLock(studyPath);
+    invalidCalendar.dataset.temporal!.splits.training.event_time.min = (
+      "2026-02-30T00:00:00Z"
+    );
+    assert.equal(studyBenchmarkLockSchema.safeParse(invalidCalendar).success, false);
+
+    const inverted = await buildStudyBenchmarkLock(studyPath);
+    inverted.dataset.temporal!.splits.training.event_time.min = (
+      "2026-07-03T00:11:00Z"
+    );
+    assert.equal(studyBenchmarkLockSchema.safeParse(inverted).success, false);
+  });
+});
+
+test("requires both temporal boundaries to exceed the declared horizon and embargo", async () => {
+  await withTemporaryStudy(async ({ studyPath, splitPath }) => {
+    await configureTemporalStudy({ studyPath, splitPath });
+    const validation = await readFile(splitPath("validation"), "utf8");
+    const exactValidationBoundary = validation.replace(
+      "2026-07-03T02:00:00Z,2026-07-03T02:30:00Z",
+      "2026-07-03T01:15:00.123456Z,2026-07-03T01:45:00.123456Z",
+    );
+    await writeFile(splitPath("validation"), exactValidationBoundary, "utf8");
+    await assert.rejects(
+      buildStudyBenchmarkLock(studyPath),
+      /training-to-validation temporal boundary.*more than 300 seconds/is,
+    );
+
+    await writeFile(
+      splitPath("validation"),
+      exactValidationBoundary.replace(
+        "2026-07-03T01:15:00.123456Z",
+        "2026-07-03T01:15:00.123457Z",
+      ),
+      "utf8",
+    );
+    await buildStudyBenchmarkLock(studyPath);
+
+    await configureTemporalStudy({ studyPath, splitPath });
+    const testData = await readFile(splitPath("test"), "utf8");
+    await writeFile(
+      splitPath("test"),
+      testData.replace(
+        "2026-07-03T04:00:00Z,2026-07-03T04:30:00Z",
+        "2026-07-03T03:15:00.123456Z,2026-07-03T03:45:00.123456Z",
+      ),
+      "utf8",
+    );
+    await assert.rejects(
+      buildStudyBenchmarkLock(studyPath),
+      /validation-to-test temporal boundary.*more than 300 seconds/is,
+    );
+  });
+});
+
+test("keeps future temporal label metadata out of model inputs", async () => {
+  await withTemporaryStudy(async ({ studyPath, splitPath }) => {
+    await configureTemporalStudy({ studyPath, splitPath });
+    const raw = JSON.parse(await readFile(studyPath, "utf8")) as {
+      task: { input_columns: string[] };
+      dataset: {
+        temporal: {
+          event_time_column: string;
+          label_end_time_column: string;
+          label_horizon_seconds: number;
+          embargo_seconds: number;
+        };
+      };
+    };
+    raw.task.input_columns.push("future_observed_at");
+    await writeFile(studyPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+    await assert.rejects(
+      buildStudyBenchmarkLock(studyPath),
+      /future label end time must not be a model input/i,
+    );
+
+    raw.task.input_columns = ["spread_bps", "note"];
+    raw.dataset.temporal.label_end_time_column = "observed_at";
+    await writeFile(studyPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+    await assert.rejects(
+      buildStudyBenchmarkLock(studyPath),
+      /label end time column must differ from event time column/i,
+    );
+
+    raw.dataset.temporal.label_end_time_column = "future_observed_at";
+    raw.dataset.temporal.label_horizon_seconds = 0;
+    await writeFile(studyPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+    await assert.rejects(
+      buildStudyBenchmarkLock(studyPath),
+      /label_horizon_seconds.*>=1/i,
+    );
+
+    raw.dataset.temporal.label_horizon_seconds = 3_600;
+    raw.dataset.temporal.event_time_column = "id";
+    await writeFile(studyPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+    await assert.rejects(
+      buildStudyBenchmarkLock(studyPath),
+      /event time column must differ from ID and target columns/i,
+    );
   });
 });
 
@@ -259,6 +534,56 @@ test("detects semantic StudySpec drift against an existing lock", async () => {
     await assert.rejects(
       validateStudyBenchmark({ studyPath }),
       /study_spec_sha256.*expected.*found/is,
+    );
+  });
+});
+
+test("detects declared temporal-policy and observed-range drift", async () => {
+  await withTemporaryStudy(async ({ studyPath, splitPath }) => {
+    await configureTemporalStudy({ studyPath, splitPath });
+    await writeStudyBenchmarkLock({ studyPath });
+
+    const raw = JSON.parse(await readFile(studyPath, "utf8")) as {
+      dataset: { temporal: { embargo_seconds: number } };
+    };
+    raw.dataset.temporal.embargo_seconds = 301;
+    await writeFile(studyPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+    await assert.rejects(
+      validateStudyBenchmark({ studyPath }),
+      /dataset\.temporal\.embargo_seconds.*expected.*found/is,
+    );
+
+    raw.dataset.temporal.embargo_seconds = 300;
+    await writeFile(studyPath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+    const training = await readFile(splitPath("training"), "utf8");
+    await writeFile(
+      splitPath("training"),
+      training
+        .replace("2026-07-03T00:10:00.123456Z", "2026-07-03T00:10:00.123455Z")
+        .replace("2026-07-03T01:10:00.123456Z", "2026-07-03T01:10:00.123455Z"),
+      "utf8",
+    );
+    await assert.rejects(
+      validateStudyBenchmark({ studyPath }),
+      /dataset\.temporal\.splits\.training\.event_time\.max.*expected.*found/is,
+    );
+  });
+});
+
+test("rejects a schema-valid forged temporal benchmark lock", async () => {
+  await withTemporaryStudy(async ({ studyPath, splitPath, lockPath }) => {
+    await configureTemporalStudy({ studyPath, splitPath });
+    await writeStudyBenchmarkLock({ studyPath });
+    const forged = JSON.parse(await readFile(lockPath, "utf8")) as {
+      dataset: { temporal: { label_horizon_seconds: number } };
+    };
+    forged.dataset.temporal.label_horizon_seconds = 3_599;
+    assert.equal(studyBenchmarkLockSchema.safeParse(forged).success, true);
+    await writeFile(lockPath, `${JSON.stringify(forged, null, 2)}\n`, "utf8");
+
+    await assert.rejects(
+      validateStudyBenchmark({ studyPath }),
+      /dataset\.temporal\.label_horizon_seconds.*expected.*found/is,
     );
   });
 });

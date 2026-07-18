@@ -21,6 +21,36 @@ const relativeDatasetPathSchema = exactStringSchema.refine(
   { message: "must be a portable relative local path" },
 );
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
+const UTC_TIMESTAMP_PATTERN = (
+  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z$/
+);
+
+function utcTimestampNanoseconds(value: string): bigint | undefined {
+  const match = UTC_TIMESTAMP_PATTERN.exec(value);
+  if (!match) return undefined;
+  const milliseconds = Date.parse(`${match[1]}Z`);
+  const normalized = Number.isFinite(milliseconds)
+    ? new Date(milliseconds).toISOString()
+    : "";
+  if (normalized !== `${match[1]}.000Z`) return undefined;
+  const fraction = (match[2] ?? "").padEnd(9, "0");
+  return BigInt(milliseconds) * 1_000_000n + BigInt(fraction || "0");
+}
+
+const utcTimestampSchema = exactStringSchema.regex(
+  UTC_TIMESTAMP_PATTERN,
+  "must be an RFC 3339 UTC timestamp ending in Z",
+).refine(
+  (value) => utcTimestampNanoseconds(value) !== undefined,
+  "must be a valid UTC calendar timestamp",
+);
+const studyTemporalPolicySchema = z.object({
+  policy: z.literal("ordered_purged"),
+  event_time_column: columnNameSchema,
+  label_end_time_column: columnNameSchema,
+  label_horizon_seconds: z.number().int().min(1).max(2 ** 32 - 1),
+  embargo_seconds: z.number().int().min(0).max(2 ** 32 - 1),
+}).strict();
 
 export const binaryClassificationStudyTaskSchema = z.object({
   type: z.literal("binary_classification"),
@@ -80,14 +110,80 @@ export const studySpecSchema = z.object({
       validation: relativeDatasetPathSchema,
       test: relativeDatasetPathSchema,
     }).strict(),
+    temporal: studyTemporalPolicySchema.optional(),
   }).strict(),
-}).strict();
+}).strict().superRefine((study, context) => {
+  const temporal = study.dataset.temporal;
+  if (!temporal) return;
+  if (
+    temporal.event_time_column === study.task.id_column
+    || temporal.event_time_column === study.task.target_column
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["dataset", "temporal", "event_time_column"],
+      message: "event time column must differ from ID and target columns",
+    });
+  }
+  if (temporal.event_time_column === temporal.label_end_time_column) {
+    context.addIssue({
+      code: "custom",
+      path: ["dataset", "temporal", "label_end_time_column"],
+      message: "label end time column must differ from event time column",
+    });
+  }
+  if (
+    temporal.label_end_time_column === study.task.id_column
+    || temporal.label_end_time_column === study.task.target_column
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["dataset", "temporal", "label_end_time_column"],
+      message: "label end time column must differ from ID and target columns",
+    });
+  }
+  if (study.task.input_columns.includes(temporal.label_end_time_column)) {
+    context.addIssue({
+      code: "custom",
+      path: ["dataset", "temporal", "label_end_time_column"],
+      message: "future label end time must not be a model input",
+    });
+  }
+});
 
 const studySplitSummarySchema = z.object({
   path: exactStringSchema,
   sha256: sha256Schema,
   size_bytes: z.number().int().nonnegative(),
   row_count: z.number().int().positive(),
+}).strict();
+
+const temporalRangeSchema = z.object({
+  min: utcTimestampSchema,
+  max: utcTimestampSchema,
+}).strict().superRefine((range, context) => {
+  const min = utcTimestampNanoseconds(range.min);
+  const max = utcTimestampNanoseconds(range.max);
+  if (min !== undefined && max !== undefined && max < min) {
+    context.addIssue({
+      code: "custom",
+      path: ["max"],
+      message: "must be at or after min",
+    });
+  }
+});
+
+const temporalSplitSummarySchema = z.object({
+  event_time: temporalRangeSchema,
+  label_end_time: temporalRangeSchema,
+}).strict();
+
+const studyTemporalCertificationSchema = studyTemporalPolicySchema.extend({
+  splits: z.object({
+    training: temporalSplitSummarySchema,
+    validation: temporalSplitSummarySchema,
+    test: temporalSplitSummarySchema,
+  }).strict(),
 }).strict();
 
 export const studyBenchmarkLockSchema = z.object({
@@ -105,6 +201,7 @@ export const studyBenchmarkLockSchema = z.object({
       validation: studySplitSummarySchema,
       test: studySplitSummarySchema,
     }).strict(),
+    temporal: studyTemporalCertificationSchema.optional(),
     total_row_count: z.number().int().positive(),
   }).strict(),
 }).strict();
@@ -120,6 +217,21 @@ interface InspectedSplit {
   columns: string[];
   ids: Set<string>;
   summary: StudyBenchmarkLock["dataset"]["splits"][StudySplitName];
+  temporal?: InspectedTemporalSplit;
+}
+
+interface ParsedUtcTimestamp {
+  nanoseconds: bigint;
+  value: string;
+}
+
+interface InspectedTemporalSplit {
+  summary: {
+    event_time: { min: string; max: string };
+    label_end_time: { min: string; max: string };
+  };
+  eventTime: { min: ParsedUtcTimestamp; max: ParsedUtcTimestamp };
+  labelEndTime: { min: ParsedUtcTimestamp; max: ParsedUtcTimestamp };
 }
 
 function schemaError(error: z.ZodError): string {
@@ -130,6 +242,21 @@ function schemaError(error: z.ZodError): string {
 
 function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function parseUtcTimestamp(
+  value: string,
+  description: string,
+): ParsedUtcTimestamp {
+  const match = UTC_TIMESTAMP_PATTERN.exec(value);
+  if (!match) {
+    throw new Error(`${description} must be an RFC 3339 UTC timestamp ending in Z`);
+  }
+  const nanoseconds = utcTimestampNanoseconds(value);
+  if (nanoseconds === undefined) {
+    throw new Error(`${description} is not a valid UTC calendar timestamp`);
+  }
+  return { value, nanoseconds };
 }
 
 function decodeUtf8(bytes: Uint8Array, split: StudySplitName): string {
@@ -176,9 +303,14 @@ function assertRequiredColumns(
   columns: string[],
   task: BinaryClassificationStudyTask,
   split: StudySplitName,
+  temporal?: z.infer<typeof studyTemporalPolicySchema>,
 ): void {
   const available = new Set(columns);
-  for (const column of [task.id_column, ...task.input_columns, task.target_column]) {
+  const required = [task.id_column, ...task.input_columns, task.target_column];
+  if (temporal) {
+    required.push(temporal.event_time_column, temporal.label_end_time_column);
+  }
+  for (const column of required) {
     if (!available.has(column)) {
       throw new Error(`${split} dataset is missing required column "${column}"`);
     }
@@ -190,6 +322,7 @@ async function inspectSplit(args: {
   source: string;
   studyDirectory: string;
   task: BinaryClassificationStudyTask;
+  temporal?: z.infer<typeof studyTemporalPolicySchema>;
 }): Promise<InspectedSplit> {
   const resolvedPath = resolve(args.studyDirectory, args.source);
   await assertRegularFile(resolvedPath, `${args.split} dataset`);
@@ -210,12 +343,22 @@ async function inspectSplit(args: {
     throw new Error(`${args.split} dataset must contain at least one data row`);
   }
   const columns = normalizedHeaders(parsed.fields, args.split);
-  assertRequiredColumns(columns, args.task, args.split);
+  assertRequiredColumns(columns, args.task, args.split, args.temporal);
   const idIndex = columns.indexOf(args.task.id_column);
   const targetIndex = columns.indexOf(args.task.target_column);
+  const eventTimeIndex = args.temporal
+    ? columns.indexOf(args.temporal.event_time_column)
+    : -1;
+  const labelEndTimeIndex = args.temporal
+    ? columns.indexOf(args.temporal.label_end_time_column)
+    : -1;
   const ids = new Set<string>();
   let sawNegativeLabel = false;
   let sawPositiveLabel = false;
+  let eventTimeMin: ParsedUtcTimestamp | undefined;
+  let eventTimeMax: ParsedUtcTimestamp | undefined;
+  let labelEndTimeMin: ParsedUtcTimestamp | undefined;
+  let labelEndTimeMax: ParsedUtcTimestamp | undefined;
 
   for (const [index, record] of parsed.records.entries()) {
     const recordNumber = index + 1;
@@ -242,6 +385,48 @@ async function inspectSplit(args: {
     }
     sawNegativeLabel ||= label === args.task.labels.negative;
     sawPositiveLabel ||= label === args.task.labels.positive;
+
+    if (args.temporal) {
+      const eventTime = parseUtcTimestamp(
+        record[eventTimeIndex]!,
+        `${args.split} dataset record ${recordNumber} `
+        + `"${args.temporal.event_time_column}"`,
+      );
+      const labelEndTime = parseUtcTimestamp(
+        record[labelEndTimeIndex]!,
+        `${args.split} dataset record ${recordNumber} `
+        + `"${args.temporal.label_end_time_column}"`,
+      );
+      if (labelEndTime.nanoseconds <= eventTime.nanoseconds) {
+        throw new Error(
+          `${args.split} dataset record ${recordNumber} label end time `
+          + `${labelEndTime.value} must be after event time ${eventTime.value}`,
+        );
+      }
+      const declaredHorizonEnd = (
+        eventTime.nanoseconds
+        + BigInt(args.temporal.label_horizon_seconds) * 1_000_000_000n
+      );
+      if (labelEndTime.nanoseconds > declaredHorizonEnd) {
+        throw new Error(
+          `${args.split} dataset record ${recordNumber} label end time `
+          + `${labelEndTime.value} exceeds the declared `
+          + `${args.temporal.label_horizon_seconds}-second label horizon`,
+        );
+      }
+      if (!eventTimeMin || eventTime.nanoseconds < eventTimeMin.nanoseconds) {
+        eventTimeMin = eventTime;
+      }
+      if (!eventTimeMax || eventTime.nanoseconds > eventTimeMax.nanoseconds) {
+        eventTimeMax = eventTime;
+      }
+      if (!labelEndTimeMin || labelEndTime.nanoseconds < labelEndTimeMin.nanoseconds) {
+        labelEndTimeMin = labelEndTime;
+      }
+      if (!labelEndTimeMax || labelEndTime.nanoseconds > labelEndTimeMax.nanoseconds) {
+        labelEndTimeMax = labelEndTime;
+      }
+    }
   }
   if (!sawNegativeLabel || !sawPositiveLabel) {
     throw new Error(
@@ -259,6 +444,22 @@ async function inspectSplit(args: {
       size_bytes: bytes.byteLength,
       row_count: parsed.records.length,
     },
+    ...(args.temporal ? {
+      temporal: {
+        summary: {
+          event_time: {
+            min: eventTimeMin!.value,
+            max: eventTimeMax!.value,
+          },
+          label_end_time: {
+            min: labelEndTimeMin!.value,
+            max: labelEndTimeMax!.value,
+          },
+        },
+        eventTime: { min: eventTimeMin!, max: eventTimeMax! },
+        labelEndTime: { min: labelEndTimeMin!, max: labelEndTimeMax! },
+      },
+    } : {}),
   };
 }
 
@@ -295,6 +496,7 @@ async function buildStudyBenchmarkLockFromLoaded(
       source: loaded.spec.dataset.splits[split],
       studyDirectory,
       task: loaded.spec.task,
+      temporal: loaded.spec.dataset.temporal,
     });
     if (expectedColumns && !isDeepStrictEqual(current.columns, expectedColumns)) {
       throw new Error(
@@ -313,6 +515,36 @@ async function buildStudyBenchmarkLockFromLoaded(
     inspected[split] = current;
   }
 
+  const temporal = loaded.spec.dataset.temporal;
+  if (temporal) {
+    const horizon = BigInt(temporal.label_horizon_seconds) * 1_000_000_000n;
+    const embargo = BigInt(temporal.embargo_seconds) * 1_000_000_000n;
+    for (const [previousName, nextName] of [
+      ["training", "validation"],
+      ["validation", "test"],
+    ] as const) {
+      const previous = inspected[previousName].temporal!;
+      const next = inspected[nextName].temporal!;
+      // Purge against the full declared horizon: observed label evidence may
+      // end early when a source dataset has only partial future coverage.
+      const declaredHorizonEnd = previous.eventTime.max.nanoseconds + horizon;
+      const foundEmbargo = (
+        next.eventTime.min.nanoseconds
+        - declaredHorizonEnd
+      );
+      if (foundEmbargo <= embargo) {
+        throw new Error(
+          `${previousName}-to-${nextName} temporal boundary is not ordered and purged: `
+          + `${previousName} has an event at ${previous.eventTime.max.value} with a `
+          + `${temporal.label_horizon_seconds}-second label horizon, while `
+          + `${nextName} starts at ${next.eventTime.min.value}; the next split must `
+          + `start more than ${temporal.embargo_seconds} seconds after the declared `
+          + "label horizon ends",
+        );
+      }
+    }
+  }
+
   return studyBenchmarkLockSchema.parse({
     schema_version: 1,
     study_spec_sha256: sha256(JSON.stringify(loaded.spec)),
@@ -328,6 +560,16 @@ async function buildStudyBenchmarkLockFromLoaded(
         validation: inspected.validation.summary,
         test: inspected.test.summary,
       },
+      ...(temporal ? {
+        temporal: {
+          ...temporal,
+          splits: {
+            training: inspected.training.temporal!.summary,
+            validation: inspected.validation.temporal!.summary,
+            test: inspected.test.temporal!.summary,
+          },
+        },
+      } : {}),
       total_row_count: STUDY_SPLITS.reduce(
         (total, split) => total + inspected[split].summary.row_count,
         0,
