@@ -34,6 +34,10 @@ import {
   runRequestFromLocalSpec,
 } from "./local-project.js";
 import { sanitizeLogLine, type LocalRunProgressEvent, type LocalRunReporter } from "./run-reporter.js";
+import {
+  validateStudyBenchmark,
+  writeStudyBenchmarkLock,
+} from "./studies.js";
 
 export * from "./compare.js";
 export * from "./contracts.js";
@@ -48,6 +52,7 @@ export * from "./prefetch.js";
 export * from "./run-reporter.js";
 export * from "./server.js";
 export * from "./store.js";
+export * from "./studies.js";
 
 export interface LocalRunnerInfo {
   name: "tuned-tensor-local";
@@ -149,6 +154,7 @@ Commands:
   runs list|get|events|watch|report|compare|cancel|reconcile [args] [--config local-runner.json]
   models list|get|verify|prefetch|verify-base|serve [args] [--config local-runner.json]
   specs list|get|import [args] [--config local-runner.json]
+  studies lock|validate <study.json> [args]
   store rebuild-index [--config local-runner.json]
 
 Global options:
@@ -356,6 +362,32 @@ const COMMAND_GROUPS: Record<string, CliCommandGroup> = {
         minPositionals: 1,
         maxPositionals: 1,
         missingPositionalsMessage: "specs import requires <spec-or-request.json>",
+      },
+    },
+  },
+  studies: {
+    description: "Lock and validate local ML study benchmark inputs.",
+    subcommands: {
+      lock: {
+        usage: "tt-local studies lock <study.json> [options]",
+        description: "Validate predefined dataset splits and write a deterministic benchmark lock.",
+        options: [
+          { name: "--output", value: "path", description: "Benchmark lock output path" },
+          { name: "--force", description: "Replace an existing benchmark lock" },
+        ],
+        minPositionals: 1,
+        maxPositionals: 1,
+        missingPositionalsMessage: "studies lock requires <study.json>",
+      },
+      validate: {
+        usage: "tt-local studies validate <study.json> [options]",
+        description: "Read-only verification of current study inputs against an existing benchmark lock.",
+        options: [
+          { name: "--lock", value: "path", description: "Benchmark lock path" },
+        ],
+        minPositionals: 1,
+        maxPositionals: 1,
+        missingPositionalsMessage: "studies validate requires <study.json>",
       },
     },
   },
@@ -1194,6 +1226,40 @@ async function main(argv: string[]): Promise<void> {
       process.once("SIGTERM", stop);
     });
     return;
+  }
+
+  if (command === "studies") {
+    const subcommand = cli.subcommand!;
+    const studyPath = cli.positionals[0];
+    if (!studyPath) throw new Error(`studies ${subcommand} requires <study.json>`);
+    if (subcommand === "lock") {
+      const result = await writeStudyBenchmarkLock({
+        studyPath,
+        outputPath: readOption(argv, "--output"),
+        force: hasFlag(argv, "--force"),
+      });
+      return printJson({
+        ok: true,
+        status: "locked",
+        study_path: resolve(studyPath),
+        lock_path: result.lockPath,
+        benchmark_lock: result.lock,
+      });
+    }
+    if (subcommand === "validate") {
+      const result = await validateStudyBenchmark({
+        studyPath,
+        lockPath: readOption(argv, "--lock"),
+      });
+      return printJson({
+        ok: true,
+        status: "valid",
+        study_path: resolve(studyPath),
+        lock_path: result.lockPath,
+        benchmark_lock: result.lock,
+      });
+    }
+    throw new Error(`Unknown studies command: ${subcommand}`);
   }
 
   if (command === "runs") {
