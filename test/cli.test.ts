@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -97,6 +97,8 @@ test("command and nested-command help never execute work", async () => {
       { args: ["models", "serve", "--help"], usage: "tt-local models serve" },
       { args: ["runs", "report", "--help"], usage: "tt-local runs report" },
       { args: ["models", "--help"], usage: "tt-local models <command>" },
+      { args: ["studies", "validate", "--help"], usage: "tt-local studies validate" },
+      { args: ["studies", "--help"], usage: "tt-local studies <command>" },
     ];
 
     for (const { args, usage } of cases) {
@@ -106,6 +108,59 @@ test("command and nested-command help never execute work", async () => {
       assert.equal(result.stderr, "");
       assertNoWorkCreated(root);
     }
+  });
+});
+
+test("study benchmark lock and validation run end to end without opening the local store", async () => {
+  await withTemporaryProject(async (root) => {
+    const dataRoot = join(root, "data");
+    await mkdir(dataRoot, { recursive: true });
+    const header = "id,spread_bps,big_move\n";
+    await writeFile(join(dataRoot, "training.csv"), `${header}train-1,1.2,0\ntrain-2,8.4,1\n`, "utf8");
+    await writeFile(join(dataRoot, "validation.csv"), `${header}validation-1,1.4,0\nvalidation-2,7.9,1\n`, "utf8");
+    await writeFile(join(dataRoot, "test.csv"), `${header}test-1,1.1,0\ntest-2,8.1,1\n`, "utf8");
+    const studyPath = join(root, "portfolio.study.json");
+    await writeFile(studyPath, `${JSON.stringify({
+      schema_version: 1,
+      name: "Portfolio anomaly benchmark",
+      task: {
+        type: "binary_classification",
+        id_column: "id",
+        input_columns: ["spread_bps"],
+        target_column: "big_move",
+        labels: { negative: "0", positive: "1" },
+        primary_metric: "average_precision",
+      },
+      dataset: {
+        format: "csv",
+        splits: {
+          training: "data/training.csv",
+          validation: "data/validation.csv",
+          test: "data/test.csv",
+        },
+      },
+    }, null, 2)}\n`, "utf8");
+
+    const locked = runCli(["studies", "lock", studyPath], root);
+    assert.equal(locked.status, 0, locked.stderr);
+    const lockedOutput = JSON.parse(locked.stdout) as { ok: boolean; lock_path: string };
+    assert.equal(lockedOutput.ok, true);
+    const lockText = await readFile(lockedOutput.lock_path, "utf8");
+
+    const validated = runCli(["studies", "validate", studyPath], root);
+    assert.equal(validated.status, 0, validated.stderr);
+    assert.equal(JSON.parse(validated.stdout).ok, true);
+
+    await writeFile(
+      join(dataRoot, "validation.csv"),
+      `${header}validation-1,1.4,0\nvalidation-2,7.8,1\n`,
+      "utf8",
+    );
+    const drifted = runCli(["studies", "validate", studyPath], root);
+    assert.equal(drifted.status, 1);
+    assert.match(drifted.stderr, /dataset\.splits\.validation\.sha256.*expected.*found/is);
+    assert.equal(await readFile(lockedOutput.lock_path, "utf8"), lockText);
+    assertNoWorkCreated(root);
   });
 });
 

@@ -2,6 +2,17 @@
 
 All notable changes to TT Local will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- Added a separate versioned StudySpec for binary-classification benchmarks,
+  with explicit feature allowlists and predefined CSV training, validation,
+  and test splits.
+- Added `tt-local studies lock` and read-only `tt-local studies validate` to
+  record and verify deterministic dataset hashes, schemas, row counts, and
+  split ID integrity without opening the run store.
+
 ## 0.2.9 - 2026-07-14
 
 ### Changed

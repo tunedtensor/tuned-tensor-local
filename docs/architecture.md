@@ -11,6 +11,9 @@ packaged as a standalone CLI.
 - Local project spec: `tt-local init` creates a local `tunedtensor.json`, and
   `tt-local run` converts that spec into the same run request contract used by
   compatible hosted exports.
+- Study benchmark validator: keeps classic ML task/data contracts separate
+  from fine-tuning requests and writes deterministic integrity locks for
+  predefined training, validation, and test CSVs.
 - Artifact store: writes datasets, logs, model outputs, and reports beneath a
   configured local artifact root.
 - Local state store: keeps a SQLite metadata index for specs, runs, progress
@@ -70,6 +73,33 @@ configuration. The run request describes the training method, behavior spec,
 base model, examples, datasets, and hyperparameters. The local runner
 configuration describes artifact paths, store paths, uv or command entrypoint
 settings, model cache paths, OpenRouter judge settings, and timeout limits.
+
+## Study Benchmark Boundary
+
+`StudySpec` is a parallel, model-independent versioned contract rather than
+another variant of the fine-tuning run request. Its initial task is binary
+classification with explicit ID, input, target, label, and primary-metric
+fields. Algorithms, hyperparameters, trials, and search policy belong to later
+trial records, not the benchmark definition. V1 does not train, select, or
+score a model.
+
+`tt-local studies lock` validates three explicit CSV splits and writes an
+adjacent deterministic lock. The lock contains the canonical StudySpec hash
+and each split's exact byte hash, byte size, row count, and common ordered
+columns. It deliberately contains no timestamps, absolute paths, environment
+state, UUIDs, or class prevalence. `tt-local studies validate` only recomputes
+and compares this evidence; it never rewrites the lock.
+
+The validator rejects malformed CSV, ambiguous or incompatible headers,
+missing role columns, undeclared labels, duplicate IDs, and IDs reused across
+splits. Every split must contain both declared labels, but no balance policy is
+imposed. Input columns are always allowlisted explicitly. This is an integrity
+boundary, not proof that a benchmark is leakage-free: v1 does not audit
+chronology, lookahead horizons, purge/embargo gaps, correlated entity groups,
+near duplicates, feature causality, class balance, or command access to test
+files. Test data remains readable. Those need dedicated temporal-split and
+isolated-evaluation contracts before an autonomous research loop can claim a
+sealed test result.
 
 ## Evaluation Loop
 

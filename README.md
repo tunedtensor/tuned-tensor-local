@@ -34,6 +34,62 @@ The default uv project is included in the npm package at
 `training/local-runner`; using bundled training does not require cloning this
 repository.
 
+## ML Study Benchmarks
+
+TT Local has a separate, model-independent StudySpec foundation for classic ML
+work. The first slice validates predefined binary-classification CSV splits
+and records their exact inputs in a deterministic benchmark lock; it does not
+train, select, or score models yet.
+
+Define the task and explicitly allowlist model inputs:
+
+```json
+{
+  "schema_version": 1,
+  "name": "Portfolio anomaly benchmark",
+  "task": {
+    "type": "binary_classification",
+    "id_column": "id",
+    "input_columns": ["spread_bps", "liquidity", "imbalance_3c"],
+    "target_column": "big_move",
+    "labels": { "negative": "0", "positive": "1" },
+    "primary_metric": "average_precision"
+  },
+  "dataset": {
+    "format": "csv",
+    "splits": {
+      "training": "data/training.csv",
+      "validation": "data/validation.csv",
+      "test": "data/test.csv"
+    }
+  }
+}
+```
+
+Then create and verify the adjacent integrity lock:
+
+```bash
+tt-local studies lock portfolio.study.json
+tt-local studies validate portfolio.study.json
+```
+
+`studies lock` refuses to replace an existing lock unless `--force` is
+explicit. `studies validate` is read-only. It checks exact file hashes,
+ordered columns, row counts, the presence of both declared labels, duplicate
+IDs, and ID overlap between splits. Portable relative CSV paths resolve from
+the StudySpec.
+
+The explicit `input_columns` allowlist is important: label-derived or
+future-derived export columns must never become model inputs accidentally.
+This v1 lock records predefined files; it does not certify temporal ordering,
+purge/embargo windows, overlapping feature or label horizons, entity-group
+isolation, near-duplicate separation, class balance beyond requiring both
+labels, or feature causality. Test rows and labels remain readable: the lock
+detects changes but does not seal the test set or stop trial code from
+accessing it. Trading benchmarks must establish those split properties
+upstream and keep test data out of the trial loop until dedicated temporal and
+isolated-evaluation contracts are added.
+
 ## First Local Run
 
 On an NVIDIA Spark or another CUDA host, initialize both the behavior spec and
