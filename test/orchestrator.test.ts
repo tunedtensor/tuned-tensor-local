@@ -677,6 +677,9 @@ import { join } from "node:path";
 const inputPath = process.argv[process.argv.indexOf("--input") + 1];
 const outputPath = process.argv[process.argv.indexOf("--output") + 1];
 const payload = JSON.parse(readFileSync(inputPath, "utf8"));
+if (payload.examples.some((example) => Object.hasOwn(example, "output"))) {
+  throw new Error("inference examples must not contain expected outputs");
+}
 const modelPath = payload.adapter_path ? join(payload.adapter_path, "model.json") : null;
 const model = modelPath ? JSON.parse(readFileSync(modelPath, "utf8")) : { completions: {} };
 writeFileSync(outputPath, JSON.stringify({
@@ -686,8 +689,7 @@ writeFileSync(outputPath, JSON.stringify({
   adapter_path: payload.adapter_path,
   generation_config: payload.generation,
   results: payload.examples.map((example) => ({
-    prompt: example.input,
-    expected: example.output,
+    id: example.id,
     actual: model.completions[example.input] ?? "",
     latency_ms: 1,
   })),

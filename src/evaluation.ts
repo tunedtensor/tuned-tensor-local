@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -260,20 +260,21 @@ function fileUriToPath(value?: string): string | undefined {
   return value.startsWith("file://") ? value.slice("file://".length) : value;
 }
 
+export const INFERENCE_PROTOCOL_VERSION = 2;
+
 async function runInferenceCommand(args: {
   command: string[];
   prompt: string;
   system: string;
-  expected: string;
   timeoutMs: number;
   shouldCancel?: () => boolean | Promise<boolean>;
 }): Promise<string> {
   return runJsonStdInCommand({
     command: args.command,
     payload: {
+      protocol_version: INFERENCE_PROTOCOL_VERSION,
       system: args.system,
       prompt: args.prompt,
-      expected: args.expected,
     },
     timeoutMs: args.timeoutMs,
     timeoutMessage: `Inference command timed out after ${args.timeoutMs}ms`,
@@ -289,11 +290,87 @@ interface BatchInferenceResult {
   adapter_path?: string;
   generation_config?: Record<string, unknown>;
   results: Array<{
-    prompt: string;
-    expected: string;
+    id: string;
     actual: string;
     latency_ms: number;
   }>;
+}
+
+function inferenceExample(example: BehaviorSpecExample, index: number): Record<string, unknown> {
+  return {
+    id: String(index),
+    input: example.input,
+    ...(example.input_assets ? { input_assets: example.input_assets } : {}),
+    ...(example.modality ? { modality: example.modality } : {}),
+  };
+}
+
+function parseBatchInferenceResult(
+  value: unknown,
+  provider: BatchInferenceResult["provider"],
+  expectedIds: string[],
+): BatchInferenceResult {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${provider} inference output must be a JSON object`);
+  }
+  const output = value as Record<string, unknown>;
+  if (!Array.isArray(output.results)) {
+    throw new Error(`${provider} inference output must include a results array`);
+  }
+  if (output.results.length !== expectedIds.length) {
+    const noun = output.results.length === 1 ? "prediction" : "predictions";
+    throw new Error(
+      `${provider} inference returned ${output.results.length} ${noun}; expected ${expectedIds.length}`,
+    );
+  }
+  const expectedIdSet = new Set(expectedIds);
+  const predictionsById = new Map<string, BatchInferenceResult["results"][number]>();
+  output.results.forEach((entry, index) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`${provider} inference prediction ${index} must be a JSON object`);
+    }
+    const prediction = entry as Record<string, unknown>;
+    if (typeof prediction.id !== "string" || !expectedIdSet.has(prediction.id)) {
+      throw new Error(`${provider} inference prediction ${index} has unknown or missing id`);
+    }
+    if (predictionsById.has(prediction.id)) {
+      throw new Error(`${provider} inference returned duplicate prediction id ${prediction.id}`);
+    }
+    if (typeof prediction.actual !== "string") {
+      throw new Error(`${provider} inference prediction ${index} must include string actual`);
+    }
+    if (
+      typeof prediction.latency_ms !== "number"
+      || !Number.isFinite(prediction.latency_ms)
+      || !Number.isInteger(prediction.latency_ms)
+      || prediction.latency_ms < 0
+    ) {
+      throw new Error(`${provider} inference prediction ${index} must include non-negative latency_ms`);
+    }
+    const parsed = {
+      id: prediction.id,
+      actual: prediction.actual,
+      latency_ms: prediction.latency_ms,
+    };
+    predictionsById.set(parsed.id, parsed);
+  });
+  const optionalString = (key: string): string | undefined => (
+    typeof output[key] === "string" ? output[key] : undefined
+  );
+  const modelId = optionalString("model_id");
+  const baseModel = optionalString("base_model");
+  const adapterPath = optionalString("adapter_path");
+  const generationConfig = output.generation_config;
+  return {
+    provider,
+    ...(modelId ? { model_id: modelId } : {}),
+    ...(baseModel ? { base_model: baseModel } : {}),
+    ...(adapterPath ? { adapter_path: adapterPath } : {}),
+    ...(generationConfig && typeof generationConfig === "object" && !Array.isArray(generationConfig)
+      ? { generation_config: generationConfig as Record<string, unknown> }
+      : {}),
+    results: expectedIds.map((id) => predictionsById.get(id)!),
+  };
 }
 
 function buildBatchInferenceCommand(config: LocalRunnerConfig, inputPath: string, outputPath: string) {
@@ -335,6 +412,7 @@ async function runBatchInference(args: {
     modelLoader = undefined;
   }
   await writeFile(inputPath, `${JSON.stringify({
+    protocol_version: INFERENCE_PROTOCOL_VERSION,
     kind: args.kind,
     model_id: args.modelId,
     base_model: args.baseModelId,
@@ -342,7 +420,7 @@ async function runBatchInference(args: {
     model_loader: modelLoader,
     adapter_path: fileUriToPath(args.adapterPath),
     system: args.system,
-    examples: args.examples,
+    examples: args.examples.map(inferenceExample),
     model_cache: args.config.paths.modelCache ? resolve(args.config.paths.modelCache) : undefined,
     trust_remote_code: args.config.evaluation.inference.trustRemoteCode,
     device: args.config.evaluation.inference.device,
@@ -353,6 +431,7 @@ async function runBatchInference(args: {
       top_p: args.config.evaluation.inference.topP,
     },
   }, null, 2)}\n`, "utf8");
+  await rm(outputPath, { force: true });
 
   const entrypoint = buildBatchInferenceCommand(args.config, inputPath, outputPath);
   const command = entrypoint.displayCommand;
@@ -402,10 +481,13 @@ async function runBatchInference(args: {
     message: `Finished ${args.kind} ${label} inference.`,
     details: { output_path: outputPath, log_path: logPath },
   });
-  return {
-    ...JSON.parse(await readFile(outputPath, "utf8")) as Omit<BatchInferenceResult, "provider">,
-    provider,
-  };
+  let inferenceOutput: unknown;
+  try {
+    inferenceOutput = JSON.parse(await readFile(outputPath, "utf8"));
+  } catch (error) {
+    throw new Error(`${label} inference did not write valid JSON output: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return parseBatchInferenceResult(inferenceOutput, provider, args.examples.map((_, index) => String(index)));
 }
 
 /**
@@ -559,7 +641,8 @@ export function baselineCacheKey(args: {
 }): string {
   const judgeAvailability = evaluationJudgeAvailability(args.config);
   const payload = {
-    v: 3,
+    v: 4,
+    inference_protocol_version: INFERENCE_PROTOCOL_VERSION,
     package_version: args.packageVersion,
     model_id: args.modelId,
     base_model_revision: args.baseModelRevision ?? null,
@@ -956,7 +1039,6 @@ export async function evaluateExamples(args: {
           command,
           prompt: example.input,
           system: args.system,
-          expected: example.output,
           timeoutMs: args.config.evaluation.timeoutMs,
           shouldCancel: args.shouldCancel,
         })
