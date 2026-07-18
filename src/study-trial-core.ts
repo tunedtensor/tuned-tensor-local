@@ -178,8 +178,29 @@ export const studyTrialOutputSchema = z.object({
   predictions: z.array(studyTrialPredictionSchema),
 }).strict();
 
+export const bundledRuntimeVersionsSchema = z.object({
+  python: exactStringSchema,
+  platform: exactStringSchema,
+  numpy: exactStringSchema,
+  scikit_learn: exactStringSchema,
+  joblib: exactStringSchema,
+}).strict();
+
+export const bundledPredictionRuntimeEvidenceSchema = z.object({
+  schema_version: z.literal(1),
+  protocol_version: z.literal(STUDY_TRIAL_PROTOCOL_VERSION),
+  runner: z.object({
+    name: z.literal("numeric_logistic_regression"),
+    version: z.literal(NUMERIC_LOGISTIC_REGRESSION_RUNNER_VERSION),
+  }).strict(),
+  runtime: bundledRuntimeVersionsSchema,
+}).strict();
+
 export type StudyTrialSpec = z.infer<typeof studyTrialSpecSchema>;
 export type StudyTrialOutput = z.infer<typeof studyTrialOutputSchema>;
+export type BundledPredictionRuntimeEvidence = z.infer<
+  typeof bundledPredictionRuntimeEvidenceSchema
+>;
 type StudyTemporalCertification = NonNullable<StudyBenchmarkLock["dataset"]["temporal"]>;
 export type StudyTrialTemporalEvidence = Omit<StudyTemporalCertification, "splits"> & {
   splits: Pick<StudyTemporalCertification["splits"], "training" | "validation">;

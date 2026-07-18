@@ -47,6 +47,16 @@ RUNNER_VERSION = 2
 PARAMETER_KEYS = {"c", "class_weight", "max_iter", "random_seed"}
 
 
+def runtime_versions() -> dict[str, str]:
+    return {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "numpy": np.__version__,
+        "scikit_learn": sklearn.__version__,
+        "joblib": joblib.__version__,
+    }
+
+
 def display_value(value: str, maximum_length: int = 96) -> str:
     if len(value) > maximum_length:
         value = value[: maximum_length - 3] + "..."
@@ -624,13 +634,7 @@ def run(input_path: Path, output_path: Path, artifact_directory: Path) -> None:
             "missing_counts": training_missing,
             "transformed_feature_count": len(input_columns) + len(indicator.features_),
         },
-        "runtime": {
-            "python": sys.version.split()[0],
-            "platform": platform.platform(),
-            "numpy": np.__version__,
-            "scikit_learn": sklearn.__version__,
-            "joblib": joblib.__version__,
-        },
+        "runtime": runtime_versions(),
         "model": {
             "path": "model.joblib",
             "sha256": sha256_file(model_path),
@@ -656,7 +660,12 @@ def run(input_path: Path, output_path: Path, artifact_directory: Path) -> None:
     )
 
 
-def predict(input_path: Path, output_path: Path, model_directory: Path) -> None:
+def predict(
+    input_path: Path,
+    output_path: Path,
+    model_directory: Path,
+    runtime_output_path: Path | None = None,
+) -> None:
     task, prediction_csv = parse_prediction_request(input_path)
     input_columns = task["input_columns"]
     id_column = task["id_column"]
@@ -678,6 +687,16 @@ def predict(input_path: Path, output_path: Path, model_directory: Path) -> None:
         prediction_values,
         len(prediction_rows),
     )
+    if runtime_output_path is not None:
+        write_json_atomic(runtime_output_path, {
+            "schema_version": 1,
+            "protocol_version": 1,
+            "runner": {
+                "name": RUNNER_NAME,
+                "version": RUNNER_VERSION,
+            },
+            "runtime": runtime_versions(),
+        })
     write_json_atomic(output_path, {
         "protocol_version": 1,
         "predictions": [
@@ -695,6 +714,30 @@ def predict(input_path: Path, output_path: Path, model_directory: Path) -> None:
     )
 
 
+def validate_prediction_output_paths(
+    input_path: Path,
+    output_path: Path,
+    model_directory: Path,
+    runtime_output_path: Path | None,
+) -> None:
+    prediction_input = input_path.resolve()
+    prediction_output = output_path.resolve()
+    model_root = model_directory.resolve()
+    if prediction_output == prediction_input:
+        raise ValueError("prediction output must not overwrite prediction input")
+    if prediction_output.is_relative_to(model_root):
+        raise ValueError("prediction output must be outside the saved model directory")
+    if runtime_output_path is None:
+        return
+    runtime_output = runtime_output_path.resolve()
+    if runtime_output == prediction_input:
+        raise ValueError("runtime output must not overwrite prediction input")
+    if runtime_output == prediction_output:
+        raise ValueError("runtime output must be separate from prediction output")
+    if runtime_output.is_relative_to(model_root):
+        raise ValueError("runtime output must be outside the saved model directory")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run TT Local's bundled numeric logistic-regression Study trial.",
@@ -704,19 +747,37 @@ def main() -> None:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--artifact-dir")
     mode.add_argument("--model-dir")
+    parser.add_argument(
+        "--runtime-output",
+        help="write saved-model prediction runtime evidence as JSON",
+    )
     arguments = parser.parse_args()
     try:
         if arguments.artifact_dir is not None:
+            if arguments.runtime_output is not None:
+                raise ValueError("--runtime-output requires --model-dir")
             run(
                 Path(arguments.input),
                 Path(arguments.output),
                 Path(arguments.artifact_dir),
             )
         else:
+            runtime_output_path = (
+                Path(arguments.runtime_output)
+                if arguments.runtime_output is not None
+                else None
+            )
+            validate_prediction_output_paths(
+                Path(arguments.input),
+                Path(arguments.output),
+                Path(arguments.model_dir),
+                runtime_output_path,
+            )
             predict(
                 Path(arguments.input),
                 Path(arguments.output),
                 Path(arguments.model_dir),
+                runtime_output_path,
             )
     except Exception as error:
         print(f"{RUNNER_NAME}: {error}", file=sys.stderr, flush=True)

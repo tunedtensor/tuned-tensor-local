@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import test from "node:test";
 import {
+  bundledPredictionRuntimeEvidenceSchema,
   buildStudyTrialRunnerCommand,
   runStudyTrial,
   studyTrialSpecSchema,
@@ -38,6 +39,44 @@ interface TrialFixture {
     overrides?: Partial<StudyTrialSpec["runner"]>,
   ) => Promise<string>;
 }
+
+test("strictly validates bundled prediction runtime evidence", () => {
+  const valid = {
+    schema_version: 1,
+    protocol_version: 1,
+    runner: {
+      name: "numeric_logistic_regression",
+      version: 2,
+    },
+    runtime: {
+      python: "3.13.5",
+      platform: "Linux",
+      numpy: "2.3.1",
+      scikit_learn: "1.7.1",
+      joblib: "1.5.1",
+    },
+  };
+  assert.deepEqual(bundledPredictionRuntimeEvidenceSchema.parse(valid), valid);
+  for (const invalid of [
+    { ...valid, unexpected: true },
+    { ...valid, schema_version: 2 },
+    { ...valid, protocol_version: 2 },
+    { ...valid, runner: { ...valid.runner, version: 1 } },
+    {
+      ...valid,
+      runtime: {
+        platform: "Linux",
+        numpy: "2.3.1",
+        scikit_learn: "1.7.1",
+        joblib: "1.5.1",
+      },
+    },
+    { ...valid, runtime: { ...valid.runtime, python: "" } },
+    { ...valid, runtime: { ...valid.runtime, unexpected: "value" } },
+  ]) {
+    assert.throws(() => bundledPredictionRuntimeEvidenceSchema.parse(invalid));
+  }
+});
 
 async function withTrialFixture(
   callback: (fixture: TrialFixture) => void | Promise<void>,
@@ -614,6 +653,13 @@ test("runs the bundled numeric logistic-regression trial deterministically", asy
       ),
     ) as {
       runner: { name: string; version: number };
+      runtime: {
+        python: string;
+        platform: string;
+        numpy: string;
+        scikit_learn: string;
+        joblib: string;
+      };
       training: {
         class_counts: { negative: number; positive: number };
         missing_counts: Record<string, number>;
@@ -683,24 +729,120 @@ test("runs the bundled numeric logistic-regression trial deterministically", asy
       inputPath: string,
       modelDirectory: string,
       outputName: string,
-    ) => spawnSync(bundledCommand.command, [
-      ...bundledCommand.baseArgs,
-      "--input",
-      inputPath,
-      "--output",
-      join(root, outputName),
-      "--model-dir",
-      modelDirectory,
-    ], { cwd: root, encoding: "utf8" });
+      runtimeOutputName?: string,
+    ) => spawnSync(
+      bundledCommand.command,
+      [
+        ...bundledCommand.baseArgs,
+        "--input",
+        inputPath,
+        "--output",
+        join(root, outputName),
+        "--model-dir",
+        modelDirectory,
+        ...(
+          runtimeOutputName === undefined
+            ? []
+            : ["--runtime-output", join(root, runtimeOutputName)]
+        ),
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
     const savedModel = runSavedModel(
       predictionInputPath,
       join(first.trialDirectory, "model"),
       "saved-model-predictions.json",
+      "saved-model-runtime.json",
     );
     assert.equal(savedModel.status, 0, savedModel.stderr);
     assert.deepEqual(
       JSON.parse(await readFile(join(root, "saved-model-predictions.json"), "utf8")),
       JSON.parse(await readFile(join(first.trialDirectory, "predictions.json"), "utf8")),
+    );
+    const predictionRuntime = JSON.parse(
+      await readFile(join(root, "saved-model-runtime.json"), "utf8"),
+    ) as Record<string, unknown>;
+    assert.deepEqual(Object.keys(predictionRuntime).sort(), [
+      "protocol_version",
+      "runner",
+      "runtime",
+      "schema_version",
+    ]);
+    assert.equal(predictionRuntime.schema_version, 1);
+    assert.equal(predictionRuntime.protocol_version, 1);
+    assert.deepEqual(predictionRuntime.runner, {
+      name: "numeric_logistic_regression",
+      version: 2,
+    });
+    assert.deepEqual(predictionRuntime.runtime, manifest.runtime);
+
+    const legacySavedModel = runSavedModel(
+      predictionInputPath,
+      join(first.trialDirectory, "model"),
+      "legacy-saved-model-predictions.json",
+    );
+    assert.equal(legacySavedModel.status, 0, legacySavedModel.stderr);
+    const legacyPredictions = JSON.parse(
+      await readFile(join(root, "legacy-saved-model-predictions.json"), "utf8"),
+    );
+    assert.deepEqual(Object.keys(legacyPredictions).sort(), [
+      "predictions",
+      "protocol_version",
+    ]);
+    assert.deepEqual(
+      legacyPredictions,
+      JSON.parse(await readFile(join(first.trialDirectory, "predictions.json"), "utf8")),
+    );
+
+    const forgedRuntimeModelDirectory = join(root, "forged-runtime-model");
+    await cp(
+      join(first.trialDirectory, "model"),
+      forgedRuntimeModelDirectory,
+      { recursive: true },
+    );
+    const forgedRuntimeManifestPath = join(
+      forgedRuntimeModelDirectory,
+      "runner-manifest.json",
+    );
+    const forgedRuntimeManifest = JSON.parse(
+      await readFile(forgedRuntimeManifestPath, "utf8"),
+    );
+    forgedRuntimeManifest.runtime = {
+      python: "forged",
+      platform: "forged",
+      numpy: "forged",
+      scikit_learn: "forged",
+      joblib: "forged",
+    };
+    await writeFile(
+      forgedRuntimeManifestPath,
+      `${JSON.stringify(forgedRuntimeManifest, null, 2)}\n`,
+      "utf8",
+    );
+    const actualRuntime = runSavedModel(
+      predictionInputPath,
+      forgedRuntimeModelDirectory,
+      "actual-runtime-predictions.json",
+      "actual-runtime.json",
+    );
+    assert.equal(actualRuntime.status, 0, actualRuntime.stderr);
+    assert.deepEqual(
+      JSON.parse(await readFile(join(root, "actual-runtime.json"), "utf8")).runtime,
+      manifest.runtime,
+    );
+    const modelDestination = runSavedModel(
+      predictionInputPath,
+      forgedRuntimeModelDirectory,
+      "forged-runtime-model/prediction-output.json",
+    );
+    assert.equal(modelDestination.status, 1);
+    assert.match(
+      modelDestination.stderr,
+      /prediction output must be outside the saved model directory/i,
+    );
+    assert.equal(
+      existsSync(join(forgedRuntimeModelDirectory, "prediction-output.json")),
+      false,
     );
 
     const unknownRequestPath = join(root, "unknown-prediction-input.json");
@@ -756,12 +898,59 @@ test("runs the bundled numeric logistic-regression trial deterministically", asy
       predictionInputPath,
       driftModelDirectory,
       "changed-model-predictions.json",
+      "changed-model-runtime.json",
     );
     assert.equal(changedModel.status, 1);
     assert.match(
       changedModel.stderr,
       /saved model SHA-256 does not match/i,
     );
+    assert.equal(existsSync(join(root, "changed-model-runtime.json")), false);
+
+    const collidingRuntime = runSavedModel(
+      predictionInputPath,
+      join(first.trialDirectory, "model"),
+      "colliding-output.json",
+      "colliding-output.json",
+    );
+    assert.equal(collidingRuntime.status, 1);
+    assert.match(
+      collidingRuntime.stderr,
+      /runtime output must be separate from prediction output/i,
+    );
+    assert.equal(existsSync(join(root, "colliding-output.json")), false);
+
+    await writeFile(join(root, "blocked-runtime-parent"), "not a directory", "utf8");
+    const blockedRuntime = runSavedModel(
+      predictionInputPath,
+      join(first.trialDirectory, "model"),
+      "blocked-runtime-predictions.json",
+      "blocked-runtime-parent/runtime.json",
+    );
+    assert.equal(blockedRuntime.status, 1);
+    assert.equal(
+      existsSync(join(root, "blocked-runtime-predictions.json")),
+      false,
+    );
+
+    const fitWithRuntime = spawnSync(
+      bundledCommand.command,
+      [
+        ...bundledCommand.baseArgs,
+        "--input",
+        join(first.trialDirectory, "trial-input.json"),
+        "--output",
+        join(root, "fit-with-runtime-predictions.json"),
+        "--artifact-dir",
+        join(root, "fit-with-runtime-model"),
+        "--runtime-output",
+        join(root, "fit-with-runtime.json"),
+      ],
+      { cwd: root, encoding: "utf8" },
+    );
+    assert.equal(fitWithRuntime.status, 1);
+    assert.match(fitWithRuntime.stderr, /--runtime-output requires --model-dir/i);
+    assert.equal(existsSync(join(root, "fit-with-runtime.json")), false);
   });
 });
 
