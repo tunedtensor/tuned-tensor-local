@@ -10,6 +10,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { writeJsonAtomic } from "./artifacts.js";
 import { minimalMachineLearningEnvironment } from "./huggingface-cache.js";
@@ -30,6 +31,11 @@ import {
 
 export const STUDY_TRIAL_PROTOCOL_VERSION = 1;
 const MAX_PREDICTION_BYTES = 16 * 1024 * 1024;
+const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const NUMERIC_LOGISTIC_REGRESSION_SCRIPT = join(
+  packageRoot,
+  "training/study-runner/numeric_logistic_regression.py",
+);
 
 export type StudyTrialJsonValue =
   | string
@@ -64,6 +70,35 @@ const relativeWorkingDirectorySchema = exactStringSchema.refine(
   ),
   { message: "must be a portable relative local path" },
 );
+const studyTrialTimeoutSchema = z.number().int().min(1_000).max(86_400_000);
+
+const studyTrialCommandRunnerSchema = z.object({
+  command: z.array(exactStringSchema).min(1).refine(
+    (command) => !command.some((value) => (
+      value === "--input"
+      || value.startsWith("--input=")
+      || value === "--output"
+      || value.startsWith("--output=")
+      || value === "--artifact-dir"
+      || value.startsWith("--artifact-dir=")
+    )),
+    { message: "--input, --output, and --artifact-dir are reserved by the trial protocol" },
+  ),
+  cwd: relativeWorkingDirectorySchema.optional(),
+  timeout_ms: studyTrialTimeoutSchema,
+}).strict();
+
+const studyTrialBuiltinRunnerSchema = z.object({
+  builtin: z.literal("numeric_logistic_regression"),
+  timeout_ms: studyTrialTimeoutSchema,
+}).strict();
+
+const numericLogisticRegressionParametersSchema = z.object({
+  c: z.number().finite().min(1e-6).max(1e6),
+  class_weight: z.enum(["none", "balanced"]),
+  max_iter: z.number().int().min(1).max(10_000),
+  random_seed: z.number().int().min(0).max(2 ** 32 - 1),
+}).strict();
 
 export const studyTrialSpecSchema = z.object({
   schema_version: z.literal(1),
@@ -72,23 +107,23 @@ export const studyTrialSpecSchema = z.object({
     "must start with an alphanumeric character and contain only alphanumerics, '.', '_', or '-'",
   ),
   name: exactStringSchema,
-  runner: z.object({
-    command: z.array(exactStringSchema).min(1).refine(
-      (command) => !command.some((value) => (
-        value === "--input"
-        || value.startsWith("--input=")
-        || value === "--output"
-        || value.startsWith("--output=")
-        || value === "--artifact-dir"
-        || value.startsWith("--artifact-dir=")
-      )),
-      { message: "--input, --output, and --artifact-dir are reserved by the trial protocol" },
-    ),
-    cwd: relativeWorkingDirectorySchema.optional(),
-    timeout_ms: z.number().int().min(1_000).max(86_400_000),
-  }).strict(),
+  runner: z.union([
+    studyTrialCommandRunnerSchema,
+    studyTrialBuiltinRunnerSchema,
+  ]),
   parameters: z.record(z.string(), studyTrialJsonValueSchema).default({}),
-}).strict();
+}).strict().superRefine((trial, context) => {
+  if (!("builtin" in trial.runner)) return;
+  const parsed = numericLogisticRegressionParametersSchema.safeParse(trial.parameters);
+  if (parsed.success) return;
+  for (const issue of parsed.error.issues) {
+    context.addIssue({
+      code: "custom",
+      path: ["parameters", ...issue.path],
+      message: issue.message,
+    });
+  }
+});
 
 export const studyTrialPredictionSchema = z.object({
   id: datasetIdSchema,
@@ -152,6 +187,13 @@ export interface StudyTrialReport {
 interface LoadedTrialSpec {
   path: string;
   spec: StudyTrialSpec;
+}
+
+export interface StudyTrialRunnerCommand {
+  command: string;
+  baseArgs: string[];
+  reportCommand: string[];
+  requiredFiles: string[];
 }
 
 interface ParsedStudySplit {
@@ -421,6 +463,29 @@ export function defaultStudyTrialOutputRoot(studyPath: string): string {
   return join(dirname(resolve(studyPath)), ".tt-local", "study-trials");
 }
 
+export function buildStudyTrialRunnerCommand(
+  runner: StudyTrialSpec["runner"],
+): StudyTrialRunnerCommand {
+  if ("builtin" in runner) {
+    return {
+      command: "uv",
+      baseArgs: ["run", "--locked", NUMERIC_LOGISTIC_REGRESSION_SCRIPT],
+      reportCommand: [`builtin:${runner.builtin}`],
+      requiredFiles: [
+        NUMERIC_LOGISTIC_REGRESSION_SCRIPT,
+        `${NUMERIC_LOGISTIC_REGRESSION_SCRIPT}.lock`,
+      ],
+    };
+  }
+  const [command, ...baseArgs] = runner.command;
+  return {
+    command: command!,
+    baseArgs,
+    reportCommand: runner.command,
+    requiredFiles: [],
+  };
+}
+
 function trialProtocolInput(args: {
   trial: StudyTrialSpec;
   task: BinaryClassificationStudyTask;
@@ -556,7 +621,13 @@ export async function runStudyTrial(args: {
     studyPath: loadedStudy.path,
     lock: validated.lock,
   });
-  const configuredCwd = loadedTrial.spec.runner.cwd;
+  const runnerCommand = buildStudyTrialRunnerCommand(loadedTrial.spec.runner);
+  await Promise.all(runnerCommand.requiredFiles.map((path) => (
+    assertRegularFile(path, "bundled study trial runtime")
+  )));
+  const configuredCwd = "cwd" in loadedTrial.spec.runner
+    ? loadedTrial.spec.runner.cwd
+    : undefined;
   const configuredRunnerCwd = configuredCwd
     ? resolve(dirname(loadedTrial.path), configuredCwd)
     : undefined;
@@ -596,9 +667,8 @@ export async function runStudyTrial(args: {
   );
 
   const runnerCwd = configuredRunnerCwd ?? trialDirectory;
-  const [command, ...baseArgs] = loadedTrial.spec.runner.command;
   const commandArgs = [
-    ...baseArgs,
+    ...runnerCommand.baseArgs,
     "--input",
     inputPath,
     "--output",
@@ -609,7 +679,7 @@ export async function runStudyTrial(args: {
   await rm(predictionPath, { force: true });
   const started = performance.now();
   const result = await runLoggedProcess({
-    command: command!,
+    command: runnerCommand.command,
     commandArgs,
     cwd: runnerCwd,
     env: minimalMachineLearningEnvironment(process.env),
@@ -691,7 +761,7 @@ export async function runStudyTrial(args: {
       predictions_sha256: sha256(parsedPredictions.bytes),
     },
     execution: {
-      command: loadedTrial.spec.runner.command,
+      command: runnerCommand.reportCommand,
       cwd: configuredCwd ?? "<trial-directory>",
       timeout_ms: loadedTrial.spec.runner.timeout_ms,
       duration_ms: durationMs,

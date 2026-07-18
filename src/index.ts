@@ -394,7 +394,7 @@ const COMMAND_GROUPS: Record<string, CliCommandGroup> = {
       },
       run: {
         usage: "tt-local studies run <study.json> <trial.json> [options]",
-        description: "Run one command-backed trial and score its validation predictions.",
+        description: "Run one bundled or command-backed trial and score its validation predictions.",
         options: [
           { name: "--lock", value: "path", description: "Benchmark lock path" },
           { name: "--output-root", value: "path", description: "Root for immutable per-trial artifacts" },

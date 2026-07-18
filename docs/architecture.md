@@ -104,14 +104,24 @@ isolated-evaluation contracts before an autonomous research loop can claim a
 sealed test result.
 
 `tt-local studies run` executes one versioned trial spec without opening the
-fine-tuning run store. Each trial has a filesystem-safe immutable ID, direct
-argv command, relative working directory, finite timeout, and free-form
-parameter record. TT Local claims a new directory for that ID and records its
-projected inputs, command log, raw predictions, optional model files, and
-atomic report. The ID is write-once within that output root; a failed ID is
-retained for diagnosis and never reused. By default the child starts in this
-directory. Explicit working directories resolve from the trial-spec
-directory.
+fine-tuning run store. Each trial has a filesystem-safe immutable ID, finite
+timeout, free-form parameter record, and either a bundled runner identifier or
+a direct argv command with an optional relative working directory. TT Local
+claims a new directory for that ID and records its projected inputs, command
+log, raw predictions, optional model files, and atomic report. The ID is
+write-once within that output root; a failed ID is retained for diagnosis and
+never reused. By default a custom child starts in this directory. Explicit
+working directories resolve from the trial-spec directory.
+
+The first bundled algorithm is `numeric_logistic_regression`: a deliberately
+narrow supervised baseline for numeric binary-classification features. It
+uses median imputation with missingness indicators, standard scaling, and
+scikit-learn logistic regression. The runner accepts only regularization,
+class weighting, iteration-limit, and seed parameters. Its PEP 723 script and
+adjacent `uv` lock create a small isolated classic-ML environment, separate
+from the Transformer training project. It writes an atomic fitted-pipeline
+artifact and a manifest containing the normalized configuration, data counts,
+runtime versions, and model hash before publishing predictions.
 
 TT Local passes the child only:
 

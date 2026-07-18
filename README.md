@@ -3,12 +3,11 @@
 [![CI](https://github.com/tunedtensor/tuned-tensor-local/actions/workflows/ci.yml/badge.svg)](https://github.com/tunedtensor/tuned-tensor-local/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/@tuned-tensor/local)](https://www.npmjs.com/package/@tuned-tensor/local)
 
-TT Local is local-first fine-tuning with built-in evaluation for small
-open-weight models. On a compatible NVIDIA GPU on Linux, it turns a behavior
-spec into a fine-tuned model and a paired, inspectable report comparing the run
-baseline with the tuned candidate on representative evaluation cases. Specs,
-datasets, model artifacts, events, reports, and dashboard state stay on local
-disk.
+TT Local is a local-first experimentation system for fine-tuning and classic
+machine learning. It can turn a behavior spec into a fine-tuned small
+open-weight model with a paired evaluation report, or run reproducible
+algorithm trials against a locked tabular benchmark. Specs, datasets, model
+artifacts, events, reports, and dashboard state stay on local disk.
 
 Usage docs:
 
@@ -21,7 +20,8 @@ npm install -g @tuned-tensor/local
 tt-local info
 ```
 
-The bundled SFT, DPO, and Transformers evaluator path also needs `uv`:
+The bundled SFT, DPO, Transformers evaluator, and classic-ML paths also need
+`uv`:
 
 ```bash
 uv --version
@@ -40,8 +40,8 @@ repository.
 
 TT Local has a separate, model-independent StudySpec foundation for classic ML
 work. It locks predefined binary-classification CSV splits, then runs
-independent command-backed algorithm trials against the same training and
-validation benchmark.
+independent bundled or command-backed algorithm trials against the same
+training and validation benchmark.
 
 Define the task and explicitly allowlist model inputs:
 
@@ -99,14 +99,15 @@ Define one immutable algorithm attempt separately from the benchmark:
 {
   "schema_version": 1,
   "id": "logreg-c1-v1",
-  "name": "Logistic regression C=1",
+  "name": "Balanced numeric logistic regression",
   "runner": {
-    "command": ["python3", "scripts/logreg_trial.py"],
-    "cwd": ".",
+    "builtin": "numeric_logistic_regression",
     "timeout_ms": 300000
   },
   "parameters": {
     "c": 1,
+    "class_weight": "balanced",
+    "max_iter": 1000,
     "random_seed": 42
   }
 }
@@ -118,21 +119,48 @@ Then run it:
 tt-local studies run portfolio.study.json logreg-c1-v1.trial.json
 ```
 
+The bundled runner treats every allowlisted input as numeric, median-imputes
+blank cells, adds missingness indicators, standardizes the features, and fits
+scikit-learn logistic regression. Its four parameters are strict:
+`c` must be between `1e-6` and `1e6`, `class_weight` is `none` or `balanced`,
+`max_iter` is between `1` and `10000`, and `random_seed` is an unsigned
+32-bit integer. It rejects nonnumeric or non-finite cells and features that
+are entirely missing in training.
+
+The first run uses `uv` to fetch a small isolated environment from the bundled
+script lock; it does not install or load TT Local's Transformer/PyTorch
+runtime. The fitted pipeline is saved as `model/model.joblib`, alongside a
+manifest with normalized parameters, data counts, runtime versions, and the
+model hash. `class_weight: "balanced"` is often useful for rare-event ranking,
+but its probabilities should not be interpreted as the event's natural-rate
+calibration without a separate calibration step.
+
 TT Local creates
 `.tt-local/study-trials/logreg-c1-v1/`, appends
 `--input <trial-input.json> --output <predictions.json> --artifact-dir <model>`
-to the configured command, and keeps the projected data, command log,
+to a command runner, and keeps the projected data, command log,
 predictions, model files, and `trial-report.json` together. Those three flags
-are reserved. `cwd` resolves from the trial-spec directory; when omitted, the
-command starts in its new trial directory. A trial ID is write-once within
-the selected output root, including after a failed attempt, so use a new ID
-for each algorithm or parameter change.
+are reserved for command runners. A custom runner's `cwd` resolves from the
+trial-spec directory; when omitted, it starts in its new trial directory. A
+trial ID is write-once within the selected output root, including after a
+failed attempt, so use a new ID for each algorithm or parameter change.
 
-The command input points to two CSVs. Training contains only the ID,
+The runner input points to two CSVs. Training contains only the ID,
 allowlisted features, and a target normalized to `0` or `1`. Validation
-contains only the ID and allowlisted features. Parameters are caller-provided
-JSON: TT Local records and passes them, but the runner must apply them. For
-example, a numeric-feature scikit-learn runner can be:
+contains only the ID and allowlisted features.
+
+For an algorithm that is not bundled, use a direct command runner instead:
+
+```json
+{
+  "command": ["python3", "scripts/custom_trial.py"],
+  "cwd": ".",
+  "timeout_ms": 300000
+}
+```
+
+Parameters are caller-provided JSON: TT Local records and passes them, but a
+custom runner must validate and apply them. For example:
 
 ```python
 import argparse
@@ -207,7 +235,12 @@ predictions:
   "trial": {
     "id": "logreg-c1-v1",
     "spec_sha256": "...",
-    "parameters": { "c": 1, "random_seed": 42 }
+    "parameters": {
+      "c": 1,
+      "class_weight": "balanced",
+      "max_iter": 1000,
+      "random_seed": 42
+    }
   },
   "evaluation": {
     "primary_score": 0.84,
@@ -222,9 +255,11 @@ predictions:
 }
 ```
 
-The v1 contract requires calibrated positive-class probabilities. A raw
-Isolation Forest or One-Class SVM anomaly score must be calibrated before it
-is returned; a general ranking-score task is a future contract.
+The v1 contract requires positive-class probabilities rather than arbitrary
+anomaly scores; calibration quality remains the model author's
+responsibility. A raw Isolation Forest or One-Class SVM score must be
+converted to a defensible probability before it is returned. A general
+ranking-score task is a future contract.
 
 This is a target-free validation projection, not a sandbox or confidentiality
 boundary. TT Local does not pass validation targets or test material through
