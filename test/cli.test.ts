@@ -178,6 +178,10 @@ test("study benchmark lock and validation run end to end without opening the loc
         command: [process.execPath, runnerPath],
         cwd: ".",
         timeout_ms: 10_000,
+        provenance: {
+          source_files: ["trial-runner.mjs"],
+          dependency_lock_files: [],
+        },
       },
       parameters: { c: 1 },
     }, null, 2)}\n`, "utf8");

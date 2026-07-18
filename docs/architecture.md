@@ -106,12 +106,15 @@ sealed test result.
 `tt-local studies run` executes one versioned trial spec without opening the
 fine-tuning run store. Each trial has a filesystem-safe immutable ID, finite
 timeout, free-form parameter record, and either a bundled runner identifier or
-a direct argv command with an optional relative working directory. TT Local
-claims a new directory for that ID and records its projected inputs, command
-log, raw predictions, optional model files, and atomic report. The ID is
-write-once within that output root; a failed ID is retained for diagnosis and
-never reused. By default a custom child starts in this directory. Explicit
-working directories resolve from the trial-spec directory.
+a direct argv command with an optional relative working directory. Direct
+commands also declare exact source files and zero or more dependency-lock
+files, all relative to the trial-spec directory. TT Local claims a new
+directory for that ID and records its projected inputs, command log, raw
+predictions, optional model files, implementation snapshot, deterministic
+manifests, and atomic report. The ID is write-once within that output root; a
+failed ID is retained for diagnosis and never reused. By default a custom child
+starts in this directory. Explicit working directories resolve from the
+trial-spec directory.
 
 The first bundled algorithm is `numeric_logistic_regression`: a deliberately
 narrow supervised baseline for numeric binary-classification features. It
@@ -140,21 +143,30 @@ tie-independent average precision and ROC AUC plus F1 at the fixed `0.5`
 threshold, and publishes only aggregate metrics in the report.
 
 The runner uses direct process arguments, process-group timeout teardown, a
-reduced machine-learning environment, bounded prediction JSON, and
-post-command input hashes. These are protocol and provenance safeguards, not
-an execution sandbox or credential/network isolation: same-user code can
-inspect the host filesystem, escape the process group, or repeatedly query
-aggregate validation scores. Names, parameters, and command arguments are
-persisted and must not contain secrets. Strong
-process isolation, validation query budgets, temporal split certification,
-and one-shot sealed test evaluation remain separate future boundaries.
+reduced machine-learning environment, bounded prediction JSON, post-command
+input hashes, and pre/post checks of its declared implementation files. TT
+Local snapshots those implementation bytes before launch. The bundled runner
+automatically binds its packaged PEP 723 script and adjacent lock; a custom
+runner must declare at least one source file and may declare an empty lock
+list. Exact files are used instead of directories or inferred import graphs.
 
-Reports bind the StudySpec, benchmark lock, source snapshot, projected inputs,
-predictions, and declared trial configuration. They do not yet hash or
-snapshot runner source, dependency locks, runtime environment, or model
-artifacts, so they are evidence of an attempt rather than a full
-reproducibility attestation. The benchmark is verified before launch; a
-source change during a same-user command is detected by the next trial.
+After successful execution, TT Local independently inventories the model tree.
+Both the implementation and model manifests are deterministic, contain
+per-file sizes and SHA-256 hashes, and are referenced by digest from the
+report. Model symlinks, special files, root replacement, drift while hashing,
+and implementation drift prevent report publication. An empty model tree
+remains valid for generic command runners.
+
+These are protocol and provenance safeguards, not an execution sandbox,
+credential/network isolation, or hermetic runtime attestation: same-user code
+can inspect the host filesystem, escape the process group, mutate and restore
+files between checks, or repeatedly query aggregate validation scores.
+Declared lock evidence does not prove a custom command consumed that lock, and
+the interpreter, operating system, native libraries, environment, and network
+inputs are not captured. Names, parameters, and command arguments are
+persisted and must not contain secrets. Strong process isolation, runtime
+attestation, validation query budgets, temporal split certification, and
+one-shot sealed test evaluation remain separate future boundaries.
 
 ## Evaluation Loop
 
