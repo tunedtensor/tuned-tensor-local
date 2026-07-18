@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "polymarket-logreg-balanced-c1-v1",
+  "name": "Balanced numeric logistic regression (C=1)",
+  "runner": {
+    "builtin": "numeric_logistic_regression",
+    "timeout_ms": 300000
+  },
+  "parameters": {
+    "c": 1,
+    "class_weight": "balanced",
+    "max_iter": 1000,
+    "random_seed": 42
+  }
+}
