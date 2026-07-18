@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import {
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import { dirname, join } from "node:path";
@@ -158,6 +164,34 @@ test("logged processes can clean up descendants after a successful direct child"
     assert.equal(result.exitCode, 0);
     await new Promise((resolveWait) => setTimeout(resolveWait, 600));
     assert.equal(existsSync(marker), false, "successful child left a descendant running");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("exclusive process logs reject aliases before launching the child", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-process-log-test-"));
+  const target = join(root, "target.log");
+  const logPath = join(root, "predictor.log");
+  const marker = join(root, "child-ran");
+  await writeFile(target, "preserve me\n");
+  await symlink(target, logPath);
+  try {
+    await assert.rejects(
+      runLoggedProcess({
+        command: process.execPath,
+        commandArgs: [
+          "-e",
+          `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran")`,
+        ],
+        stage: "study-test",
+        logPath,
+        exclusiveLog: true,
+      }),
+      /EEXIST/,
+    );
+    assert.equal(existsSync(marker), false);
+    assert.equal(await readFile(target, "utf8"), "preserve me\n");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, type WriteStream } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -88,6 +88,29 @@ export class ProcessCancelledError extends Error {
   }
 }
 
+async function openProcessLog(
+  path: string,
+  exclusive: boolean,
+): Promise<WriteStream> {
+  const stream = createWriteStream(path, {
+    flags: exclusive ? "wx" : "w",
+    mode: 0o600,
+  });
+  await new Promise<void>((resolveOpen, reject) => {
+    const onOpen = () => {
+      stream.off("error", onError);
+      resolveOpen();
+    };
+    const onError = (error: Error) => {
+      stream.off("open", onOpen);
+      reject(error);
+    };
+    stream.once("open", onOpen);
+    stream.once("error", onError);
+  });
+  return stream;
+}
+
 export async function runLoggedProcess(args: {
   command: string;
   commandArgs: string[];
@@ -102,9 +125,12 @@ export async function runLoggedProcess(args: {
   shouldCancel?: () => boolean | Promise<boolean>;
   cancelPollMs?: number;
   terminateProcessGroupOnExit?: boolean;
+  exclusiveLog?: boolean;
 }): Promise<LoggedProcessResult> {
   if (args.logPath) await mkdir(dirname(args.logPath), { recursive: true });
-  const logStream = args.logPath ? createWriteStream(args.logPath, { flags: "w" }) : null;
+  const logStream = args.logPath
+    ? await openProcessLog(args.logPath, args.exclusiveLog ?? false)
+    : null;
   let stderr = "";
 
   try {

@@ -213,12 +213,15 @@ export type StudySplitName = keyof StudySpec["dataset"]["splits"];
 
 const STUDY_SPLITS: readonly StudySplitName[] = ["training", "validation", "test"];
 
-interface InspectedSplit {
+export interface InspectedStudySplit {
+  rows: string[][];
   columns: string[];
   ids: Set<string>;
   summary: StudyBenchmarkLock["dataset"]["splits"][StudySplitName];
   temporal?: InspectedTemporalSplit;
 }
+
+type InspectedStudySplitEvidence = Omit<InspectedStudySplit, "rows">;
 
 interface ParsedUtcTimestamp {
   nanoseconds: bigint;
@@ -317,22 +320,14 @@ function assertRequiredColumns(
   }
 }
 
-async function inspectSplit(args: {
+export function inspectStudySplitBytes(args: {
   split: StudySplitName;
   source: string;
-  studyDirectory: string;
+  bytes: Uint8Array;
   task: BinaryClassificationStudyTask;
   temporal?: z.infer<typeof studyTemporalPolicySchema>;
-}): Promise<InspectedSplit> {
-  const resolvedPath = resolve(args.studyDirectory, args.source);
-  await assertRegularFile(resolvedPath, `${args.split} dataset`);
-  let bytes: Uint8Array;
-  try {
-    bytes = await readFile(resolvedPath);
-  } catch (error) {
-    throw new Error(`Cannot read ${args.split} dataset at ${resolvedPath}`, { cause: error });
-  }
-  const parsed = parseCsvRecords(decodeUtf8(bytes, args.split), { strict: true });
+}): InspectedStudySplit {
+  const parsed = parseCsvRecords(decodeUtf8(args.bytes, args.split), { strict: true });
   if (parsed.errors.length > 0) {
     throw new Error(`Invalid ${args.split} CSV: ${parsed.errors.join("; ")}`);
   }
@@ -436,12 +431,13 @@ async function inspectSplit(args: {
   }
 
   return {
+    rows: parsed.records,
     columns,
     ids,
     summary: {
       path: args.source,
-      sha256: sha256(bytes),
-      size_bytes: bytes.byteLength,
+      sha256: sha256(args.bytes),
+      size_bytes: args.bytes.byteLength,
       row_count: parsed.records.length,
     },
     ...(args.temporal ? {
@@ -461,6 +457,28 @@ async function inspectSplit(args: {
       },
     } : {}),
   };
+}
+
+async function inspectSplit(args: {
+  split: StudySplitName;
+  source: string;
+  studyDirectory: string;
+  task: BinaryClassificationStudyTask;
+  temporal?: z.infer<typeof studyTemporalPolicySchema>;
+}): Promise<InspectedStudySplitEvidence> {
+  const resolvedPath = resolve(args.studyDirectory, args.source);
+  await assertRegularFile(resolvedPath, `${args.split} dataset`);
+  let bytes: Uint8Array;
+  try {
+    bytes = await readFile(resolvedPath);
+  } catch (error) {
+    throw new Error(`Cannot read ${args.split} dataset at ${resolvedPath}`, { cause: error });
+  }
+  const { rows: _rows, ...evidence } = inspectStudySplitBytes({
+    ...args,
+    bytes,
+  });
+  return evidence;
 }
 
 export async function loadStudySpec(studyPath: string): Promise<{
@@ -486,7 +504,7 @@ async function buildStudyBenchmarkLockFromLoaded(
   loaded: Awaited<ReturnType<typeof loadStudySpec>>,
 ): Promise<StudyBenchmarkLock> {
   const studyDirectory = dirname(loaded.path);
-  const inspected = {} as Record<StudySplitName, InspectedSplit>;
+  const inspected = {} as Record<StudySplitName, InspectedStudySplitEvidence>;
   const idOwners = new Map<string, StudySplitName>();
   let expectedColumns: string[] | undefined;
 
