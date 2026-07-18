@@ -64,6 +64,12 @@ export interface StudyModelReference {
   size_bytes: number;
 }
 
+export interface InspectedStudyModel {
+  manifest: StudyModelManifest;
+  reference: StudyModelReference;
+  text: string;
+}
+
 export interface StudyImplementationInputFile {
   role: "source" | "dependency_lock";
   path: string;
@@ -444,6 +450,7 @@ async function describeTree(args: {
   maxDirectories: number;
   maxTotalBytes: number;
   expectedRoot?: DirectoryIdentity;
+  requireSingleLink?: boolean;
 }): Promise<StudyFileEvidence[]> {
   const rootBefore = await lstat(args.root);
   if (
@@ -463,6 +470,11 @@ async function describeTree(args: {
       description: args.description,
       maxBytes: args.maxTotalBytes,
     });
+    if (args.requireSingleLink && inspected.state.nlink !== 1) {
+      throw new Error(
+        `${args.description} files must not have hard-link aliases: ${path}`,
+      );
+    }
     totalBytes += inspected.evidence.size_bytes;
     if (totalBytes > args.maxTotalBytes) {
       throw new Error(
@@ -539,6 +551,55 @@ export async function verifyStudyImplementation(args: {
   }
 }
 
+export async function verifyStudyImplementationSnapshot(args: {
+  trialDirectory: string;
+  manifest: StudyImplementationManifest;
+  reference: StudyImplementationReference;
+  requireSingleLink?: boolean;
+}): Promise<void> {
+  const manifestText = jsonText(args.manifest);
+  const expectedReference: StudyImplementationReference = {
+    manifest: "implementation/manifest.json",
+    sha256: sha256(manifestText),
+    file_count: args.manifest.files.length,
+    evidence: args.manifest.evidence,
+  };
+  if (JSON.stringify(args.reference) !== JSON.stringify(expectedReference)) {
+    throw new Error("Study implementation reference does not match its manifest");
+  }
+
+  const implementationRoot = join(args.trialDirectory, "implementation");
+  const actual = await describeTree({
+    root: implementationRoot,
+    description: "study implementation snapshot",
+    maxFiles: args.manifest.files.length + 1,
+    maxDirectories: MAX_IMPLEMENTATION_DIRECTORIES,
+    maxTotalBytes: (
+      MAX_SOURCE_TOTAL_BYTES
+      + MAX_DEPENDENCY_TOTAL_BYTES
+      + 1024 * 1024
+    ),
+    requireSingleLink: args.requireSingleLink,
+  });
+  const expected = [
+    {
+      path: "manifest.json",
+      size_bytes: Buffer.byteLength(manifestText),
+      sha256: sha256(manifestText),
+    },
+    ...args.manifest.files.map((file) => ({
+      path: file.snapshot_path.replace(/^implementation\//, ""),
+      size_bytes: file.size_bytes,
+      sha256: file.sha256,
+    })),
+  ].sort((left, right) => (
+    left.path < right.path ? -1 : left.path > right.path ? 1 : 0
+  ));
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error("Study implementation snapshot does not match its manifest");
+  }
+}
+
 export async function captureDirectoryIdentity(path: string): Promise<DirectoryIdentity> {
   const metadata = await lstat(path);
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
@@ -562,14 +623,12 @@ export async function verifyDirectoryIdentity(args: {
   }
 }
 
-export async function writeStudyModelManifest(args: {
-  trialDirectory: string;
+export async function inspectStudyModel(args: {
   modelDirectory: string;
-  expectedRoot: DirectoryIdentity;
-}): Promise<{
-  manifest: StudyModelManifest;
-  reference: StudyModelReference;
-}> {
+  expectedRoot?: DirectoryIdentity;
+  requireNonempty?: boolean;
+  requireSingleLink?: boolean;
+}): Promise<InspectedStudyModel> {
   const files = await describeTree({
     root: args.modelDirectory,
     description: "study model artifacts",
@@ -577,7 +636,11 @@ export async function writeStudyModelManifest(args: {
     maxDirectories: MAX_MODEL_DIRECTORIES,
     maxTotalBytes: MAX_MODEL_TOTAL_BYTES,
     expectedRoot: args.expectedRoot,
+    requireSingleLink: args.requireSingleLink,
   });
+  if (args.requireNonempty && files.length === 0) {
+    throw new Error("Study model artifacts must contain at least one file");
+  }
   const manifest: StudyModelManifest = {
     schema_version: 1,
     directory: "model",
@@ -586,14 +649,36 @@ export async function writeStudyModelManifest(args: {
     files,
   };
   const text = jsonText(manifest);
-  await writeFileAtomic(join(args.trialDirectory, "model-manifest.json"), text);
   return {
     manifest,
+    text,
     reference: {
       manifest: "model-manifest.json",
       sha256: sha256(text),
       file_count: manifest.file_count,
       size_bytes: manifest.size_bytes,
     },
+  };
+}
+
+export async function writeStudyModelManifest(args: {
+  trialDirectory: string;
+  modelDirectory: string;
+  expectedRoot: DirectoryIdentity;
+}): Promise<{
+  manifest: StudyModelManifest;
+  reference: StudyModelReference;
+}> {
+  const inspected = await inspectStudyModel({
+    modelDirectory: args.modelDirectory,
+    expectedRoot: args.expectedRoot,
+  });
+  await writeFileAtomic(
+    join(args.trialDirectory, "model-manifest.json"),
+    inspected.text,
+  );
+  return {
+    manifest: inspected.manifest,
+    reference: inspected.reference,
   };
 }

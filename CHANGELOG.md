@@ -26,6 +26,10 @@ All notable changes to TT Local will be documented in this file.
 - Added optional temporal Study certification for strict UTC event and label
   windows, declared horizon-and-embargo purge boundaries, deterministic lock
   evidence, and trial-report provenance.
+- Added explicit write-once Study candidate promotion for the bundled numeric
+  logistic-regression runner. Promotion copies the fitted model and locked
+  predictor, strictly revalidates their provenance, and replay-checks
+  label-free validation probabilities before publishing a candidate lock.
 
 ### Changed
 

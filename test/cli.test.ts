@@ -98,6 +98,7 @@ test("command and nested-command help never execute work", async () => {
       { args: ["runs", "report", "--help"], usage: "tt-local runs report" },
       { args: ["models", "--help"], usage: "tt-local models <command>" },
       { args: ["studies", "run", "--help"], usage: "tt-local studies run" },
+      { args: ["studies", "promote", "--help"], usage: "tt-local studies promote" },
       { args: ["studies", "validate", "--help"], usage: "tt-local studies validate" },
       { args: ["studies", "--help"], usage: "tt-local studies <command>" },
     ];

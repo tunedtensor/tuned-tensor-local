@@ -347,6 +347,37 @@ parameters: those values are persisted in inputs, reports, logs, and CLI
 output. Declared source and lock files are also copied into the trial
 directory, so they must not contain credentials or other secrets.
 
+Once you have deliberately selected one bundled logistic-regression trial,
+freeze it as the Study candidate:
+
+```bash
+tt-local studies promote portfolio.study.json logreg-c1-v1.trial.json
+```
+
+If the trial used `--output-root`, point promotion at its artifacts with
+`--trial-directory`. Promotion revalidates the benchmark, trial report,
+projected data, implementation snapshot, fitted-model manifests, and saved
+runner metadata before it creates anything. It then copies the model, original
+implementation manifest, predictor source, and dependency lock into
+`.tt-local/study-candidates/<study-file>/`. Replay uses the installed bundled
+predictor only after proving its source and lock are byte-identical to the
+frozen copies and consistent with the manifest, then loads the copied model
+against the label-free validation projection. The final directory and
+`candidate.lock.json` appear only when
+the probabilities reproduce the selected trial within `1e-12`. Failed
+attempts clean up their private staging directory. The source and promoted
+model files are separate files, not hard links.
+
+Candidate selection is explicit and write-once per Study file; there is no
+automatic “pick the best” step or `--force` option. This first promotion
+contract supports only
+`builtin:numeric_logistic_regression`. Command-backed trials need a separate
+versioned saved-model prediction contract before they can be promoted safely.
+Promotion still uses validation data and does not score or expose the held-out
+test split. “Write-once” is a local workflow protocol, not host-level sealing:
+the same operating-system user can still alter or delete the candidate
+directory.
+
 ## First Local Run
 
 On an NVIDIA Spark or another CUDA host, initialize both the behavior spec and
