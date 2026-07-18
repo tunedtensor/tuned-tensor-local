@@ -22,6 +22,17 @@ import {
   type BinaryScoredRow,
 } from "./study-metrics.js";
 import {
+  captureDirectoryIdentity,
+  captureStudyImplementation,
+  prepareStudyImplementation,
+  verifyStudyImplementation,
+  verifyDirectoryIdentity,
+  writeStudyModelManifest,
+  type StudyImplementationInputFile,
+  type StudyImplementationReference,
+  type StudyModelReference,
+} from "./study-provenance.js";
+import {
   loadStudySpec,
   validateStudyBenchmark,
   type BinaryClassificationStudyTask,
@@ -36,6 +47,9 @@ const NUMERIC_LOGISTIC_REGRESSION_SCRIPT = join(
   packageRoot,
   "training/study-runner/numeric_logistic_regression.py",
 );
+const NUMERIC_LOGISTIC_REGRESSION_LOCK = `${NUMERIC_LOGISTIC_REGRESSION_SCRIPT}.lock`;
+const NUMERIC_LOGISTIC_REGRESSION_LOGICAL_PATH =
+  "training/study-runner/numeric_logistic_regression.py";
 
 export type StudyTrialJsonValue =
   | string
@@ -71,6 +85,46 @@ const relativeWorkingDirectorySchema = exactStringSchema.refine(
   { message: "must be a portable relative local path" },
 );
 const studyTrialTimeoutSchema = z.number().int().min(1_000).max(86_400_000);
+const MAX_PROVENANCE_PATH_SEGMENTS = 64;
+const provenanceFilePathSchema = exactStringSchema.refine(
+  (value) => {
+    if (
+      isAbsolute(value)
+      || value.includes("\\")
+      || /^[a-zA-Z]:[\\/]/.test(value)
+      || /^[a-z][a-z0-9+.-]*:/i.test(value)
+    ) {
+      return false;
+    }
+    const segments = value.split("/");
+    return segments.length <= MAX_PROVENANCE_PATH_SEGMENTS
+      && segments.every((segment) => (
+      segment.length > 0 && segment !== "." && segment !== ".."
+      ));
+  },
+  { message: "must be a portable descendant file path" },
+);
+const studyTrialCommandProvenanceSchema = z.object({
+  source_files: z.array(provenanceFilePathSchema).min(1).max(256),
+  dependency_lock_files: z.array(provenanceFilePathSchema).max(32),
+}).strict().superRefine((provenance, context) => {
+  const seen = new Set<string>();
+  for (const [field, paths] of [
+    ["source_files", provenance.source_files],
+    ["dependency_lock_files", provenance.dependency_lock_files],
+  ] as const) {
+    for (const [index, path] of paths.entries()) {
+      if (seen.has(path)) {
+        context.addIssue({
+          code: "custom",
+          path: [field, index],
+          message: "must not duplicate or overlap another provenance path",
+        });
+      }
+      seen.add(path);
+    }
+  }
+});
 
 const studyTrialCommandRunnerSchema = z.object({
   command: z.array(exactStringSchema).min(1).refine(
@@ -86,6 +140,7 @@ const studyTrialCommandRunnerSchema = z.object({
   ),
   cwd: relativeWorkingDirectorySchema.optional(),
   timeout_ms: studyTrialTimeoutSchema,
+  provenance: studyTrialCommandProvenanceSchema,
 }).strict();
 
 const studyTrialBuiltinRunnerSchema = z.object({
@@ -174,6 +229,10 @@ export interface StudyTrialReport {
     prediction_count: number;
     predictions_sha256: string;
   };
+  provenance: {
+    implementation: StudyImplementationReference;
+    model: StudyModelReference;
+  };
   execution: {
     command: string[];
     cwd: string;
@@ -194,6 +253,49 @@ export interface StudyTrialRunnerCommand {
   baseArgs: string[];
   reportCommand: string[];
   requiredFiles: string[];
+}
+
+function studyImplementationInput(
+  trial: LoadedTrialSpec,
+): {
+  evidence: "bundled_locked" | "declared_files";
+  files: StudyImplementationInputFile[];
+} {
+  if ("builtin" in trial.spec.runner) {
+    return {
+      evidence: "bundled_locked",
+      files: [
+        {
+          role: "source",
+          path: NUMERIC_LOGISTIC_REGRESSION_LOGICAL_PATH,
+          absolutePath: NUMERIC_LOGISTIC_REGRESSION_SCRIPT,
+        },
+        {
+          role: "dependency_lock",
+          path: `${NUMERIC_LOGISTIC_REGRESSION_LOGICAL_PATH}.lock`,
+          absolutePath: NUMERIC_LOGISTIC_REGRESSION_LOCK,
+        },
+      ],
+    };
+  }
+  const trialDirectory = dirname(trial.path);
+  return {
+    evidence: "declared_files",
+    files: [
+      ...trial.spec.runner.provenance.source_files.map((path) => ({
+        role: "source" as const,
+        path,
+        absolutePath: resolve(trialDirectory, path),
+        rootPath: trialDirectory,
+      })),
+      ...trial.spec.runner.provenance.dependency_lock_files.map((path) => ({
+        role: "dependency_lock" as const,
+        path,
+        absolutePath: resolve(trialDirectory, path),
+        rootPath: trialDirectory,
+      })),
+    ],
+  };
 }
 
 interface ParsedStudySplit {
@@ -269,7 +371,10 @@ async function readStableRegularFile(args: {
 }): Promise<Uint8Array> {
   let handle: Awaited<ReturnType<typeof open>>;
   try {
-    handle = await open(args.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await open(
+      args.path,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
   } catch (error) {
     if (
       (error as NodeJS.ErrnoException).code === "ELOOP"
@@ -473,7 +578,7 @@ export function buildStudyTrialRunnerCommand(
       reportCommand: [`builtin:${runner.builtin}`],
       requiredFiles: [
         NUMERIC_LOGISTIC_REGRESSION_SCRIPT,
-        `${NUMERIC_LOGISTIC_REGRESSION_SCRIPT}.lock`,
+        NUMERIC_LOGISTIC_REGRESSION_LOCK,
       ],
     };
   }
@@ -625,6 +730,9 @@ export async function runStudyTrial(args: {
   await Promise.all(runnerCommand.requiredFiles.map((path) => (
     assertRegularFile(path, "bundled study trial runtime")
   )));
+  const preparedImplementation = await prepareStudyImplementation(
+    studyImplementationInput(loadedTrial),
+  );
   const configuredCwd = "cwd" in loadedTrial.spec.runner
     ? loadedTrial.spec.runner.cwd
     : undefined;
@@ -639,6 +747,8 @@ export async function runStudyTrial(args: {
     args.outputRoot ?? defaultStudyTrialOutputRoot(loadedStudy.path),
   );
   const trialDirectory = await claimTrialDirectory(outputRoot, loadedTrial.spec.id);
+  const outputRootIdentity = await captureDirectoryIdentity(outputRoot);
+  const trialDirectoryIdentity = await captureDirectoryIdentity(trialDirectory);
   const trainingPath = join(trialDirectory, "training.csv");
   const validationPath = join(trialDirectory, "validation.csv");
   const inputPath = join(trialDirectory, "trial-input.json");
@@ -647,6 +757,11 @@ export async function runStudyTrial(args: {
   const logPath = join(trialDirectory, "trial.log");
   const reportPath = join(trialDirectory, "trial-report.json");
   await mkdir(artifactDirectory, { mode: 0o700 });
+  const modelDirectoryIdentity = await captureDirectoryIdentity(artifactDirectory);
+  const capturedImplementation = await captureStudyImplementation({
+    trialDirectory,
+    prepared: preparedImplementation,
+  });
   await Promise.all([
     writeFile(trainingPath, prepared.trainingCsv, { encoding: "utf8", mode: 0o400, flag: "wx" }),
     writeFile(validationPath, prepared.validationCsv, { encoding: "utf8", mode: 0o400, flag: "wx" }),
@@ -698,6 +813,22 @@ export async function runStudyTrial(args: {
       `Study trial "${loadedTrial.spec.id}" exited with code ${result.exitCode}; see ${logPath}`,
     );
   }
+  await Promise.all([
+    verifyDirectoryIdentity({
+      path: outputRoot,
+      expected: outputRootIdentity,
+      description: "Study trial output root",
+    }),
+    verifyDirectoryIdentity({
+      path: trialDirectory,
+      expected: trialDirectoryIdentity,
+      description: "Study trial directory",
+    }),
+  ]);
+  await verifyStudyImplementation({
+    trialDirectory,
+    captured: capturedImplementation,
+  });
 
   const [trainingAfter, validationAfter] = await Promise.all([
     readStableRegularFile({
@@ -724,6 +855,16 @@ export async function runStudyTrial(args: {
     prepared.validationLabels,
   );
   const metrics = computeBinaryClassificationMetrics(parsedPredictions.rows);
+  await verifyDirectoryIdentity({
+    path: trialDirectory,
+    expected: trialDirectoryIdentity,
+    description: "Study trial directory",
+  });
+  const modelProvenance = await writeStudyModelManifest({
+    trialDirectory,
+    modelDirectory: artifactDirectory,
+    expectedRoot: modelDirectoryIdentity,
+  });
   const report: StudyTrialReport = {
     schema_version: 1,
     protocol_version: STUDY_TRIAL_PROTOCOL_VERSION,
@@ -760,6 +901,10 @@ export async function runStudyTrial(args: {
       prediction_count: parsedPredictions.rows.length,
       predictions_sha256: sha256(parsedPredictions.bytes),
     },
+    provenance: {
+      implementation: capturedImplementation.reference,
+      model: modelProvenance.reference,
+    },
     execution: {
       command: runnerCommand.reportCommand,
       cwd: configuredCwd ?? "<trial-directory>",
@@ -769,6 +914,18 @@ export async function runStudyTrial(args: {
       artifact_directory: "model",
     },
   };
+  await Promise.all([
+    verifyDirectoryIdentity({
+      path: outputRoot,
+      expected: outputRootIdentity,
+      description: "Study trial output root",
+    }),
+    verifyDirectoryIdentity({
+      path: trialDirectory,
+      expected: trialDirectoryIdentity,
+      description: "Study trial directory",
+    }),
+  ]);
   await writeJsonAtomic(reportPath, report);
   return { trialDirectory, reportPath, report };
 }

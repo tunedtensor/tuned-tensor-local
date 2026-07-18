@@ -20,6 +20,9 @@ All notable changes to TT Local will be documented in this file.
 - Added a bundled numeric logistic-regression Study runner with median
   imputation, missingness indicators, feature scaling, strict parameters, a
   small isolated locked scikit-learn runtime, and hashed model artifacts.
+- Added deterministic Study trial provenance for declared runner source,
+  dependency locks, immutable implementation snapshots, and independently
+  inventoried model artifacts.
 
 ### Changed
 

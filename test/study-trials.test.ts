@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 import {
   buildStudyTrialRunnerCommand,
@@ -17,6 +20,10 @@ import {
   type StudyTrialSpec,
 } from "../src/study-trials.js";
 import { writeStudyBenchmarkLock } from "../src/studies.js";
+
+function sha256(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
+}
 
 interface TrialFixture {
   root: string;
@@ -91,6 +98,10 @@ async function withTrialFixture(
           command: [process.execPath, scriptPath],
           cwd: ".",
           timeout_ms: 10_000,
+          provenance: {
+            source_files: [`trial-runner-${scriptNumber}.mjs`],
+            dependency_lock_files: [],
+          },
           ...overrides,
         },
         parameters: { regularization: 0.25 },
@@ -155,6 +166,61 @@ test("runs a label-blind command trial and computes trusted validation metrics",
       await readFile(join(result.trialDirectory, "model", "model.txt"), "utf8"),
       "trained",
     );
+    const implementationManifestText = await readFile(
+      join(result.trialDirectory, "implementation", "manifest.json"),
+      "utf8",
+    );
+    assert.equal(
+      result.report.provenance.implementation.sha256,
+      sha256(implementationManifestText),
+    );
+    assert.equal(
+      result.report.provenance.implementation.evidence,
+      "declared_files",
+    );
+    assert.equal(result.report.provenance.implementation.file_count, 1);
+    const implementationManifest = JSON.parse(implementationManifestText) as {
+      evidence: string;
+      files: Array<{
+        role: string;
+        path: string;
+        snapshot_path: string;
+        sha256: string;
+      }>;
+    };
+    assert.equal(implementationManifest.evidence, "declared_files");
+    assert.deepEqual(
+      implementationManifest.files.map((file) => ({
+        role: file.role,
+        path: file.path,
+        snapshot_path: file.snapshot_path,
+      })),
+      [{
+        role: "source",
+        path: "trial-runner-1.mjs",
+        snapshot_path: "implementation/source/trial-runner-1.mjs",
+      }],
+    );
+    assert.equal(
+      await readFile(
+        join(result.trialDirectory, "implementation", "source", "trial-runner-1.mjs"),
+        "utf8",
+      ),
+      validRunner,
+    );
+    assert.equal(implementationManifest.files[0]!.sha256, sha256(validRunner));
+
+    const modelManifestText = await readFile(
+      join(result.trialDirectory, "model-manifest.json"),
+      "utf8",
+    );
+    assert.equal(result.report.provenance.model.sha256, sha256(modelManifestText));
+    assert.equal(result.report.provenance.model.file_count, 1);
+    assert.equal(result.report.provenance.model.size_bytes, 7);
+    assert.deepEqual(
+      (JSON.parse(modelManifestText) as { files: unknown[] }).files,
+      [{ path: "model.txt", size_bytes: 7, sha256: sha256("trained") }],
+    );
 
     const validation = await readFile(join(result.trialDirectory, "validation.csv"), "utf8");
     assert.equal(validation.includes("big_move"), false);
@@ -196,6 +262,10 @@ test("defaults to the trial directory and reserves protocol-owned command flags"
     runner: {
       command: ["python3", "runner.py", "--output"],
       timeout_ms: 10_000,
+      provenance: {
+        source_files: ["runner.py"],
+        dependency_lock_files: [],
+      },
     },
     parameters: {},
   }), /reserved by the trial protocol/);
@@ -206,6 +276,10 @@ test("defaults to the trial directory and reserves protocol-owned command flags"
     runner: {
       command: ["python3", "runner.py", "--output=elsewhere.json"],
       timeout_ms: 10_000,
+      provenance: {
+        source_files: ["runner.py"],
+        dependency_lock_files: [],
+      },
     },
     parameters: {},
   }), /reserved by the trial protocol/);
@@ -216,8 +290,61 @@ test("defaults to the trial directory and reserves protocol-owned command flags"
     runner: {
       command: ["python3", "runner.py"],
       timeout_ms: 10_000,
+      provenance: {
+        source_files: ["runner.py"],
+        dependency_lock_files: [],
+      },
     },
     parameters: { learning_rate: Number.POSITIVE_INFINITY },
+  }).success, false);
+  const commandTrial = {
+    schema_version: 1,
+    id: "provenance",
+    name: "Command provenance",
+    runner: {
+      command: ["python3", "runner.py"],
+      timeout_ms: 10_000,
+      provenance: {
+        source_files: ["runner.py"],
+        dependency_lock_files: ["uv.lock"],
+      },
+    },
+    parameters: {},
+  };
+  assert.equal(studyTrialSpecSchema.safeParse({
+    ...commandTrial,
+    runner: {
+      command: ["python3", "runner.py"],
+      timeout_ms: 10_000,
+    },
+  }).success, false);
+  for (const sourcePath of [
+    "../runner.py",
+    "/tmp/runner.py",
+    "file://runner.py",
+    "scripts\\runner.py",
+    "scripts//runner.py",
+  ]) {
+    assert.equal(studyTrialSpecSchema.safeParse({
+      ...commandTrial,
+      runner: {
+        ...commandTrial.runner,
+        provenance: {
+          ...commandTrial.runner.provenance,
+          source_files: [sourcePath],
+        },
+      },
+    }).success, false);
+  }
+  assert.equal(studyTrialSpecSchema.safeParse({
+    ...commandTrial,
+    runner: {
+      ...commandTrial.runner,
+      provenance: {
+        source_files: ["runner.py"],
+        dependency_lock_files: ["runner.py"],
+      },
+    },
   }).success, false);
 });
 
@@ -342,6 +469,44 @@ test("runs the bundled numeric logistic-regression trial deterministically", asy
       ["builtin:numeric_logistic_regression"],
     );
     assert.equal(
+      first.report.provenance.implementation.sha256,
+      second.report.provenance.implementation.sha256,
+    );
+    assert.equal(
+      first.report.provenance.implementation.evidence,
+      "bundled_locked",
+    );
+    assert.equal(first.report.provenance.implementation.file_count, 2);
+    const implementationManifest = JSON.parse(
+      await readFile(
+        join(first.trialDirectory, "implementation", "manifest.json"),
+        "utf8",
+      ),
+    ) as {
+      evidence: string;
+      files: Array<{ role: string; path: string; snapshot_path: string }>;
+    };
+    assert.equal(implementationManifest.evidence, "bundled_locked");
+    assert.deepEqual(
+      implementationManifest.files.map((file) => ({
+        role: file.role,
+        path: file.path,
+      })),
+      [
+        {
+          role: "source",
+          path: "training/study-runner/numeric_logistic_regression.py",
+        },
+        {
+          role: "dependency_lock",
+          path: "training/study-runner/numeric_logistic_regression.py.lock",
+        },
+      ],
+    );
+    for (const file of implementationManifest.files) {
+      assert.equal(existsSync(join(first.trialDirectory, file.snapshot_path)), true);
+    }
+    assert.equal(
       first.report.evaluation.predictions_sha256,
       second.report.evaluation.predictions_sha256,
     );
@@ -386,6 +551,15 @@ test("runs the bundled numeric logistic-regression trial deterministically", asy
     );
     assert.match(manifest.model.sha256, /^[0-9a-f]{64}$/);
     assert.ok(manifest.model.size_bytes > 0);
+    const modelManifest = JSON.parse(
+      await readFile(join(first.trialDirectory, "model-manifest.json"), "utf8"),
+    ) as { files: Array<{ path: string }> };
+    assert.deepEqual(
+      modelManifest.files.map((file) => file.path),
+      ["model.joblib", "runner-manifest.json"],
+    );
+    assert.equal(first.report.provenance.model.file_count, 2);
+    assert.ok(first.report.provenance.model.size_bytes > 0);
   });
 });
 
@@ -495,6 +669,334 @@ test("bundled numeric trials fail clearly on invalid parameters and features", a
   });
 });
 
+test("implementation provenance fails before launch or report publication on drift", async () => {
+  await withTrialFixture(async ({ root, studyPath, outputRoot, writeTrial }) => {
+    const missingSource = await writeTrial(
+      "missing-source",
+      validRunner,
+      {
+        provenance: {
+          source_files: ["missing-runner.mjs"],
+          dependency_lock_files: [],
+        },
+      },
+    );
+    await assert.rejects(
+      runStudyTrial({ studyPath, trialPath: missingSource, outputRoot }),
+      /implementation source must be a readable regular, non-symbolic file/i,
+    );
+    assert.equal(existsSync(join(outputRoot, "missing-source")), false);
+
+    const outsideDirectory = join(root, "outside-source");
+    await mkdir(outsideDirectory);
+    await writeFile(join(outsideDirectory, "runner.mjs"), validRunner, "utf8");
+    await symlink(outsideDirectory, join(root, "linked-source"), "dir");
+    const linkedSource = await writeTrial(
+      "linked-source",
+      validRunner,
+      {
+        provenance: {
+          source_files: ["linked-source/runner.mjs"],
+          dependency_lock_files: [],
+        },
+      },
+    );
+    await assert.rejects(
+      runStudyTrial({ studyPath, trialPath: linkedSource, outputRoot }),
+      /provenance paths must not contain symbolic links/i,
+    );
+    assert.equal(existsSync(join(outputRoot, "linked-source")), false);
+
+    if (process.platform !== "win32") {
+      const fifoPath = join(root, "runner.fifo");
+      execFileSync("mkfifo", [fifoPath]);
+      const fifoSource = await writeTrial(
+        "fifo-source",
+        validRunner,
+        {
+          provenance: {
+            source_files: ["runner.fifo"],
+            dependency_lock_files: [],
+          },
+        },
+      );
+      await assert.rejects(
+        runStudyTrial({ studyPath, trialPath: fifoSource, outputRoot }),
+        /implementation source must be a regular file/i,
+      );
+      assert.equal(existsSync(join(outputRoot, "fifo-source")), false);
+    }
+
+    const sourceDrift = await writeTrial("source-drift", `
+      import { writeFileSync } from "node:fs";
+      const output = process.argv[process.argv.indexOf("--output") + 1];
+      writeFileSync(output, JSON.stringify({
+        protocol_version: 1,
+        predictions: [
+          { id: "validation-1", probability: 0.1 },
+          { id: "validation-2", probability: 0.9 }
+        ]
+      }));
+      writeFileSync(new URL(import.meta.url), "mutated");
+    `);
+    await assert.rejects(
+      runStudyTrial({ studyPath, trialPath: sourceDrift, outputRoot }),
+      /implementation .* changed after provenance capture/i,
+    );
+    assert.equal(
+      existsSync(join(outputRoot, "source-drift", "trial-report.json")),
+      false,
+    );
+
+    const dependencyPath = join(root, "dependencies.lock");
+    await writeFile(dependencyPath, "version=1\n", "utf8");
+    const dependencyDrift = await writeTrial("dependency-drift", `
+      import { writeFileSync } from "node:fs";
+      const output = process.argv[process.argv.indexOf("--output") + 1];
+      writeFileSync(output, JSON.stringify({
+        protocol_version: 1,
+        predictions: [
+          { id: "validation-1", probability: 0.1 },
+          { id: "validation-2", probability: 0.9 }
+        ]
+      }));
+      writeFileSync(${JSON.stringify(dependencyPath)}, "version=2\\n");
+    `);
+    const dependencyTrial = JSON.parse(
+      await readFile(dependencyDrift, "utf8"),
+    ) as {
+      runner: {
+        command: string[];
+        provenance: {
+          source_files: string[];
+          dependency_lock_files: string[];
+        };
+      };
+    };
+    dependencyTrial.runner.provenance = {
+      source_files: [basename(dependencyTrial.runner.command[1]!)],
+      dependency_lock_files: ["dependencies.lock"],
+    };
+    await writeFile(
+      dependencyDrift,
+      `${JSON.stringify(dependencyTrial, null, 2)}\n`,
+      "utf8",
+    );
+    await assert.rejects(
+      runStudyTrial({ studyPath, trialPath: dependencyDrift, outputRoot }),
+      /implementation dependencies\.lock changed after provenance capture/i,
+    );
+    assert.equal(
+      existsSync(join(outputRoot, "dependency-drift", "trial-report.json")),
+      false,
+    );
+    assert.equal(
+      await readFile(
+        join(
+          outputRoot,
+          "dependency-drift",
+          "implementation",
+          "dependency-lock",
+          "dependencies.lock",
+        ),
+        "utf8",
+      ),
+      "version=1\n",
+    );
+
+    const snapshotDrift = await writeTrial("snapshot-drift", `
+      import { chmodSync, writeFileSync } from "node:fs";
+      import { basename, dirname, join } from "node:path";
+      import { fileURLToPath } from "node:url";
+      const value = (name) => process.argv[process.argv.indexOf(name) + 1];
+      writeFileSync(value("--output"), JSON.stringify({
+        protocol_version: 1,
+        predictions: [
+          { id: "validation-1", probability: 0.1 },
+          { id: "validation-2", probability: 0.9 }
+        ]
+      }));
+      const trialDirectory = dirname(value("--artifact-dir"));
+      const sourceName = basename(fileURLToPath(import.meta.url));
+      const snapshot = join(
+        trialDirectory,
+        "implementation",
+        "source",
+        sourceName
+      );
+      chmodSync(snapshot, 0o600);
+      writeFileSync(snapshot, "tampered");
+    `);
+    await assert.rejects(
+      runStudyTrial({ studyPath, trialPath: snapshotDrift, outputRoot }),
+      /implementation snapshot changed during trial execution/i,
+    );
+    assert.equal(
+      existsSync(join(outputRoot, "snapshot-drift", "trial-report.json")),
+      false,
+    );
+  });
+});
+
+test("manifests nested and empty model trees and rejects symbolic links", async () => {
+  await withTrialFixture(async ({ studyPath, outputRoot, writeTrial }) => {
+    const nested = await writeTrial("nested-model", `
+      import { linkSync, mkdirSync, writeFileSync } from "node:fs";
+      import { join } from "node:path";
+      const value = (name) => process.argv[process.argv.indexOf(name) + 1];
+      const model = value("--artifact-dir");
+      mkdirSync(join(model, "nested"));
+      writeFileSync(join(model, "z.txt"), "last");
+      writeFileSync(join(model, "nested", "a.txt"), "first");
+      linkSync(join(model, "z.txt"), join(model, "nested", "z-link.txt"));
+      writeFileSync(value("--output"), JSON.stringify({
+        protocol_version: 1,
+        predictions: [
+          { id: "validation-1", probability: 0.1 },
+          { id: "validation-2", probability: 0.9 }
+        ]
+      }));
+    `);
+    const nestedResult = await runStudyTrial({
+      studyPath,
+      trialPath: nested,
+      outputRoot,
+    });
+    const nestedManifest = JSON.parse(
+      await readFile(join(nestedResult.trialDirectory, "model-manifest.json"), "utf8"),
+    ) as { files: Array<{ path: string }>; file_count: number; size_bytes: number };
+    assert.deepEqual(
+      nestedManifest.files.map((file) => file.path),
+      ["nested/a.txt", "nested/z-link.txt", "z.txt"],
+    );
+    assert.equal(nestedManifest.file_count, 3);
+    assert.equal(nestedManifest.size_bytes, 13);
+
+    const empty = await writeTrial("empty-model", `
+      import { writeFileSync } from "node:fs";
+      const output = process.argv[process.argv.indexOf("--output") + 1];
+      writeFileSync(output, JSON.stringify({
+        protocol_version: 1,
+        predictions: [
+          { id: "validation-1", probability: 0.1 },
+          { id: "validation-2", probability: 0.9 }
+        ]
+      }));
+    `);
+    const emptyResult = await runStudyTrial({
+      studyPath,
+      trialPath: empty,
+      outputRoot,
+    });
+    assert.deepEqual(emptyResult.report.provenance.model, {
+      manifest: "model-manifest.json",
+      sha256: emptyResult.report.provenance.model.sha256,
+      file_count: 0,
+      size_bytes: 0,
+    });
+
+    const symbolic = await writeTrial("symbolic-model", `
+      import { symlinkSync, writeFileSync } from "node:fs";
+      import { join } from "node:path";
+      const value = (name) => process.argv[process.argv.indexOf(name) + 1];
+      symlinkSync(value("--input"), join(value("--artifact-dir"), "linked-model"));
+      writeFileSync(value("--output"), JSON.stringify({
+        protocol_version: 1,
+        predictions: [
+          { id: "validation-1", probability: 0.1 },
+          { id: "validation-2", probability: 0.9 }
+        ]
+      }));
+    `);
+    await assert.rejects(
+      runStudyTrial({ studyPath, trialPath: symbolic, outputRoot }),
+      /model artifacts must not contain symbolic links/i,
+    );
+    assert.equal(
+      existsSync(join(outputRoot, "symbolic-model", "trial-report.json")),
+      false,
+    );
+
+    const deep = await writeTrial("deep-model", `
+      import { mkdirSync, writeFileSync } from "node:fs";
+      import { join } from "node:path";
+      const value = (name) => process.argv[process.argv.indexOf(name) + 1];
+      let directory = value("--artifact-dir");
+      for (let depth = 0; depth < 65; depth += 1) {
+        directory = join(directory, "d");
+        mkdirSync(directory);
+      }
+      writeFileSync(value("--output"), JSON.stringify({
+        protocol_version: 1,
+        predictions: [
+          { id: "validation-1", probability: 0.1 },
+          { id: "validation-2", probability: 0.9 }
+        ]
+      }));
+    `);
+    await assert.rejects(
+      runStudyTrial({ studyPath, trialPath: deep, outputRoot }),
+      /exceeds the 64-level depth limit/i,
+    );
+    assert.equal(
+      existsSync(join(outputRoot, "deep-model", "trial-report.json")),
+      false,
+    );
+  });
+});
+
+test("directory replacement cannot redirect report publication", async () => {
+  await withTrialFixture(async ({ studyPath, outputRoot, writeTrial }) => {
+    const modelReplacement = await writeTrial("replace-model", `
+      import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+      const value = (name) => process.argv[process.argv.indexOf(name) + 1];
+      const model = value("--artifact-dir");
+      renameSync(model, model + ".moved");
+      mkdirSync(model);
+      writeFileSync(value("--output"), JSON.stringify({
+        protocol_version: 1,
+        predictions: [
+          { id: "validation-1", probability: 0.1 },
+          { id: "validation-2", probability: 0.9 }
+        ]
+      }));
+    `);
+    await assert.rejects(
+      runStudyTrial({ studyPath, trialPath: modelReplacement, outputRoot }),
+      /model artifacts directory was replaced/i,
+    );
+    assert.equal(
+      existsSync(join(outputRoot, "replace-model", "trial-report.json")),
+      false,
+    );
+
+    const trialReplacement = await writeTrial("replace-trial", `
+      import { renameSync, symlinkSync, writeFileSync } from "node:fs";
+      import { dirname } from "node:path";
+      const value = (name) => process.argv[process.argv.indexOf(name) + 1];
+      const trial = dirname(value("--artifact-dir"));
+      const moved = trial + ".moved";
+      renameSync(trial, moved);
+      symlinkSync(moved, trial, "dir");
+      writeFileSync(value("--output"), JSON.stringify({
+        protocol_version: 1,
+        predictions: [
+          { id: "validation-1", probability: 0.1 },
+          { id: "validation-2", probability: 0.9 }
+        ]
+      }));
+    `);
+    await assert.rejects(
+      runStudyTrial({ studyPath, trialPath: trialReplacement, outputRoot }),
+      /trial directory was replaced during trial execution/i,
+    );
+    assert.equal(
+      existsSync(join(outputRoot, "replace-trial.moved", "trial-report.json")),
+      false,
+    );
+  });
+});
+
 test("rejects malformed, incomplete, forged, and non-regular prediction outputs", async () => {
   await withTrialFixture(async ({ studyPath, outputRoot, writeTrial }) => {
     const cases = [
@@ -580,6 +1082,18 @@ test("rejects malformed, incomplete, forged, and non-regular prediction outputs"
       runStudyTrial({ studyPath, trialPath: symlinkTrial, outputRoot }),
       /regular, non-symbolic file/,
     );
+
+    if (process.platform !== "win32") {
+      const fifoTrial = await writeTrial("fifo", `
+        import { execFileSync } from "node:child_process";
+        const output = process.argv[process.argv.indexOf("--output") + 1];
+        execFileSync("mkfifo", [output]);
+      `);
+      await assert.rejects(
+        runStudyTrial({ studyPath, trialPath: fifoTrial, outputRoot }),
+        /predictions must be a regular, non-symbolic file/i,
+      );
+    }
   });
 });
 

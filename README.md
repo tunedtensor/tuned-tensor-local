@@ -139,11 +139,12 @@ TT Local creates
 `.tt-local/study-trials/logreg-c1-v1/`, appends
 `--input <trial-input.json> --output <predictions.json> --artifact-dir <model>`
 to a command runner, and keeps the projected data, command log,
-predictions, model files, and `trial-report.json` together. Those three flags
-are reserved for command runners. A custom runner's `cwd` resolves from the
-trial-spec directory; when omitted, it starts in its new trial directory. A
-trial ID is write-once within the selected output root, including after a
-failed attempt, so use a new ID for each algorithm or parameter change.
+predictions, model files, implementation snapshot, deterministic provenance
+manifests, and `trial-report.json` together. Those three flags are reserved for
+command runners. A custom runner's `cwd` resolves from the trial-spec
+directory; when omitted, it starts in its new trial directory. A trial ID is
+write-once within the selected output root, including after a failed attempt,
+so use a new ID for each algorithm or parameter change.
 
 The runner input points to two CSVs. Training contains only the ID,
 allowlisted features, and a target normalized to `0` or `1`. Validation
@@ -155,9 +156,21 @@ For an algorithm that is not bundled, use a direct command runner instead:
 {
   "command": ["python3", "scripts/custom_trial.py"],
   "cwd": ".",
-  "timeout_ms": 300000
+  "timeout_ms": 300000,
+  "provenance": {
+    "source_files": ["scripts/custom_trial.py"],
+    "dependency_lock_files": ["uv.lock"]
+  }
 }
 ```
+
+Every command runner must declare at least one source file and may declare an
+empty dependency-lock list. These are exact portable paths relative to the
+trial-spec directory, independent of `cwd`; directories, globs, symbolic
+links, and paths outside that directory are rejected. TT Local snapshots the
+declared bytes before launch and refuses to publish a report if an original or
+snapshot changes during the trial. The bundled runner declares its packaged
+script and adjacent lock automatically.
 
 Parameters are caller-provided JSON: TT Local records and passes them, but a
 custom runner must validate and apply them. For example:
@@ -251,6 +264,20 @@ predictions:
     },
     "decision_threshold": 0.5,
     "predictions_sha256": "..."
+  },
+  "provenance": {
+    "implementation": {
+      "manifest": "implementation/manifest.json",
+      "sha256": "...",
+      "file_count": 2,
+      "evidence": "bundled_locked"
+    },
+    "model": {
+      "manifest": "model-manifest.json",
+      "sha256": "...",
+      "file_count": 2,
+      "size_bytes": 18432
+    }
   }
 }
 ```
@@ -269,12 +296,23 @@ the network. Test data is never scored by `studies run`, but remains readable
 at its original path. Repeated validation scores are also an adaptive oracle.
 Use this loop for algorithm development, not as a sealed test result.
 
-The report binds the exact benchmark snapshot checked before launch. A later
-source change is rejected by the next run. It does not hash runner source,
-dependencies, environment, or model contents yet, so use immutable code and a
-dependency lock for reproducible trials. Do not put secrets in command
-arguments, names, or parameters: those values are persisted in inputs,
-reports, logs, and CLI output.
+The report binds the exact benchmark snapshot checked before launch. Its
+`provenance` references `implementation/manifest.json`, which records and
+hashes the snapshotted source and dependency locks, and
+`model-manifest.json`, which independently inventories every regular file
+under `model/`. Model directories may be empty for generic command runners;
+symbolic links, special files, replacement of the model root, or files that
+change while being read prevent report publication.
+
+This evidence is deliberately narrower than a hermetic build attestation. TT
+Local does not capture the interpreter, operating system, environment, native
+libraries, or network inputs, and it cannot prove that a custom command
+actually used its declared dependency lock. Same-user code may also mutate and
+restore host files between checks. Use a locked command and immutable runtime
+when those factors matter. Do not put secrets in command arguments, names, or
+parameters: those values are persisted in inputs, reports, logs, and CLI
+output. Declared source and lock files are also copied into the trial
+directory, so they must not contain credentials or other secrets.
 
 ## First Local Run
 
