@@ -32,6 +32,10 @@ All notable changes to TT Local will be documented in this file.
   label-free validation probabilities before publishing a candidate lock.
 - Added optional, versioned prediction-time runtime evidence for the bundled
   runner's saved-model mode.
+- Added `tt-local studies test` for one-shot held-out evaluation of a promoted
+  bundled candidate. It uses a path-independent global claim, passes only
+  allowlisted label-free inputs to the frozen predictor, computes trusted
+  metrics, and publishes durable success or metric-free failure evidence.
 
 ### Changed
 

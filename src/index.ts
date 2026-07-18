@@ -39,6 +39,7 @@ import {
   writeStudyBenchmarkLock,
 } from "./studies.js";
 import { promoteStudyTrialCandidate } from "./study-candidates.js";
+import { runStudyTest } from "./study-tests.js";
 import { runStudyTrial } from "./study-trials.js";
 
 export * from "./compare.js";
@@ -57,7 +58,36 @@ export * from "./store.js";
 export * from "./study-metrics.js";
 export * from "./study-candidates.js";
 export * from "./study-trials.js";
-export * from "./studies.js";
+export {
+  binaryClassificationStudyTaskSchema,
+  buildStudyBenchmarkLock,
+  defaultStudyLockPath,
+  loadStudySpec,
+  studyBenchmarkLockSchema,
+  studySpecSchema,
+  validateStudyBenchmark,
+  writeStudyBenchmarkLock,
+  type BinaryClassificationStudyTask,
+  type StudyBenchmarkLock,
+  type StudySpec,
+  type StudySplitName,
+} from "./studies.js";
+export {
+  STUDY_TEST_PROTOCOL_VERSION,
+  defaultStudyTestClaimDirectory,
+  defaultStudyTestClaimRoot,
+  runStudyTest,
+  studyTestClaimId,
+  studyTestClaimIdentity,
+  studyTestClaimIdentitySchema,
+  studyTestFailureReceiptSchema,
+  studyTestReceiptSchema,
+  studyTestSuccessReceiptSchema,
+  type StudyTestClaimIdentity,
+  type StudyTestFailureReceipt,
+  type StudyTestReceipt,
+  type StudyTestSuccessReceipt,
+} from "./study-tests.js";
 
 export interface LocalRunnerInfo {
   name: "tuned-tensor-local";
@@ -159,7 +189,7 @@ Commands:
   runs list|get|events|watch|report|compare|cancel|reconcile [args] [--config local-runner.json]
   models list|get|verify|prefetch|verify-base|serve [args] [--config local-runner.json]
   specs list|get|import [args] [--config local-runner.json]
-  studies lock|validate|run|promote <study.json> [args]
+  studies lock|validate|run|promote|test <study.json> [args]
   store rebuild-index [--config local-runner.json]
 
 Global options:
@@ -371,7 +401,7 @@ const COMMAND_GROUPS: Record<string, CliCommandGroup> = {
     },
   },
   studies: {
-    description: "Lock benchmarks, run validation trials, and promote a fitted Study candidate.",
+    description: "Lock benchmarks, run validation trials, promote a fitted candidate, and run its one-shot held-out test.",
     subcommands: {
       lock: {
         usage: "tt-local studies lock <study.json> [options]",
@@ -415,6 +445,16 @@ const COMMAND_GROUPS: Record<string, CliCommandGroup> = {
         minPositionals: 2,
         maxPositionals: 2,
         missingPositionalsMessage: "studies promote requires <study.json> <trial.json>",
+      },
+      test: {
+        usage: "tt-local studies test <study.json> [--lock path]",
+        description: "Consume the globally claimed held-out split once and publish its durable test receipt.",
+        options: [
+          { name: "--lock", value: "path", description: "Benchmark lock path" },
+        ],
+        minPositionals: 1,
+        maxPositionals: 1,
+        missingPositionalsMessage: "studies test requires <study.json>",
       },
     },
   },
@@ -1324,6 +1364,21 @@ async function main(argv: string[]): Promise<void> {
         candidate_directory: result.candidateDirectory,
         candidate_lock_path: result.lockPath,
         candidate_lock: result.lock,
+      });
+    }
+    if (subcommand === "test") {
+      const result = await runStudyTest({
+        studyPath,
+        lockPath: readOption(argv, "--lock"),
+      });
+      return printJson({
+        ok: true,
+        status: "tested",
+        study_path: resolve(studyPath),
+        claim_directory: result.claimDirectory,
+        receipt_path: result.receiptPath,
+        evaluation: result.receipt.evaluation,
+        receipt: result.receipt,
       });
     }
     throw new Error(`Unknown studies command: ${subcommand}`);

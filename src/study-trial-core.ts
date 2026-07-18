@@ -210,6 +210,43 @@ export const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 export const probabilityMetricSchema = z.number().finite().min(0).max(1);
 export const nonnegativeIntegerSchema = z.number().int().nonnegative();
 export const positiveIntegerSchema = z.number().int().positive();
+export const bundledRunnerManifestSchema = z.object({
+  schema_version: z.literal(1),
+  runner: z.object({
+    name: z.literal("numeric_logistic_regression"),
+    version: z.literal(NUMERIC_LOGISTIC_REGRESSION_RUNNER_VERSION),
+  }).strict(),
+  parameters: numericLogisticRegressionParametersSchema,
+  pipeline: z.object({
+    imputer: z.object({
+      strategy: z.literal("median"),
+      add_indicator: z.literal(true),
+    }).strict(),
+    scaler: z.literal("standard"),
+    classifier: z.object({
+      name: z.literal("logistic_regression"),
+      solver: z.literal("liblinear"),
+      penalty: z.literal("l2"),
+      tolerance: z.literal(1e-4),
+    }).strict(),
+  }).strict(),
+  input_columns: z.array(exactStringSchema).min(1),
+  training: z.object({
+    row_count: positiveIntegerSchema,
+    class_counts: z.object({
+      negative: positiveIntegerSchema,
+      positive: positiveIntegerSchema,
+    }).strict(),
+    missing_counts: z.record(z.string(), nonnegativeIntegerSchema),
+    transformed_feature_count: positiveIntegerSchema,
+  }).strict(),
+  runtime: bundledRuntimeVersionsSchema,
+  model: z.object({
+    path: z.literal("model.joblib"),
+    sha256: sha256Schema,
+    size_bytes: positiveIntegerSchema,
+  }).strict(),
+}).strict();
 const temporalRangeSchema = z.object({
   min: exactStringSchema,
   max: exactStringSchema,
@@ -697,11 +734,10 @@ export function trialProtocolInput(args: {
   };
 }
 
-export async function parsePredictions(
+export async function readStudyTrialOutput(
   predictionPath: string,
-  validationLabels: readonly { id: string; positive: boolean }[],
   options: { requireSingleLink?: boolean } = {},
-): Promise<{ bytes: Uint8Array; rows: BinaryScoredRow[] }> {
+): Promise<{ bytes: Uint8Array; output: StudyTrialOutput }> {
   const bytes = await readStableRegularFile({
     path: predictionPath,
     description: "trial predictions",
@@ -719,32 +755,51 @@ export async function parsePredictions(
   if (!parsed.success) {
     throw new Error(`Invalid trial predictions: ${schemaError(parsed.error)}`);
   }
-  if (parsed.data.predictions.length !== validationLabels.length) {
+  return { bytes, output: parsed.data };
+}
+
+export async function parsePredictions(
+  predictionPath: string,
+  expectedLabels: readonly { id: string; positive: boolean }[],
+  options: {
+    requireSingleLink?: boolean;
+    splitDescription?: string;
+  } = {},
+): Promise<{ bytes: Uint8Array; rows: BinaryScoredRow[] }> {
+  const { bytes, output } = await readStudyTrialOutput(predictionPath, options);
+  const splitDescription = options.splitDescription ?? "validation";
+  if (output.predictions.length !== expectedLabels.length) {
     throw new Error(
-      `Trial returned ${parsed.data.predictions.length} predictions for `
-      + `${validationLabels.length} validation examples`,
+      `Trial returned ${output.predictions.length} predictions for `
+      + `${expectedLabels.length} ${splitDescription} examples`,
     );
   }
 
-  const expectedIds = new Set(validationLabels.map((row) => row.id));
+  const expectedIds = new Set(expectedLabels.map((row) => row.id));
   const probabilities = new Map<string, number>();
-  for (const prediction of parsed.data.predictions) {
+  for (const prediction of output.predictions) {
     if (!expectedIds.has(prediction.id)) {
-      throw new Error(`Trial returned unknown validation ID "${prediction.id}"`);
+      throw new Error(
+        `Trial returned unknown ${splitDescription} ID "${prediction.id}"`,
+      );
     }
     if (probabilities.has(prediction.id)) {
-      throw new Error(`Trial returned duplicate validation ID "${prediction.id}"`);
+      throw new Error(
+        `Trial returned duplicate ${splitDescription} ID "${prediction.id}"`,
+      );
     }
     probabilities.set(prediction.id, prediction.probability);
   }
 
-  const missing = validationLabels.find((row) => !probabilities.has(row.id));
+  const missing = expectedLabels.find((row) => !probabilities.has(row.id));
   if (missing) {
-    throw new Error(`Trial did not return validation ID "${missing.id}"`);
+    throw new Error(
+      `Trial did not return ${splitDescription} ID "${missing.id}"`,
+    );
   }
   return {
     bytes,
-    rows: validationLabels.map((row) => ({
+    rows: expectedLabels.map((row) => ({
       ...row,
       probability: probabilities.get(row.id)!,
     })),

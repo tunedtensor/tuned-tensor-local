@@ -173,9 +173,21 @@ files between checks, or repeatedly query aggregate validation scores.
 Declared lock evidence does not prove a custom command consumed that lock, and
 the interpreter, operating system, native libraries, environment, and network
 inputs are not captured. Names, parameters, and command arguments are
-persisted and must not contain secrets. Strong process isolation, runtime
-attestation, validation query budgets, entity-aware split certification, and
-one-shot sealed test evaluation remain separate future boundaries.
+persisted and must not contain secrets.
+
+For a promoted bundled candidate, `studies test` adds a local one-shot
+held-out workflow. It completes candidate and validation replay preflight
+before atomically claiming the path-independent test content and target
+semantics in a global `TT_LOCAL_HOME` ledger. After the claim, only a
+label-free projection reaches the frozen predictor; TT Local computes metrics
+and publishes either a success receipt or metric-free failure evidence. A
+crashed or incomplete claim remains consumed.
+
+The ledger is a reproducibility guard, not sealed evaluation: the same user
+can change the home path, delete the ledger, or read source data directly.
+Strong process isolation, externally controlled test custody, runtime
+attestation, validation query budgets, and entity-aware split certification
+remain separate future boundaries.
 
 ## Evaluation Loop
 

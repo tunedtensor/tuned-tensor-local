@@ -122,9 +122,10 @@ leakage-free. It does not prove complete sampling through the label horizon,
 label correctness, feature availability or causality, chronological row order
 inside a file, entity-group isolation, near-duplicate separation, cadence, or
 class balance beyond requiring both labels. Test rows and labels remain
-readable: the lock detects changes but does not seal the test set or stop trial
-code from accessing it. Establish those additional properties upstream and
-keep test data out of the trial loop until isolated evaluation is available.
+readable at their original path: neither the lock nor the one-shot test
+workflow seals a host file from code running as the same operating-system
+user. Establish those additional properties upstream and keep the test path
+operationally isolated from the iterative trial loop.
 
 Define one immutable algorithm attempt separately from the benchmark:
 
@@ -377,6 +378,41 @@ Promotion still uses validation data and does not score or expose the held-out
 test split. “Write-once” is a local workflow protocol, not host-level sealing:
 the same operating-system user can still alter or delete the candidate
 directory.
+
+After promotion, deliberately consume the held-out split once:
+
+```bash
+tt-local studies test portfolio.study.json
+```
+
+Before claiming the test, TT Local verifies the Study, benchmark lock,
+candidate, fitted model, frozen predictor, dependency lock, and a fresh
+label-free validation replay. A failed preflight is retryable and does not
+open or stat the test CSV.
+
+The command then atomically claims the locked test content and target semantics
+in the global `TT_LOCAL_HOME` ledger. The claim excludes the source path,
+feature selection, model, and metric, so renamed or copied Studies for the same
+prediction task share one claim and model variations cannot reopen it. A
+genuinely different target task in the same CSV has a separate identity. An
+existing successful, failed, incomplete, or crashed claim is permanently
+consumed. Once claimed, TT Local reads the test once, passes only the ID and
+allowlisted feature columns to the frozen predictor, and keeps labels in the
+trusted Node process for scoring.
+
+Success publishes a strict `receipt.json` as the final artifact. It binds the
+Study and benchmark hashes, candidate and model evidence, actual
+prediction-time runtime, label-free request, projected CSV, predictions,
+predictor log, and trusted AP, ROC AUC, and fixed-threshold F1 metrics. A
+post-claim error publishes a metric-free `failure-receipt.json` when possible;
+the claim-directory tombstone remains authoritative even after a crash.
+
+This is a reproducible workflow guard against accidental test reuse, not a
+confidentiality or adversarial sandbox. A user can change `TT_LOCAL_HOME`,
+delete local state, read the original test path, or modify local artifacts.
+Keep the source test data access-controlled outside TT Local when stronger
+isolation is required. The first one-shot contract supports only a promoted
+bundled numeric logistic-regression candidate.
 
 ## First Local Run
 

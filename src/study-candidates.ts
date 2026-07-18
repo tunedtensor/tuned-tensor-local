@@ -19,17 +19,15 @@ import {
   MAX_TRIAL_REPORT_BYTES,
   NUMERIC_LOGISTIC_REGRESSION_LOCK,
   NUMERIC_LOGISTIC_REGRESSION_LOGICAL_PATH,
-  NUMERIC_LOGISTIC_REGRESSION_RUNNER_VERSION,
   NUMERIC_LOGISTIC_REGRESSION_SCRIPT,
   STUDY_TRIAL_PROTOCOL_VERSION,
-  bundledRuntimeVersionsSchema,
+  bundledRunnerManifestSchema,
   canonicalJson,
   datasetIdSchema,
   defaultStudyTrialOutputRoot,
   exactStringSchema,
   loadStudyTrialSpec,
   nonnegativeIntegerSchema,
-  numericLogisticRegressionParametersSchema,
   parsePredictions,
   positiveIntegerSchema,
   prepareTrialData,
@@ -82,44 +80,6 @@ const studyImplementationManifestSchema: z.ZodType<StudyImplementationManifest> 
   evidence: z.enum(["bundled_locked", "declared_files"]),
   files: z.array(studyImplementationFileSchema).max(288),
 }).strict();
-const bundledRunnerManifestSchema = z.object({
-  schema_version: z.literal(1),
-  runner: z.object({
-    name: z.literal("numeric_logistic_regression"),
-    version: z.literal(NUMERIC_LOGISTIC_REGRESSION_RUNNER_VERSION),
-  }).strict(),
-  parameters: numericLogisticRegressionParametersSchema,
-  pipeline: z.object({
-    imputer: z.object({
-      strategy: z.literal("median"),
-      add_indicator: z.literal(true),
-    }).strict(),
-    scaler: z.literal("standard"),
-    classifier: z.object({
-      name: z.literal("logistic_regression"),
-      solver: z.literal("liblinear"),
-      penalty: z.literal("l2"),
-      tolerance: z.literal(1e-4),
-    }).strict(),
-  }).strict(),
-  input_columns: z.array(exactStringSchema).min(1),
-  training: z.object({
-    row_count: positiveIntegerSchema,
-    class_counts: z.object({
-      negative: positiveIntegerSchema,
-      positive: positiveIntegerSchema,
-    }).strict(),
-    missing_counts: z.record(z.string(), nonnegativeIntegerSchema),
-    transformed_feature_count: positiveIntegerSchema,
-  }).strict(),
-  runtime: bundledRuntimeVersionsSchema,
-  model: z.object({
-    path: z.literal("model.joblib"),
-    sha256: sha256Schema,
-    size_bytes: positiveIntegerSchema,
-  }).strict(),
-}).strict();
-
 const candidateReplayRequestSchema = z.object({
   protocol_version: z.literal(STUDY_TRIAL_PROTOCOL_VERSION),
   task: z.object({

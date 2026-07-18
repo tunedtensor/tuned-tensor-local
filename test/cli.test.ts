@@ -99,6 +99,7 @@ test("command and nested-command help never execute work", async () => {
       { args: ["models", "--help"], usage: "tt-local models <command>" },
       { args: ["studies", "run", "--help"], usage: "tt-local studies run" },
       { args: ["studies", "promote", "--help"], usage: "tt-local studies promote" },
+      { args: ["studies", "test", "--help"], usage: "tt-local studies test" },
       { args: ["studies", "validate", "--help"], usage: "tt-local studies validate" },
       { args: ["studies", "--help"], usage: "tt-local studies <command>" },
     ];
@@ -108,6 +109,37 @@ test("command and nested-command help never execute work", async () => {
       assert.equal(result.status, 0, `${args.join(" ")}: ${result.stderr}`);
       assert.match(result.stdout, new RegExp(`Usage: ${usage.replaceAll(" ", "\\s+")}`));
       assert.equal(result.stderr, "");
+      assertNoWorkCreated(root);
+    }
+  });
+});
+
+test("held-out Study test parser failures do not create or consume work", async () => {
+  await withTemporaryProject((root) => {
+    const cases = [
+      {
+        args: ["studies", "test"],
+        error: /^studies test requires <study\.json>/,
+      },
+      {
+        args: ["studies", "test", "study.json", "--lock"],
+        error: /^Option --lock requires a value\./,
+      },
+      {
+        args: ["studies", "test", "study.json", "--output", "receipt.json"],
+        error: /^Unknown option: --output/,
+      },
+      {
+        args: ["studies", "test", "study.json", "extra.json"],
+        error: /^Too many arguments\. Usage: tt-local studies test/,
+      },
+    ];
+
+    for (const { args, error } of cases) {
+      const result = runCli(args, root);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, error);
+      assert.equal(result.stdout, "");
       assertNoWorkCreated(root);
     }
   });
