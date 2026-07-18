@@ -16,6 +16,10 @@ parser.add_argument("--input", required=True)
 parser.add_argument("--output", required=True)
 args = parser.parse_args()
 payload = json.load(open(args.input))
+if payload.get("protocol_version") != 2:
+    raise ValueError("expected inference protocol version 2")
+if any("output" in example for example in payload["examples"]):
+    raise ValueError("inference examples must not contain expected outputs")
 print("fake evaluator started")
 print("fake evaluator loading model", file=sys.stderr)
 json.dump({
@@ -26,8 +30,9 @@ json.dump({
   "generation_config": payload["generation"],
   "results": [
     {
-      "prompt": example["input"],
-      "expected": example["output"],
+      "id": example["id"],
+      "prompt": "forged prompt",
+      "expected": "forged expected output",
       "actual": ${JSON.stringify(actual)},
       "latency_ms": 12
     }
@@ -70,6 +75,8 @@ test("transformers evaluation adapter records generated outputs and exact-match 
 
     assert.equal(report.inference_provider, "transformers");
     assert.equal(report.scoring_method, "exact_match");
+    assert.equal(report.results[0]?.prompt, "Classify: good");
+    assert.equal(report.results[0]?.expected, "positive");
     assert.equal(report.results[0]?.actual, "positive");
     assert.equal(report.avg_score, 1);
     assert.equal(report.exact_match_rate, 1);
@@ -77,7 +84,9 @@ test("transformers evaluation adapter records generated outputs and exact-match 
     const inferencePayload = JSON.parse(
       await readFile(`${join(root, "candidate-eval.json")}.inference-input.json`, "utf8"),
     ) as Record<string, unknown>;
+    assert.equal(inferencePayload.protocol_version, 2);
     assert.equal(inferencePayload.base_model_revision, "0123456789abcdef");
+    assert.equal("output" in (inferencePayload.examples as Array<Record<string, unknown>>)[0], false);
     const logText = await readFile(report.log_uri.replace(/^file:\/\//, ""), "utf8");
     assert.match(logText, /fake evaluator started/);
     assert.match(logText, /fake evaluator loading model/);
@@ -97,6 +106,8 @@ parser.add_argument("--input", required=True)
 parser.add_argument("--output", required=True)
 args = parser.parse_args()
 payload = json.load(open(args.input))
+if any("output" in example for example in payload["examples"]):
+    raise ValueError("inference examples must not contain expected outputs")
 print(json.dumps({key: os.environ.get(key) for key in [
   "HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE"
 ]}))
@@ -104,7 +115,7 @@ json.dump({
   "provider": "transformers",
   "model_id": payload["model_id"],
   "results": [
-    {"prompt": e["input"], "expected": e["output"], "actual": e["output"], "latency_ms": 1}
+    {"id": e["id"], "actual": "positive", "latency_ms": 1}
     for e in payload["examples"]
   ]
 }, open(args.output, "w"))
@@ -159,7 +170,9 @@ test("command inference provider runs configured evaluator commands", async () =
     const command = [
       process.execPath,
       "-e",
-      "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const p=JSON.parse(d);process.stdout.write(JSON.stringify({actual:p.expected}))})",
+      "let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{const p=JSON.parse(d);"
+        + "if(p.protocol_version!==2||Object.hasOwn(p,'expected'))process.exit(2);"
+        + "process.stdout.write(JSON.stringify({actual:p.prompt.includes('good')?'positive':'negative'}))})",
     ];
     const config = localRunnerConfigSchema.parse({
       dryRun: false,
@@ -184,6 +197,138 @@ test("command inference provider runs configured evaluator commands", async () =
     assert.equal(report.results[0]?.actual, "positive");
     assert.equal(report.results[0]?.scored_by, "exact_match");
     assert.equal(report.avg_score, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("batch inference joins reordered predictions by opaque id", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-reordered-batch-test-"));
+  try {
+    const script = join(root, "reordered-batch.mjs");
+    await writeFile(script, `
+import { readFileSync, writeFileSync } from "node:fs";
+const inputPath = process.argv[process.argv.indexOf("--input") + 1];
+const outputPath = process.argv[process.argv.indexOf("--output") + 1];
+const payload = JSON.parse(readFileSync(inputPath, "utf8"));
+if (payload.examples.some((example) => Object.hasOwn(example, "output"))) process.exit(2);
+writeFileSync(outputPath, JSON.stringify({
+  results: [...payload.examples].reverse().map((example) => ({
+    id: example.id,
+    actual: example.input === "first" ? "one" : "two",
+    latency_ms: 1
+  }))
+}));
+`, "utf8");
+    const config = localRunnerConfigSchema.parse({
+      dryRun: false,
+      evaluation: {
+        inference: {
+          provider: "batch_command",
+          command: [process.execPath, script],
+        },
+        scoring: { mode: "exact_match" },
+      },
+    });
+
+    const report = await evaluateExamples({
+      kind: "candidate",
+      modelId: "external:test",
+      baseModelId: "external:test",
+      examples: [
+        { input: "first", output: "one" },
+        { input: "second", output: "two" },
+      ],
+      system: "Predict.",
+      config,
+      outputPath: join(root, "candidate-eval.json"),
+    });
+
+    assert.deepEqual(report.results.map((result) => result.actual), ["one", "two"]);
+    assert.equal(report.avg_score, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("batch inference rejects incomplete or malformed prediction output", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-eval-short-batch-test-"));
+  try {
+    const script = join(root, "short-batch.mjs");
+    await writeFile(script, `
+import { readFileSync, writeFileSync } from "node:fs";
+const inputPath = process.argv[process.argv.indexOf("--input") + 1];
+const outputPath = process.argv[process.argv.indexOf("--output") + 1];
+const payload = JSON.parse(readFileSync(inputPath, "utf8"));
+if (payload.examples.some((example) => Object.hasOwn(example, "output"))) process.exit(2);
+writeFileSync(outputPath, JSON.stringify({
+  results: [{ id: payload.examples[0].id, actual: "first", latency_ms: 1 }]
+}));
+`, "utf8");
+    const config = localRunnerConfigSchema.parse({
+      dryRun: false,
+      evaluation: {
+        inference: {
+          provider: "batch_command",
+          command: [process.execPath, script],
+        },
+        scoring: { mode: "exact_match" },
+      },
+    });
+
+    await assert.rejects(
+      evaluateExamples({
+        kind: "candidate",
+        modelId: "external:test",
+        baseModelId: "external:test",
+        examples: [
+          { input: "first", output: "one" },
+          { input: "second", output: "two" },
+        ],
+        system: "Predict.",
+        config,
+        outputPath: join(root, "candidate-eval.json"),
+      }),
+      /returned 1 prediction; expected 2/,
+    );
+
+    await writeFile(script, `
+import { writeFileSync } from "node:fs";
+const outputPath = process.argv[process.argv.indexOf("--output") + 1];
+writeFileSync(outputPath, JSON.stringify({
+  results: [{ id: "0", actual: 42, latency_ms: 1 }]
+}));
+`, "utf8");
+    await assert.rejects(
+      evaluateExamples({
+        kind: "candidate",
+        modelId: "external:test",
+        baseModelId: "external:test",
+        examples: [{ input: "first", output: "one" }],
+        system: "Predict.",
+        config,
+        outputPath: join(root, "malformed-candidate-eval.json"),
+      }),
+      /prediction 0 must include string actual/,
+    );
+
+    const staleOutputPath = join(root, "stale-candidate-eval.json");
+    await writeFile(`${staleOutputPath}.inference-output.json`, JSON.stringify({
+      results: [{ id: "0", actual: "stale", latency_ms: 1 }],
+    }), "utf8");
+    await writeFile(script, "process.exit(0);\n", "utf8");
+    await assert.rejects(
+      evaluateExamples({
+        kind: "candidate",
+        modelId: "external:test",
+        baseModelId: "external:test",
+        examples: [{ input: "first", output: "one" }],
+        system: "Predict.",
+        config,
+        outputPath: staleOutputPath,
+      }),
+      /did not write valid JSON output/,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -215,6 +360,7 @@ test("transformers evaluation payload includes image-text loader for multimodal 
         input: "What is the blue value?",
         output: "42",
         input_assets: [{ type: "image", image: "charts/example.png" }],
+        modality: "document_ocr",
       }],
       system: "Read charts.",
       config,
@@ -222,8 +368,11 @@ test("transformers evaluation payload includes image-text loader for multimodal 
     });
 
     const payload = JSON.parse(await readFile(join(root, "baseline-eval.json.inference-input.json"), "utf8"));
+    assert.equal(payload.protocol_version, 2);
     assert.equal(payload.model_loader, "image_text_to_text");
     assert.deepEqual(payload.examples[0].input_assets, [{ type: "image", image: "charts/example.png" }]);
+    assert.equal(payload.examples[0].modality, "document_ocr");
+    assert.equal("output" in payload.examples[0], false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -751,13 +900,15 @@ parser.add_argument("--input", required=True)
 parser.add_argument("--output", required=True)
 args = parser.parse_args()
 payload = json.load(open(args.input))
+if any("output" in example for example in payload["examples"]):
+    raise ValueError("inference examples must not contain expected outputs")
 with open(${JSON.stringify("COUNT_PATH")}, "a") as fh:
     fh.write("x")
 json.dump({
   "provider": "transformers",
   "model_id": payload["model_id"],
   "results": [
-    {"prompt": e["input"], "expected": e["output"], "actual": ${JSON.stringify("ACTUAL")}, "latency_ms": 5}
+    {"id": e["id"], "actual": ${JSON.stringify("ACTUAL")}, "latency_ms": 5}
     for e in payload["examples"]
   ]
 }, open(args.output, "w"))

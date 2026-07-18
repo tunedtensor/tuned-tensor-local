@@ -28,7 +28,9 @@ uv --version
 ```
 
 Custom training or evaluation workflows can use command entrypoints instead of
-`uv`.
+`uv`. Inference protocol v2 omits expected outputs from command payloads; TT
+Local joins returned ID-keyed predictions to its references for scoring. See
+`docs/architecture.md`.
 
 The default uv project is included in the npm package at
 `training/local-runner`; using bundled training does not require cloning this

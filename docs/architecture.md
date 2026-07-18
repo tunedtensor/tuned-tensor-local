@@ -86,9 +86,18 @@ comparison less direct.
 
 Custom model families can use `training.backend: "command"` and
 `evaluation.inference.provider: "batch_command"`. Batch evaluators receive the
-same `--input`/`--output` JSON files as the bundled Transformers evaluator, so a
-custom workflow can load any artifact format as long as it writes compatible
-evaluation results.
+same versioned `--input`/`--output` JSON protocol as the bundled Transformers
+evaluator, so a custom workflow can load any artifact format. Protocol v2 input
+examples contain an opaque `id`, `input`, and optional input assets or modality,
+but never the expected output. Evaluators return exactly one prediction for
+each input using the same `id`, a string `actual`, and a non-negative integer
+`latency_ms`. TT Local rejects missing, duplicate, unknown, or malformed
+predictions and joins them to trusted prompts and expected outputs before
+scoring.
+
+This protocol boundary prevents accidental label access through evaluator input;
+it is not a process sandbox. Command-backed evaluators still require a trusted
+host until isolated execution is added.
 
 `paths.modelCache` is a single cache contract: it is passed as Hugging Face
 `HF_HOME`, and Hub snapshots live beneath `<modelCache>/hub`. The environment

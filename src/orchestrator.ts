@@ -42,7 +42,14 @@ import {
   localAssetPathsFromChatJsonl,
   normalizeChatJsonlForRelocation,
 } from "./dataset.js";
-import { compareEvalReports, deriveSampleSeed, evaluateExamples, rescoreEvalReport, splitSpecExamples } from "./evaluation.js";
+import {
+  INFERENCE_PROTOCOL_VERSION,
+  compareEvalReports,
+  deriveSampleSeed,
+  evaluateExamples,
+  rescoreEvalReport,
+  splitSpecExamples,
+} from "./evaluation.js";
 import { launchProcessTraining } from "./process-training.js";
 import { assertUsableModelArtifact, localModelArtifactPath } from "./model-registry.js";
 import { ProcessCancelledError } from "./process-runner.js";
@@ -774,6 +781,7 @@ async function stageFingerprint(args: {
     project: args.config.evaluation.inference.project,
   });
   const evaluation = {
+    inference_protocol_version: INFERENCE_PROTOCOL_VERSION,
     command: args.stage === "baseline"
       ? args.config.evaluation.baselineCommand
       : args.config.evaluation.candidateCommand,

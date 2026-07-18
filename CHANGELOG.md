@@ -8,6 +8,10 @@ All notable changes to TT Local will be documented in this file.
 
 - Prebuilt datasets with both validation and test files now use validation for
   normal iterative evaluation, preserving test as a separate holdout.
+- **Breaking:** inference protocol v2 no longer sends expected outputs to
+  command or batch evaluators. Batch evaluators must echo each opaque input
+  `id` with string `actual` and non-negative integer `latency_ms`. TT Local
+  validates predictions and joins them to trusted references before scoring.
 
 ## 0.2.9 - 2026-07-14
 

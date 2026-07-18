@@ -277,7 +277,6 @@ def generate_text_one(
     chat_template_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prompt = str(example["input"])
-    expected = str(example["output"])
     formatted = format_prompt(tokenizer, system, prompt, chat_template_kwargs)
     inputs = tokenizer(formatted, return_tensors="pt")
     target_device = next(model.parameters()).device
@@ -295,8 +294,7 @@ def generate_text_one(
     output_tokens = generated[0][input_length:]
     actual = tokenizer.decode(output_tokens, skip_special_tokens=True).strip()
     return {
-        "prompt": prompt,
-        "expected": expected,
+        "id": str(example["id"]),
         "actual": actual,
         "latency_ms": latency_ms,
     }
@@ -312,7 +310,6 @@ def generate_multimodal_one(
     chat_template_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prompt = str(example["input"])
-    expected = str(example["output"])
     image_values = example_assets(example)
     images = [load_image(value, base_dir) for value in image_values]
     user_content: list[dict[str, str]] = [{"type": "image"} for _ in images]
@@ -353,8 +350,7 @@ def generate_multimodal_one(
         clean_up_tokenization_spaces=False,
     )[0].strip()
     return {
-        "prompt": prompt,
-        "expected": expected,
+        "id": str(example["id"]),
         "actual": actual,
         "latency_ms": latency_ms,
     }
@@ -367,6 +363,8 @@ def main() -> None:
     args = parser.parse_args()
 
     payload = load_json(Path(args.input))
+    if payload.get("protocol_version") != 2:
+        raise ValueError("Unsupported inference protocol; expected protocol_version 2")
     configure_hugging_face_cache(payload.get("model_cache"))
     import_runtime_dependencies()
 
