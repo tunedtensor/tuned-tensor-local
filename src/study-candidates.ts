@@ -22,6 +22,7 @@ import {
   NUMERIC_LOGISTIC_REGRESSION_RUNNER_VERSION,
   NUMERIC_LOGISTIC_REGRESSION_SCRIPT,
   STUDY_TRIAL_PROTOCOL_VERSION,
+  bundledRuntimeVersionsSchema,
   canonicalJson,
   datasetIdSchema,
   defaultStudyTrialOutputRoot,
@@ -111,13 +112,7 @@ const bundledRunnerManifestSchema = z.object({
     missing_counts: z.record(z.string(), nonnegativeIntegerSchema),
     transformed_feature_count: positiveIntegerSchema,
   }).strict(),
-  runtime: z.object({
-    python: exactStringSchema,
-    platform: exactStringSchema,
-    numpy: exactStringSchema,
-    scikit_learn: exactStringSchema,
-    joblib: exactStringSchema,
-  }).strict(),
+  runtime: bundledRuntimeVersionsSchema,
   model: z.object({
     path: z.literal("model.joblib"),
     sha256: sha256Schema,

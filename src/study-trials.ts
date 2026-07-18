@@ -34,6 +34,7 @@ import { loadStudySpec, validateStudyBenchmark } from "./studies.js";
 
 export {
   STUDY_TRIAL_PROTOCOL_VERSION,
+  bundledPredictionRuntimeEvidenceSchema,
   buildStudyTrialRunnerCommand,
   defaultStudyTrialOutputRoot,
   loadStudyTrialSpec,
@@ -41,6 +42,7 @@ export {
   studyTrialPredictionSchema,
   studyTrialReportSchema,
   studyTrialSpecSchema,
+  type BundledPredictionRuntimeEvidence,
   type StudyTrialJsonValue,
   type StudyTrialOutput,
   type StudyTrialReport,

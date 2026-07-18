@@ -30,6 +30,8 @@ All notable changes to TT Local will be documented in this file.
   logistic-regression runner. Promotion copies the fitted model and locked
   predictor, strictly revalidates their provenance, and replay-checks
   label-free validation probabilities before publishing a candidate lock.
+- Added optional, versioned prediction-time runtime evidence for the bundled
+  runner's saved-model mode.
 
 ### Changed
 
