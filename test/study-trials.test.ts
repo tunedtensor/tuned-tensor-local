@@ -244,6 +244,97 @@ test("runs a label-blind command trial and computes trusted validation metrics",
   });
 });
 
+test("surfaces temporal certification without exposing its metadata to the runner", async () => {
+  await withTrialFixture(async ({ root, studyPath, outputRoot, writeTrial }) => {
+    const header = (
+      "id,spread_bps,note,big_move,future_mid,"
+      + "observed_at,future_observed_at\n"
+    );
+    await writeFile(
+      join(root, "data", "training.csv"),
+      `${header}`
+      + "train-1,1.2,quiet,0,0.10,2026-07-03T00:00:00Z,2026-07-03T00:30:00Z\n"
+      + "train-2,8.4,move,1,0.90,2026-07-03T00:10:00Z,2026-07-03T00:40:00Z\n",
+      "utf8",
+    );
+    await writeFile(
+      join(root, "data", "validation.csv"),
+      `${header}`
+      + "validation-1,1.4,quiet,0,0.20,2026-07-03T02:00:00Z,2026-07-03T02:30:00Z\n"
+      + "validation-2,7.9,move,1,0.80,2026-07-03T02:10:00Z,2026-07-03T02:40:00Z\n",
+      "utf8",
+    );
+    await writeFile(
+      join(root, "data", "test.csv"),
+      `${header}`
+      + "test-1,1.1,quiet,0,0.30,2026-07-03T04:00:00Z,2026-07-03T04:30:00Z\n"
+      + "test-2,8.1,move,1,0.70,2026-07-03T04:10:00Z,2026-07-03T04:40:00Z\n",
+      "utf8",
+    );
+    const study = JSON.parse(await readFile(studyPath, "utf8")) as {
+      dataset: {
+        temporal?: {
+          policy: string;
+          event_time_column: string;
+          label_end_time_column: string;
+          label_horizon_seconds: number;
+          embargo_seconds: number;
+        };
+      };
+    };
+    study.dataset.temporal = {
+      policy: "ordered_purged",
+      event_time_column: "observed_at",
+      label_end_time_column: "future_observed_at",
+      label_horizon_seconds: 3_600,
+      embargo_seconds: 300,
+    };
+    await writeFile(studyPath, `${JSON.stringify(study, null, 2)}\n`, "utf8");
+    await writeStudyBenchmarkLock({ studyPath, force: true });
+
+    const trialPath = await writeTrial("temporal-logreg", validRunner);
+    const result = await runStudyTrial({ studyPath, trialPath, outputRoot });
+    assert.equal(result.report.data.temporal?.policy, "ordered_purged");
+    assert.equal(result.report.data.temporal?.label_horizon_seconds, 3_600);
+    assert.equal(result.report.data.temporal?.embargo_seconds, 300);
+    assert.deepEqual(
+      result.report.data.temporal?.splits.validation.event_time,
+      {
+        min: "2026-07-03T02:00:00Z",
+        max: "2026-07-03T02:10:00Z",
+      },
+    );
+    assert.equal("test" in result.report.data.temporal!.splits, false);
+    const inputText = await readFile(join(result.trialDirectory, "trial-input.json"), "utf8");
+    const input = JSON.parse(inputText) as Record<string, unknown>;
+    assert.equal("temporal" in input, false);
+    assert.equal(inputText.includes("future_observed_at"), false);
+    assert.equal(
+      (await readFile(join(result.trialDirectory, "validation.csv"), "utf8"))
+        .includes("observed_at"),
+      false,
+    );
+
+    const lockPath = join(root, "portfolio.study.lock.json");
+    const forged = JSON.parse(await readFile(lockPath, "utf8")) as {
+      dataset: { temporal: { label_horizon_seconds: number } };
+    };
+    forged.dataset.temporal.label_horizon_seconds = 3_599;
+    await writeFile(lockPath, `${JSON.stringify(forged, null, 2)}\n`, "utf8");
+    const marker = join(root, "forged-lock-runner-launched");
+    const forgedTrialPath = await writeTrial("forged-temporal-lock", `
+      import { writeFileSync } from "node:fs";
+      writeFileSync(${JSON.stringify(marker)}, "yes");
+    `);
+    await assert.rejects(
+      runStudyTrial({ studyPath, trialPath: forgedTrialPath, outputRoot }),
+      /dataset\.temporal\.label_horizon_seconds.*expected.*found/is,
+    );
+    assert.equal(existsSync(marker), false);
+    assert.equal(existsSync(join(outputRoot, "forged-temporal-lock")), false);
+  });
+});
+
 test("defaults to the trial directory and reserves protocol-owned command flags", async () => {
   await withTrialFixture(async ({ studyPath, outputRoot, writeTrial }) => {
     const trialPath = await writeTrial(

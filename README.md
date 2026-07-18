@@ -63,6 +63,13 @@ Define the task and explicitly allowlist model inputs:
       "training": "data/training.csv",
       "validation": "data/validation.csv",
       "test": "data/test.csv"
+    },
+    "temporal": {
+      "policy": "ordered_purged",
+      "event_time_column": "observed_at",
+      "label_end_time_column": "future_observed_at",
+      "label_horizon_seconds": 3600,
+      "embargo_seconds": 300
     }
   }
 }
@@ -82,16 +89,42 @@ IDs, and ID overlap between splits. Portable relative CSV paths resolve from
 the StudySpec. `studies run` performs this validation itself, so a separate
 validate command is not required before every trial.
 
+The optional `dataset.temporal` contract certifies time-indexed splits without
+changing non-temporal tasks. Both time columns must contain strict RFC 3339 UTC
+timestamps ending in `Z`, with up to nanosecond precision. For every row, the
+observed label endpoint must be after its event time and no later than the
+declared label horizon. For both training-to-validation and
+validation-to-test, the next split's earliest event must be strictly later
+than the previous split's latest event plus the full declared horizon and
+embargo:
+
+```text
+next.min(event_time) >
+previous.max(event_time) + label_horizon_seconds + embargo_seconds
+```
+
+TT Local scans extrema, so this check does not depend on physical CSV row
+order and does not rewrite the files. The lock records the declared policy
+plus exact event-time and observed label-end ranges for all three splits.
+Successful iterative trial reports repeat only the training and validation
+ranges while binding the full lock by hash. Purging uses the full declared
+horizon rather than the latest available `label_end_time_column` value, which
+may represent only partial future coverage.
+
 The explicit `input_columns` allowlist is important: label-derived or
-future-derived export columns must never become model inputs accidentally.
-This v1 lock records predefined files; it does not certify temporal ordering,
-purge/embargo windows, overlapping feature or label horizons, entity-group
-isolation, near-duplicate separation, class balance beyond requiring both
-labels, or feature causality. Test rows and labels remain readable: the lock
-detects changes but does not seal the test set or stop trial code from
-accessing it. Trading benchmarks must establish those split properties
-upstream and keep test data out of the trial loop until dedicated temporal and
-isolated-evaluation contracts are added.
+future-derived export columns must never become model inputs accidentally. The
+declared label-end column is always forbidden as an input and is not projected
+to a trial child. The event-time column is projected only when it is explicitly
+allowlisted.
+
+This is a declared horizon-purge certificate, not proof that a benchmark is
+leakage-free. It does not prove complete sampling through the label horizon,
+label correctness, feature availability or causality, chronological row order
+inside a file, entity-group isolation, near-duplicate separation, cadence, or
+class balance beyond requiring both labels. Test rows and labels remain
+readable: the lock detects changes but does not seal the test set or stop trial
+code from accessing it. Establish those additional properties upstream and
+keep test data out of the trial loop until isolated evaluation is available.
 
 Define one immutable algorithm attempt separately from the benchmark:
 

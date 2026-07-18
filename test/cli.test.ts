@@ -112,14 +112,32 @@ test("command and nested-command help never execute work", async () => {
   });
 });
 
-test("study benchmark lock and validation run end to end without opening the local store", async () => {
+test("temporal Study lock, validation, and trial run end to end without the local store", async () => {
   await withTemporaryProject(async (root) => {
     const dataRoot = join(root, "data");
     await mkdir(dataRoot, { recursive: true });
-    const header = "id,spread_bps,big_move\n";
-    await writeFile(join(dataRoot, "training.csv"), `${header}train-1,1.2,0\ntrain-2,8.4,1\n`, "utf8");
-    await writeFile(join(dataRoot, "validation.csv"), `${header}validation-1,1.4,0\nvalidation-2,7.9,1\n`, "utf8");
-    await writeFile(join(dataRoot, "test.csv"), `${header}test-1,1.1,0\ntest-2,8.1,1\n`, "utf8");
+    const header = "id,spread_bps,big_move,observed_at,future_observed_at\n";
+    await writeFile(
+      join(dataRoot, "training.csv"),
+      `${header}`
+      + "train-1,1.2,0,2026-07-03T00:00:00Z,2026-07-03T00:30:00Z\n"
+      + "train-2,8.4,1,2026-07-03T00:10:00Z,2026-07-03T00:40:00Z\n",
+      "utf8",
+    );
+    await writeFile(
+      join(dataRoot, "validation.csv"),
+      `${header}`
+      + "validation-1,1.4,0,2026-07-03T02:00:00Z,2026-07-03T02:30:00Z\n"
+      + "validation-2,7.9,1,2026-07-03T02:10:00Z,2026-07-03T02:40:00Z\n",
+      "utf8",
+    );
+    await writeFile(
+      join(dataRoot, "test.csv"),
+      `${header}`
+      + "test-1,1.1,0,2026-07-03T04:00:00Z,2026-07-03T04:30:00Z\n"
+      + "test-2,8.1,1,2026-07-03T04:10:00Z,2026-07-03T04:40:00Z\n",
+      "utf8",
+    );
     const studyPath = join(root, "portfolio.study.json");
     await writeFile(studyPath, `${JSON.stringify({
       schema_version: 1,
@@ -127,7 +145,7 @@ test("study benchmark lock and validation run end to end without opening the loc
       task: {
         type: "binary_classification",
         id_column: "id",
-        input_columns: ["spread_bps"],
+        input_columns: ["spread_bps", "observed_at"],
         target_column: "big_move",
         labels: { negative: "0", positive: "1" },
         primary_metric: "average_precision",
@@ -139,13 +157,36 @@ test("study benchmark lock and validation run end to end without opening the loc
           validation: "data/validation.csv",
           test: "data/test.csv",
         },
+        temporal: {
+          policy: "ordered_purged",
+          event_time_column: "observed_at",
+          label_end_time_column: "future_observed_at",
+          label_horizon_seconds: 3_600,
+          embargo_seconds: 300,
+        },
       },
     }, null, 2)}\n`, "utf8");
 
     const locked = runCli(["studies", "lock", studyPath], root);
     assert.equal(locked.status, 0, locked.stderr);
-    const lockedOutput = JSON.parse(locked.stdout) as { ok: boolean; lock_path: string };
+    const lockedOutput = JSON.parse(locked.stdout) as {
+      ok: boolean;
+      lock_path: string;
+      benchmark_lock: {
+        dataset: {
+          temporal: {
+            policy: string;
+            splits: { test: { event_time: { min: string } } };
+          };
+        };
+      };
+    };
     assert.equal(lockedOutput.ok, true);
+    assert.equal(lockedOutput.benchmark_lock.dataset.temporal.policy, "ordered_purged");
+    assert.equal(
+      lockedOutput.benchmark_lock.dataset.temporal.splits.test.event_time.min,
+      "2026-07-03T04:00:00Z",
+    );
     const lockText = await readFile(lockedOutput.lock_path, "utf8");
 
     const validated = runCli(["studies", "validate", studyPath], root);
@@ -158,8 +199,11 @@ test("study benchmark lock and validation run end to end without opening the loc
       const arg = (name) => process.argv[process.argv.indexOf(name) + 1];
       const input = JSON.parse(readFileSync(arg("--input"), "utf8"));
       const validation = readFileSync(input.datasets.validation_csv, "utf8");
-      if (validation !== "id,spread_bps\\nvalidation-1,1.4\\nvalidation-2,7.9\\n") {
+      if (validation !== "id,spread_bps,observed_at\\nvalidation-1,1.4,2026-07-03T02:00:00Z\\nvalidation-2,7.9,2026-07-03T02:10:00Z\\n") {
         throw new Error("validation projection contains unexpected data");
+      }
+      if (JSON.stringify(input).includes("future_observed_at") || "temporal" in input) {
+        throw new Error("future or temporal metadata leaked into trial input");
       }
       writeFileSync(arg("--output"), JSON.stringify({
         protocol_version: 1,
@@ -197,16 +241,27 @@ test("study benchmark lock and validation run end to end without opening the loc
     assert.equal(trial.status, 0, trial.stderr);
     const trialResult = JSON.parse(trial.stdout) as {
       ok: boolean;
-      trial_report: { evaluation: { primary_score: number } };
+      trial_report: {
+        data: {
+          temporal: {
+            policy: string;
+            splits: Record<string, unknown>;
+          };
+        };
+        evaluation: { primary_score: number };
+      };
       report_path: string;
     };
     assert.equal(trialResult.ok, true);
     assert.equal(trialResult.trial_report.evaluation.primary_score, 1);
+    assert.equal(trialResult.trial_report.data.temporal.policy, "ordered_purged");
+    assert.equal("test" in trialResult.trial_report.data.temporal.splits, false);
     assert.equal(existsSync(trialResult.report_path), true);
 
+    const validationData = await readFile(join(dataRoot, "validation.csv"), "utf8");
     await writeFile(
       join(dataRoot, "validation.csv"),
-      `${header}validation-1,1.4,0\nvalidation-2,7.8,1\n`,
+      validationData.replace("validation-2,7.9", "validation-2,7.8"),
       "utf8",
     );
     const drifted = runCli(["studies", "validate", studyPath], root);

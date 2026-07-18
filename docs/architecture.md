@@ -88,20 +88,29 @@ trial records, not the benchmark definition.
 `tt-local studies lock` validates three explicit CSV splits and writes an
 adjacent deterministic lock. The lock contains the canonical StudySpec hash
 and each split's exact byte hash, byte size, row count, and common ordered
-columns. It deliberately contains no timestamps, absolute paths, environment
-state, UUIDs, or class prevalence. `tt-local studies validate` only recomputes
-and compares this evidence; it never rewrites the lock.
+columns. A StudySpec may also declare a fixed label horizon and embargo with
+event-time and observed label-end columns. In that case the validator requires
+strict UTC timestamps, checks every observed label endpoint is inside its
+declared window, and requires each later split to begin strictly after the
+previous split's maximum event time plus the full horizon and embargo. Its lock
+then records the temporal policy and exact per-split event and label-end
+ranges. It deliberately contains no absolute paths, environment state, UUIDs,
+or class prevalence. `tt-local studies validate` only recomputes and compares
+this evidence; it never rewrites the lock.
 
 The validator rejects malformed CSV, ambiguous or incompatible headers,
 missing role columns, undeclared labels, duplicate IDs, and IDs reused across
 splits. Every split must contain both declared labels, but no balance policy is
 imposed. Input columns are always allowlisted explicitly. This is an integrity
-boundary, not proof that a benchmark is leakage-free: v1 does not audit
-chronology, lookahead horizons, purge/embargo gaps, correlated entity groups,
-near duplicates, feature causality, class balance, or command access to test
-files. Test data remains readable. Those need dedicated temporal-split and
-isolated-evaluation contracts before an autonomous research loop can claim a
-sealed test result.
+boundary, not proof that a benchmark is leakage-free. Temporal certification
+audits only the caller-declared timestamps, fixed horizon, and split-boundary
+inequality; it uses the full declared horizon even when observed future
+evidence ends early. It does not prove complete label coverage, correct
+labels, feature causality or availability, row ordering inside a file,
+correlated entity-group isolation, near-duplicate separation, cadence, class
+balance, or command isolation from test files. Test data remains readable.
+Those need upstream data audits and isolated evaluation before an autonomous
+research loop can claim a sealed test result.
 
 `tt-local studies run` executes one versioned trial spec without opening the
 fine-tuning run store. Each trial has a filesystem-safe immutable ID, finite
@@ -165,7 +174,7 @@ Declared lock evidence does not prove a custom command consumed that lock, and
 the interpreter, operating system, native libraries, environment, and network
 inputs are not captured. Names, parameters, and command arguments are
 persisted and must not contain secrets. Strong process isolation, runtime
-attestation, validation query budgets, temporal split certification, and
+attestation, validation query budgets, entity-aware split certification, and
 one-shot sealed test evaluation remain separate future boundaries.
 
 ## Evaluation Loop

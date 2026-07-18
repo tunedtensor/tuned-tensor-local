@@ -192,6 +192,10 @@ export const studyTrialOutputSchema = z.object({
 
 export type StudyTrialSpec = z.infer<typeof studyTrialSpecSchema>;
 export type StudyTrialOutput = z.infer<typeof studyTrialOutputSchema>;
+type StudyTemporalCertification = NonNullable<StudyBenchmarkLock["dataset"]["temporal"]>;
+type StudyTrialTemporalEvidence = Omit<StudyTemporalCertification, "splits"> & {
+  splits: Pick<StudyTemporalCertification["splits"], "training" | "validation">;
+};
 
 export interface StudyTrialReport {
   schema_version: 1;
@@ -220,6 +224,7 @@ export interface StudyTrialReport {
       projected_sha256: string;
       row_count: number;
     };
+    temporal?: StudyTrialTemporalEvidence;
   };
   evaluation: {
     score_semantics: "positive_class_probability";
@@ -892,6 +897,19 @@ export async function runStudyTrial(args: {
         projected_sha256: projectedHashes.validation,
         row_count: prepared.source.validation.rowCount,
       },
+      ...(validated.lock.dataset.temporal ? {
+        temporal: {
+          policy: validated.lock.dataset.temporal.policy,
+          event_time_column: validated.lock.dataset.temporal.event_time_column,
+          label_end_time_column: validated.lock.dataset.temporal.label_end_time_column,
+          label_horizon_seconds: validated.lock.dataset.temporal.label_horizon_seconds,
+          embargo_seconds: validated.lock.dataset.temporal.embargo_seconds,
+          splits: {
+            training: validated.lock.dataset.temporal.splits.training,
+            validation: validated.lock.dataset.temporal.splits.validation,
+          },
+        },
+      } : {}),
     },
     evaluation: {
       score_semantics: "positive_class_probability",
