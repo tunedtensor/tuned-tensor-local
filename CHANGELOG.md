@@ -2,6 +2,13 @@
 
 All notable changes to TT Local will be documented in this file.
 
+## Unreleased
+
+### Changed
+
+- Prebuilt datasets with both validation and test files now use validation for
+  normal iterative evaluation, preserving test as a separate holdout.
+
 ## 0.2.9 - 2026-07-14
 
 ### Changed

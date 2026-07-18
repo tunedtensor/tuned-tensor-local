@@ -186,8 +186,8 @@ function selectPrebuiltEvaluation(dataset: FineTuneRunRequest["dataset_prebuilt"
   split: EvalSplit;
 } {
   if (!dataset) throw new Error("dataset_prebuilt is required");
-  if (dataset.test) return { path: stripFileUri(dataset.test), split: "prebuilt_test" };
   if (dataset.validation) return { path: stripFileUri(dataset.validation), split: "prebuilt_validation" };
+  if (dataset.test) return { path: stripFileUri(dataset.test), split: "prebuilt_test" };
   return { path: stripFileUri(dataset.training), split: "prebuilt_training" };
 }
 
@@ -195,11 +195,11 @@ function selectDpoEvaluation(request: FineTuneRunRequest): {
   path?: string;
   split: EvalSplit;
 } {
-  if (request.dataset_prebuilt?.test) {
-    return { path: stripFileUri(request.dataset_prebuilt.test), split: "prebuilt_test" };
-  }
   if (request.dataset_prebuilt?.validation) {
     return { path: stripFileUri(request.dataset_prebuilt.validation), split: "prebuilt_validation" };
+  }
+  if (request.dataset_prebuilt?.test) {
+    return { path: stripFileUri(request.dataset_prebuilt.test), split: "prebuilt_test" };
   }
   return { split: "spec_examples" };
 }
