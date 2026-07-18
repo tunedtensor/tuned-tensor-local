@@ -38,7 +38,10 @@ import {
   validateStudyBenchmark,
   writeStudyBenchmarkLock,
 } from "./studies.js";
-import { runStudyTrial } from "./study-trials.js";
+import {
+  promoteStudyTrialCandidate,
+  runStudyTrial,
+} from "./study-trials.js";
 
 export * from "./compare.js";
 export * from "./contracts.js";
@@ -157,7 +160,7 @@ Commands:
   runs list|get|events|watch|report|compare|cancel|reconcile [args] [--config local-runner.json]
   models list|get|verify|prefetch|verify-base|serve [args] [--config local-runner.json]
   specs list|get|import [args] [--config local-runner.json]
-  studies lock|validate|run <study.json> [args]
+  studies lock|validate|run|promote <study.json> [args]
   store rebuild-index [--config local-runner.json]
 
 Global options:
@@ -369,7 +372,7 @@ const COMMAND_GROUPS: Record<string, CliCommandGroup> = {
     },
   },
   studies: {
-    description: "Lock benchmarks and run target-free-validation ML study trials.",
+    description: "Lock benchmarks, run validation trials, and promote a fitted Study candidate.",
     subcommands: {
       lock: {
         usage: "tt-local studies lock <study.json> [options]",
@@ -402,6 +405,17 @@ const COMMAND_GROUPS: Record<string, CliCommandGroup> = {
         minPositionals: 2,
         maxPositionals: 2,
         missingPositionalsMessage: "studies run requires <study.json> <trial.json>",
+      },
+      promote: {
+        usage: "tt-local studies promote <study.json> <trial.json> [options]",
+        description: "Freeze one fitted bundled trial and replay-verify it as the Study candidate.",
+        options: [
+          { name: "--lock", value: "path", description: "Benchmark lock path" },
+          { name: "--trial-directory", value: "path", description: "Existing immutable trial artifact directory" },
+        ],
+        minPositionals: 2,
+        maxPositionals: 2,
+        missingPositionalsMessage: "studies promote requires <study.json> <trial.json>",
       },
     },
   },
@@ -1290,6 +1304,27 @@ async function main(argv: string[]): Promise<void> {
         trial_directory: result.trialDirectory,
         report_path: result.reportPath,
         trial_report: result.report,
+      });
+    }
+    if (subcommand === "promote") {
+      const trialPath = cli.positionals[1];
+      if (!trialPath) {
+        throw new Error("studies promote requires <study.json> <trial.json>");
+      }
+      const result = await promoteStudyTrialCandidate({
+        studyPath,
+        trialPath,
+        lockPath: readOption(argv, "--lock"),
+        trialDirectory: readOption(argv, "--trial-directory"),
+      });
+      return printJson({
+        ok: true,
+        status: "promoted",
+        study_path: resolve(studyPath),
+        trial_spec_path: resolve(trialPath),
+        candidate_directory: result.candidateDirectory,
+        candidate_lock_path: result.lockPath,
+        candidate_lock: result.lock,
       });
     }
     throw new Error(`Unknown studies command: ${subcommand}`);
