@@ -13,6 +13,12 @@ All notable changes to TT Local will be documented in this file.
   record and verify deterministic dataset hashes, schemas, row counts, and
   split ID integrity without opening the run store.
 
+### Fixed
+
+- Completed process-group teardown when a logged command's direct child exits,
+  including an opt-in cleanup mode for successful commands that must not leave
+  background descendants running.
+
 ## 0.2.9 - 2026-07-14
 
 ### Changed

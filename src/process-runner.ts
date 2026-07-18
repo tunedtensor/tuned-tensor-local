@@ -101,6 +101,7 @@ export async function runLoggedProcess(args: {
   onLine?: (line: string, stream: "stdout" | "stderr") => void;
   shouldCancel?: () => boolean | Promise<boolean>;
   cancelPollMs?: number;
+  terminateProcessGroupOnExit?: boolean;
 }): Promise<LoggedProcessResult> {
   if (args.logPath) await mkdir(dirname(args.logPath), { recursive: true });
   const logStream = args.logPath ? createWriteStream(args.logPath, { flags: "w" }) : null;
@@ -205,6 +206,17 @@ export async function runLoggedProcess(args: {
           : error);
       });
       child.on("close", (code) => {
+        if (
+          timedOut
+          || cancelled
+          || cancellationError
+          || args.terminateProcessGroupOnExit
+        ) {
+          // The direct child can close its stdio while descendants remain in
+          // the process group and ignore SIGTERM. Complete teardown before
+          // cancelling the force-kill timer.
+          killProcessGroup("SIGKILL");
+        }
         clearProcessTimers();
         if (timedOut) {
           reject(new Error(args.timeoutMessage ?? `${args.command} timed out after ${args.timeoutMs}ms`));
