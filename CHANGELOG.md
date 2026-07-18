@@ -22,6 +22,12 @@ All notable changes to TT Local will be documented in this file.
   `id` with string `actual` and non-negative integer `latency_ms`. TT Local
   validates predictions and joins them to trusted references before scoring.
 
+### Fixed
+
+- Completed process-group teardown when a logged command's direct child exits,
+  including an opt-in cleanup mode for successful commands that must not leave
+  background descendants running.
+
 ## 0.2.9 - 2026-07-14
 
 ### Changed
