@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "name": "Polymarket LP large-move risk",
+  "task": {
+    "type": "binary_classification",
+    "id_column": "id",
+    "input_columns": [
+      "spread_bps",
+      "liquidity",
+      "volume_24h",
+      "bid_depth_3c",
+      "ask_depth_3c",
+      "imbalance_3c"
+    ],
+    "target_column": "big_move",
+    "labels": {
+      "negative": "0",
+      "positive": "1"
+    },
+    "primary_metric": "average_precision"
+  },
+  "dataset": {
+    "format": "csv",
+    "splits": {
+      "training": "data/training.csv",
+      "validation": "data/validation.csv",
+      "test": "data/test.csv"
+    },
+    "temporal": {
+      "policy": "ordered_purged",
+      "event_time_column": "observed_at",
+      "label_end_time_column": "future_observed_at",
+      "label_horizon_seconds": 3600,
+      "embargo_seconds": 300
+    }
+  }
+}
