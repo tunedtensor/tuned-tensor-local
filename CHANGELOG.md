@@ -12,6 +12,11 @@ All notable changes to TT Local will be documented in this file.
 - Added `tt-local studies lock` and read-only `tt-local studies validate` to
   record and verify deterministic dataset hashes, schemas, row counts, and
   split ID integrity without opening the run store.
+- Added `tt-local studies run` for write-once command-backed binary
+  classification trials. It exposes allowlisted training data and
+  target-free validation data, accepts strict ID-keyed positive-class
+  probabilities, and computes trusted AP, ROC AUC, and fixed-threshold F1
+  reports without exposing the test split to the command protocol.
 
 ### Changed
 

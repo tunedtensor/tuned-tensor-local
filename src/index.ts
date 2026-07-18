@@ -38,6 +38,7 @@ import {
   validateStudyBenchmark,
   writeStudyBenchmarkLock,
 } from "./studies.js";
+import { runStudyTrial } from "./study-trials.js";
 
 export * from "./compare.js";
 export * from "./contracts.js";
@@ -52,6 +53,8 @@ export * from "./prefetch.js";
 export * from "./run-reporter.js";
 export * from "./server.js";
 export * from "./store.js";
+export * from "./study-metrics.js";
+export * from "./study-trials.js";
 export * from "./studies.js";
 
 export interface LocalRunnerInfo {
@@ -154,7 +157,7 @@ Commands:
   runs list|get|events|watch|report|compare|cancel|reconcile [args] [--config local-runner.json]
   models list|get|verify|prefetch|verify-base|serve [args] [--config local-runner.json]
   specs list|get|import [args] [--config local-runner.json]
-  studies lock|validate <study.json> [args]
+  studies lock|validate|run <study.json> [args]
   store rebuild-index [--config local-runner.json]
 
 Global options:
@@ -366,7 +369,7 @@ const COMMAND_GROUPS: Record<string, CliCommandGroup> = {
     },
   },
   studies: {
-    description: "Lock and validate local ML study benchmark inputs.",
+    description: "Lock benchmarks and run target-free-validation ML study trials.",
     subcommands: {
       lock: {
         usage: "tt-local studies lock <study.json> [options]",
@@ -388,6 +391,17 @@ const COMMAND_GROUPS: Record<string, CliCommandGroup> = {
         minPositionals: 1,
         maxPositionals: 1,
         missingPositionalsMessage: "studies validate requires <study.json>",
+      },
+      run: {
+        usage: "tt-local studies run <study.json> <trial.json> [options]",
+        description: "Run one command-backed trial and score its validation predictions.",
+        options: [
+          { name: "--lock", value: "path", description: "Benchmark lock path" },
+          { name: "--output-root", value: "path", description: "Root for immutable per-trial artifacts" },
+        ],
+        minPositionals: 2,
+        maxPositionals: 2,
+        missingPositionalsMessage: "studies run requires <study.json> <trial.json>",
       },
     },
   },
@@ -1257,6 +1271,25 @@ async function main(argv: string[]): Promise<void> {
         study_path: resolve(studyPath),
         lock_path: result.lockPath,
         benchmark_lock: result.lock,
+      });
+    }
+    if (subcommand === "run") {
+      const trialPath = cli.positionals[1];
+      if (!trialPath) throw new Error("studies run requires <study.json> <trial.json>");
+      const result = await runStudyTrial({
+        studyPath,
+        trialPath,
+        lockPath: readOption(argv, "--lock"),
+        outputRoot: readOption(argv, "--output-root"),
+      });
+      return printJson({
+        ok: true,
+        status: "completed",
+        study_path: resolve(studyPath),
+        trial_spec_path: resolve(trialPath),
+        trial_directory: result.trialDirectory,
+        report_path: result.reportPath,
+        trial_report: result.report,
       });
     }
     throw new Error(`Unknown studies command: ${subcommand}`);

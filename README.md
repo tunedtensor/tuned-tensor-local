@@ -39,9 +39,9 @@ repository.
 ## ML Study Benchmarks
 
 TT Local has a separate, model-independent StudySpec foundation for classic ML
-work. The first slice validates predefined binary-classification CSV splits
-and records their exact inputs in a deterministic benchmark lock; it does not
-train, select, or score models yet.
+work. It locks predefined binary-classification CSV splits, then runs
+independent command-backed algorithm trials against the same training and
+validation benchmark.
 
 Define the task and explicitly allowlist model inputs:
 
@@ -79,7 +79,8 @@ tt-local studies validate portfolio.study.json
 explicit. `studies validate` is read-only. It checks exact file hashes,
 ordered columns, row counts, the presence of both declared labels, duplicate
 IDs, and ID overlap between splits. Portable relative CSV paths resolve from
-the StudySpec.
+the StudySpec. `studies run` performs this validation itself, so a separate
+validate command is not required before every trial.
 
 The explicit `input_columns` allowlist is important: label-derived or
 future-derived export columns must never become model inputs accidentally.
@@ -91,6 +92,154 @@ detects changes but does not seal the test set or stop trial code from
 accessing it. Trading benchmarks must establish those split properties
 upstream and keep test data out of the trial loop until dedicated temporal and
 isolated-evaluation contracts are added.
+
+Define one immutable algorithm attempt separately from the benchmark:
+
+```json
+{
+  "schema_version": 1,
+  "id": "logreg-c1-v1",
+  "name": "Logistic regression C=1",
+  "runner": {
+    "command": ["python3", "scripts/logreg_trial.py"],
+    "cwd": ".",
+    "timeout_ms": 300000
+  },
+  "parameters": {
+    "c": 1,
+    "random_seed": 42
+  }
+}
+```
+
+Then run it:
+
+```bash
+tt-local studies run portfolio.study.json logreg-c1-v1.trial.json
+```
+
+TT Local creates
+`.tt-local/study-trials/logreg-c1-v1/`, appends
+`--input <trial-input.json> --output <predictions.json> --artifact-dir <model>`
+to the configured command, and keeps the projected data, command log,
+predictions, model files, and `trial-report.json` together. Those three flags
+are reserved. `cwd` resolves from the trial-spec directory; when omitted, the
+command starts in its new trial directory. A trial ID is write-once within
+the selected output root, including after a failed attempt, so use a new ID
+for each algorithm or parameter change.
+
+The command input points to two CSVs. Training contains only the ID,
+allowlisted features, and a target normalized to `0` or `1`. Validation
+contains only the ID and allowlisted features. Parameters are caller-provided
+JSON: TT Local records and passes them, but the runner must apply them. For
+example, a numeric-feature scikit-learn runner can be:
+
+```python
+import argparse
+import json
+from pathlib import Path
+
+import joblib
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", required=True)
+parser.add_argument("--output", required=True)
+parser.add_argument("--artifact-dir", required=True)
+args = parser.parse_args()
+
+request = json.loads(Path(args.input).read_text())
+task = request["task"]
+params = request["trial"]["parameters"]
+id_dtype = {task["id_column"]: "string"}
+training = pd.read_csv(request["datasets"]["training_csv"], dtype=id_dtype)
+validation = pd.read_csv(request["datasets"]["validation_csv"], dtype=id_dtype)
+
+model = LogisticRegression(
+    C=float(params["c"]),
+    random_state=int(params["random_seed"]),
+    max_iter=1000,
+)
+model.fit(training[task["input_columns"]], training[task["target_column"]])
+positive_index = list(model.classes_).index(1)
+probabilities = model.predict_proba(
+    validation[task["input_columns"]]
+)[:, positive_index]
+joblib.dump(model, Path(args.artifact_dir) / "model.joblib")
+
+result = {
+    "protocol_version": 1,
+    "predictions": [
+        {"id": str(row_id), "probability": float(probability)}
+        for row_id, probability in zip(
+            validation[task["id_column"]], probabilities, strict=True
+        )
+    ],
+}
+Path(args.output).write_text(json.dumps(result))
+```
+
+The command must write exactly one positive-class probability per validation
+ID:
+
+```json
+{
+  "protocol_version": 1,
+  "predictions": [
+    { "id": "validation-2", "probability": 0.82 },
+    { "id": "validation-1", "probability": 0.06 }
+  ]
+}
+```
+
+Prediction order is irrelevant. TT Local rejects missing, duplicate, unknown,
+non-finite, or out-of-range results and computes average precision, ROC AUC,
+and F1 at the fixed `0.5` threshold itself. Candidate-supplied labels or
+metrics are not accepted.
+
+The report records the primary score, all three trusted metrics, trial
+parameters, and hashes for the StudySpec, benchmark lock, projected data, and
+predictions:
+
+```json
+{
+  "trial": {
+    "id": "logreg-c1-v1",
+    "spec_sha256": "...",
+    "parameters": { "c": 1, "random_seed": 42 }
+  },
+  "evaluation": {
+    "primary_score": 0.84,
+    "metrics": {
+      "average_precision": 0.84,
+      "roc_auc": 0.88,
+      "f1_at_0_5": 0.73
+    },
+    "decision_threshold": 0.5,
+    "predictions_sha256": "..."
+  }
+}
+```
+
+The v1 contract requires calibrated positive-class probabilities. A raw
+Isolation Forest or One-Class SVM anomaly score must be calibrated before it
+is returned; a general ranking-score task is a future contract.
+
+This is a target-free validation projection, not a sandbox or confidentiality
+boundary. TT Local does not pass validation targets or test material through
+the command protocol, but IDs may themselves carry information and same-user
+code can inspect other host files, credentials under the home directory, or
+the network. Test data is never scored by `studies run`, but remains readable
+at its original path. Repeated validation scores are also an adaptive oracle.
+Use this loop for algorithm development, not as a sealed test result.
+
+The report binds the exact benchmark snapshot checked before launch. A later
+source change is rejected by the next run. It does not hash runner source,
+dependencies, environment, or model contents yet, so use immutable code and a
+dependency lock for reproducible trials. Do not put secrets in command
+arguments, names, or parameters: those values are persisted in inputs,
+reports, logs, and CLI output.
 
 ## First Local Run
 
