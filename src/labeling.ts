@@ -145,17 +145,22 @@ export function parseUnlabeledJsonl(text: string, maxRows: number): ParseResult 
  * quotes). tt-local deliberately avoids a CSV dependency; this covers the
  * upload formats the hosted labeling dialog accepts.
  */
-export function parseCsvRecords(text: string): { fields: string[]; records: string[][]; errors: string[] } {
+export function parseCsvRecords(
+  text: string,
+  options: { strict?: boolean } = {},
+): { fields: string[]; records: string[][]; errors: string[] } {
   const records: string[][] = [];
   const errors: string[] = [];
   let record: string[] = [];
   let field = "";
   let inQuotes = false;
+  let closedQuotedField = false;
   let sawAny = false;
 
   const endField = () => {
     record.push(field);
     field = "";
+    closedQuotedField = false;
   };
   const endRecord = () => {
     endField();
@@ -175,15 +180,25 @@ export function parseCsvRecords(text: string): { fields: string[]; records: stri
           i += 1;
         } else {
           inQuotes = false;
+          closedQuotedField = true;
         }
       } else {
         field += char;
       }
       continue;
     }
+    if (closedQuotedField && char !== "," && char !== "\n" && char !== "\r") {
+      if (options.strict) {
+        pushError(errors, `Unexpected character after closing quote at offset ${i + 1}`);
+      }
+      closedQuotedField = false;
+    }
     if (char === "\"" && field.length === 0) {
       inQuotes = true;
       continue;
+    }
+    if (char === "\"" && options.strict) {
+      pushError(errors, `Unexpected quote in unquoted field at offset ${i + 1}`);
     }
     if (char === ",") {
       endField();
