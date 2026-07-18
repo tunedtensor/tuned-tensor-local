@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import {
+  chmod,
+  cp,
   mkdir,
   mkdtemp,
   readFile,
@@ -620,7 +622,7 @@ test("runs the bundled numeric logistic-regression trial deterministically", asy
     };
     assert.deepEqual(manifest.runner, {
       name: "numeric_logistic_regression",
-      version: 1,
+      version: 2,
     });
     assert.deepEqual(manifest.training.class_counts, {
       negative: 3,
@@ -651,6 +653,115 @@ test("runs the bundled numeric logistic-regression trial deterministically", asy
     );
     assert.equal(first.report.provenance.model.file_count, 2);
     assert.ok(first.report.provenance.model.size_bytes > 0);
+
+    const predictionInput = {
+      protocol_version: 1,
+      task: {
+        type: "binary_classification",
+        id_column: "id",
+        input_columns: ["spread_bps", "volume"],
+        prediction: {
+          field: "probability",
+          meaning: "probability_of_positive_target",
+        },
+      },
+      dataset: {
+        prediction_csv: join(first.trialDirectory, "validation.csv"),
+      },
+    };
+    const predictionInputPath = join(root, "saved-model-prediction-input.json");
+    await writeFile(
+      predictionInputPath,
+      `${JSON.stringify(predictionInput, null, 2)}\n`,
+      "utf8",
+    );
+    const bundledCommand = buildStudyTrialRunnerCommand({
+      builtin: "numeric_logistic_regression",
+      timeout_ms: 120_000,
+    });
+    const runSavedModel = (
+      inputPath: string,
+      modelDirectory: string,
+      outputName: string,
+    ) => spawnSync(bundledCommand.command, [
+      ...bundledCommand.baseArgs,
+      "--input",
+      inputPath,
+      "--output",
+      join(root, outputName),
+      "--model-dir",
+      modelDirectory,
+    ], { cwd: root, encoding: "utf8" });
+    const savedModel = runSavedModel(
+      predictionInputPath,
+      join(first.trialDirectory, "model"),
+      "saved-model-predictions.json",
+    );
+    assert.equal(savedModel.status, 0, savedModel.stderr);
+    assert.deepEqual(
+      JSON.parse(await readFile(join(root, "saved-model-predictions.json"), "utf8")),
+      JSON.parse(await readFile(join(first.trialDirectory, "predictions.json"), "utf8")),
+    );
+
+    const unknownRequestPath = join(root, "unknown-prediction-input.json");
+    await writeFile(unknownRequestPath, `${JSON.stringify({
+      ...predictionInput,
+      unexpected: true,
+    }, null, 2)}\n`, "utf8");
+    const unknownRequest = runSavedModel(
+      unknownRequestPath,
+      join(first.trialDirectory, "model"),
+      "unknown-request-predictions.json",
+    );
+    assert.equal(unknownRequest.status, 1);
+    assert.match(
+      unknownRequest.stderr,
+      /prediction input has unknown fields.*unexpected/i,
+    );
+
+    const driftModelDirectory = join(root, "drift-model");
+    await cp(
+      join(first.trialDirectory, "model"),
+      driftModelDirectory,
+      { recursive: true },
+    );
+    const driftManifestPath = join(driftModelDirectory, "runner-manifest.json");
+    const driftManifestText = await readFile(driftManifestPath, "utf8");
+    const oldManifest = JSON.parse(driftManifestText);
+    oldManifest.runner.version = 1;
+    await chmod(driftManifestPath, 0o600);
+    await writeFile(
+      driftManifestPath,
+      `${JSON.stringify(oldManifest, null, 2)}\n`,
+      "utf8",
+    );
+    const oldRunner = runSavedModel(
+      predictionInputPath,
+      driftModelDirectory,
+      "old-runner-predictions.json",
+    );
+    assert.equal(oldRunner.status, 1);
+    assert.match(
+      oldRunner.stderr,
+      /must identify numeric_logistic_regression version 2/i,
+    );
+
+    await writeFile(driftManifestPath, driftManifestText, "utf8");
+    const driftModelPath = join(driftModelDirectory, "model.joblib");
+    const driftModel = await readFile(driftModelPath);
+    driftModel[0] = driftModel[0]! ^ 1;
+    await chmod(driftModelPath, 0o600);
+    await writeFile(driftModelPath, driftModel);
+    const changedModel = runSavedModel(
+      predictionInputPath,
+      driftModelDirectory,
+      "changed-model-predictions.json",
+    );
+    assert.equal(changedModel.status, 1);
+    assert.match(
+      changedModel.stderr,
+      /saved model SHA-256 does not match/i,
+    );
   });
 });
 
