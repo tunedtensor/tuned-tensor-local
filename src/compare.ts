@@ -17,7 +17,6 @@ interface RunSummary {
   candidate_avg_score: number;
   candidate_avg_token_f1: number | null;
   avg_score_delta: number;
-  fallback_scored_count: number;
 }
 
 export interface RunComparison {
@@ -31,11 +30,6 @@ export interface RunComparison {
     candidate_avg_token_f1_delta: number | null;
   };
   b_only: SubsetSide & { examples: number };
-  judge_noise: {
-    identical_baseline_outputs: number;
-    mean_score_spread: number | null;
-    max_score_spread: number | null;
-  };
   notes: string[];
 }
 
@@ -58,8 +52,6 @@ function summarizeRun(report: RunReport): RunSummary {
     candidate_avg_score: report.candidate.avg_score,
     candidate_avg_token_f1: report.candidate.avg_token_f1 ?? null,
     avg_score_delta: report.comparison.avg_score_delta,
-    fallback_scored_count: (report.baseline.fallback_scored_count ?? 0)
-      + (report.candidate.fallback_scored_count ?? 0),
   };
 }
 
@@ -84,8 +76,7 @@ function subsetSide(
  * Aligns two run reports on their shared eval prompts so recipe changes can
  * be compared apples-to-apples even when the eval set grew or shifted between
  * runs. Headline avg_score_delta values are not comparable across different
- * eval subsets; the shared subset is. Identical baseline outputs that appear
- * in both runs also give a free measurement of judge score noise.
+ * eval subsets; the shared subset is.
  */
 export function compareRuns(a: RunReport, b: RunReport): RunComparison {
   const aCandidate = byPrompt(a.candidate);
@@ -94,16 +85,6 @@ export function compareRuns(a: RunReport, b: RunReport): RunComparison {
   const bBaseline = byPrompt(b.baseline);
   const sharedPrompts = [...bCandidate.keys()].filter((prompt) => aCandidate.has(prompt));
   const bOnlyPrompts = [...bCandidate.keys()].filter((prompt) => !aCandidate.has(prompt));
-
-  const spreads: number[] = [];
-  let identical = 0;
-  for (const prompt of sharedPrompts) {
-    const first = aBaseline.get(prompt);
-    const second = bBaseline.get(prompt);
-    if (!first || !second || first.actual !== second.actual) continue;
-    identical += 1;
-    spreads.push(Math.abs(first.score - second.score));
-  }
 
   const sharedA = subsetSide(sharedPrompts, aBaseline, aCandidate);
   const sharedB = subsetSide(sharedPrompts, bBaseline, bCandidate);
@@ -117,13 +98,6 @@ export function compareRuns(a: RunReport, b: RunReport): RunComparison {
       + "are not directly comparable across the two runs. Use the shared subset for recipe comparisons.",
     );
   }
-  if (runA.fallback_scored_count + runB.fallback_scored_count > 0) {
-    notes.push(
-      `${runA.fallback_scored_count + runB.fallback_scored_count} example(s) across both runs were `
-      + "fallback-scored after judge failures; prefer judge_only_avg_score when comparing judge quality.",
-    );
-  }
-
   return {
     run_a: runA,
     run_b: runB,
@@ -141,11 +115,6 @@ export function compareRuns(a: RunReport, b: RunReport): RunComparison {
           : null,
     },
     b_only: { examples: bOnlyPrompts.length, ...subsetSide(bOnlyPrompts, bBaseline, bCandidate) },
-    judge_noise: {
-      identical_baseline_outputs: identical,
-      mean_score_spread: avg(spreads),
-      max_score_spread: spreads.length > 0 ? Math.max(...spreads) : null,
-    },
     notes,
   };
 }

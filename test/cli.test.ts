@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -26,7 +26,7 @@ interface CliResult {
   stderr: string;
 }
 
-function runCli(args: string[], cwd: string): CliResult {
+function runCli(args: string[], cwd: string, env: NodeJS.ProcessEnv = {}): CliResult {
   const storeRoot = join(cwd, "store");
   const result = spawnSync(
     process.execPath,
@@ -37,6 +37,7 @@ function runCli(args: string[], cwd: string): CliResult {
       env: {
         ...process.env,
         TT_LOCAL_HOME: storeRoot,
+        ...env,
       },
     },
   );
@@ -72,6 +73,11 @@ test("top-level help and version are available without loading project state", a
     assert.equal(help.status, 0);
     assert.match(help.stdout, /^Usage: tt-local <command> \[options\]/);
     assert.match(help.stdout, /-V, --version/);
+    assert.match(help.stdout, /serve <model-id>/);
+    assert.doesNotMatch(
+      help.stdout,
+      /\blabel\b|\bspecs\b|dashboard|rebuild-index|\breconcile\b|parent-model|model-artifact|--stage|--run-id|--detach|\bwatch\b|\bcancel\b/i,
+    );
     assert.equal(help.stderr, "");
 
     const version = runCli(["--version"], root);
@@ -91,17 +97,13 @@ test("command and nested-command help never execute work", async () => {
     await writeFile(join(root, ".env"), "TT_LOCAL_HELP_MUST_NOT_LOAD=true\n", "utf8");
     const cases = [
       { args: ["run", "--help"], usage: "tt-local run" },
+      { args: ["serve", "--help"], usage: "tt-local serve" },
       { args: ["models", "prefetch", "--help"], usage: "tt-local models prefetch" },
       { args: ["models", "verify-base", "--help"], usage: "tt-local models verify-base" },
       { args: ["models", "verify", "--help"], usage: "tt-local models verify" },
       { args: ["models", "serve", "--help"], usage: "tt-local models serve" },
       { args: ["runs", "report", "--help"], usage: "tt-local runs report" },
       { args: ["models", "--help"], usage: "tt-local models <command>" },
-      { args: ["studies", "run", "--help"], usage: "tt-local studies run" },
-      { args: ["studies", "promote", "--help"], usage: "tt-local studies promote" },
-      { args: ["studies", "test", "--help"], usage: "tt-local studies test" },
-      { args: ["studies", "validate", "--help"], usage: "tt-local studies validate" },
-      { args: ["studies", "--help"], usage: "tt-local studies <command>" },
     ];
 
     for (const { args, usage } of cases) {
@@ -114,209 +116,28 @@ test("command and nested-command help never execute work", async () => {
   });
 });
 
-test("held-out Study test parser failures do not create or consume work", async () => {
-  await withTemporaryProject((root) => {
-    const cases = [
-      {
-        args: ["studies", "test"],
-        error: /^studies test requires <study\.json>/,
-      },
-      {
-        args: ["studies", "test", "study.json", "--lock"],
-        error: /^Option --lock requires a value\./,
-      },
-      {
-        args: ["studies", "test", "study.json", "--output", "receipt.json"],
-        error: /^Unknown option: --output/,
-      },
-      {
-        args: ["studies", "test", "study.json", "extra.json"],
-        error: /^Too many arguments\. Usage: tt-local studies test/,
-      },
-    ];
-
-    for (const { args, error } of cases) {
-      const result = runCli(args, root);
-      assert.equal(result.status, 1);
-      assert.match(result.stderr, error);
-      assert.equal(result.stdout, "");
-      assertNoWorkCreated(root);
-    }
-  });
-});
-
-test("temporal Study lock, validation, and trial run end to end without the local store", async () => {
-  await withTemporaryProject(async (root) => {
-    const dataRoot = join(root, "data");
-    await mkdir(dataRoot, { recursive: true });
-    const header = "id,spread_bps,big_move,observed_at,future_observed_at\n";
-    await writeFile(
-      join(dataRoot, "training.csv"),
-      `${header}`
-      + "train-1,1.2,0,2026-07-03T00:00:00Z,2026-07-03T00:30:00Z\n"
-      + "train-2,8.4,1,2026-07-03T00:10:00Z,2026-07-03T00:40:00Z\n",
-      "utf8",
-    );
-    await writeFile(
-      join(dataRoot, "validation.csv"),
-      `${header}`
-      + "validation-1,1.4,0,2026-07-03T02:00:00Z,2026-07-03T02:30:00Z\n"
-      + "validation-2,7.9,1,2026-07-03T02:10:00Z,2026-07-03T02:40:00Z\n",
-      "utf8",
-    );
-    await writeFile(
-      join(dataRoot, "test.csv"),
-      `${header}`
-      + "test-1,1.1,0,2026-07-03T04:00:00Z,2026-07-03T04:30:00Z\n"
-      + "test-2,8.1,1,2026-07-03T04:10:00Z,2026-07-03T04:40:00Z\n",
-      "utf8",
-    );
-    const studyPath = join(root, "portfolio.study.json");
-    await writeFile(studyPath, `${JSON.stringify({
-      schema_version: 1,
-      name: "Portfolio anomaly benchmark",
-      task: {
-        type: "binary_classification",
-        id_column: "id",
-        input_columns: ["spread_bps", "observed_at"],
-        target_column: "big_move",
-        labels: { negative: "0", positive: "1" },
-        primary_metric: "average_precision",
-      },
-      dataset: {
-        format: "csv",
-        splits: {
-          training: "data/training.csv",
-          validation: "data/validation.csv",
-          test: "data/test.csv",
-        },
-        temporal: {
-          policy: "ordered_purged",
-          event_time_column: "observed_at",
-          label_end_time_column: "future_observed_at",
-          label_horizon_seconds: 3_600,
-          embargo_seconds: 300,
-        },
-      },
-    }, null, 2)}\n`, "utf8");
-
-    const locked = runCli(["studies", "lock", studyPath], root);
-    assert.equal(locked.status, 0, locked.stderr);
-    const lockedOutput = JSON.parse(locked.stdout) as {
-      ok: boolean;
-      lock_path: string;
-      benchmark_lock: {
-        dataset: {
-          temporal: {
-            policy: string;
-            splits: { test: { event_time: { min: string } } };
-          };
-        };
-      };
-    };
-    assert.equal(lockedOutput.ok, true);
-    assert.equal(lockedOutput.benchmark_lock.dataset.temporal.policy, "ordered_purged");
-    assert.equal(
-      lockedOutput.benchmark_lock.dataset.temporal.splits.test.event_time.min,
-      "2026-07-03T04:00:00Z",
-    );
-    const lockText = await readFile(lockedOutput.lock_path, "utf8");
-
-    const validated = runCli(["studies", "validate", studyPath], root);
-    assert.equal(validated.status, 0, validated.stderr);
-    assert.equal(JSON.parse(validated.stdout).ok, true);
-
-    const runnerPath = join(root, "trial-runner.mjs");
-    await writeFile(runnerPath, `
-      import { readFileSync, writeFileSync } from "node:fs";
-      const arg = (name) => process.argv[process.argv.indexOf(name) + 1];
-      const input = JSON.parse(readFileSync(arg("--input"), "utf8"));
-      const validation = readFileSync(input.datasets.validation_csv, "utf8");
-      if (validation !== "id,spread_bps,observed_at\\nvalidation-1,1.4,2026-07-03T02:00:00Z\\nvalidation-2,7.9,2026-07-03T02:10:00Z\\n") {
-        throw new Error("validation projection contains unexpected data");
-      }
-      if (JSON.stringify(input).includes("future_observed_at") || "temporal" in input) {
-        throw new Error("future or temporal metadata leaked into trial input");
-      }
-      writeFileSync(arg("--output"), JSON.stringify({
-        protocol_version: 1,
-        predictions: [
-          { id: "validation-2", probability: 0.9 },
-          { id: "validation-1", probability: 0.1 }
-        ]
-      }));
-    `, "utf8");
-    const trialPath = join(root, "logreg.trial.json");
-    await writeFile(trialPath, `${JSON.stringify({
-      schema_version: 1,
-      id: "logreg-v1",
-      name: "Logistic regression",
-      runner: {
-        command: [process.execPath, runnerPath],
-        cwd: ".",
-        timeout_ms: 10_000,
-        provenance: {
-          source_files: ["trial-runner.mjs"],
-          dependency_lock_files: [],
-        },
-      },
-      parameters: { c: 1 },
-    }, null, 2)}\n`, "utf8");
-    const trialOutputRoot = join(root, "trial-output");
-    const trial = runCli([
-      "studies",
-      "run",
-      studyPath,
-      trialPath,
-      "--output-root",
-      trialOutputRoot,
-    ], root);
-    assert.equal(trial.status, 0, trial.stderr);
-    const trialResult = JSON.parse(trial.stdout) as {
-      ok: boolean;
-      trial_report: {
-        data: {
-          temporal: {
-            policy: string;
-            splits: Record<string, unknown>;
-          };
-        };
-        evaluation: { primary_score: number };
-      };
-      report_path: string;
-    };
-    assert.equal(trialResult.ok, true);
-    assert.equal(trialResult.trial_report.evaluation.primary_score, 1);
-    assert.equal(trialResult.trial_report.data.temporal.policy, "ordered_purged");
-    assert.equal("test" in trialResult.trial_report.data.temporal.splits, false);
-    assert.equal(existsSync(trialResult.report_path), true);
-
-    const validationData = await readFile(join(dataRoot, "validation.csv"), "utf8");
-    await writeFile(
-      join(dataRoot, "validation.csv"),
-      validationData.replace("validation-2,7.9", "validation-2,7.8"),
-      "utf8",
-    );
-    const drifted = runCli(["studies", "validate", studyPath], root);
-    assert.equal(drifted.status, 1);
-    assert.match(drifted.stderr, /dataset\.splits\.validation\.sha256.*expected.*found/is);
-    assert.equal(await readFile(lockedOutput.lock_path, "utf8"), lockText);
-    assertNoWorkCreated(root);
-  });
-});
-
 test("unknown options are rejected before run, nested, or store work", async () => {
   await withTemporaryProject((root) => {
     for (const args of [
       ["--dryrun"],
       ["run", "--dryrun"],
+      ["run", "--parent-model", "model-id"],
+      ["run", "--model-artifact", "artifact"],
+      ["run", "--stage", "train"],
+      ["run", "--force"],
+      ["run", "--run-id", "11111111-1111-4111-8111-111111111111"],
+      ["run", "--user-id", "someone"],
+      ["run", "--detach"],
       ["models", "prefetch", "--dryrun"],
-      ["models", "serve", "model-id", "--public"],
+      ["serve", "model-id", "--public"],
       ["runs", "list", "--wat"],
     ]) {
       const result = runCli(args, root);
       assert.equal(result.status, 1);
-      assert.match(result.stderr, /^Unknown option: --(?:dryrun|public|wat)/);
+      assert.match(
+        result.stderr,
+        /^Unknown option: --(?:dryrun|parent-model|model-artifact|stage|force|run-id|user-id|detach|public|wat)/,
+      );
       assert.equal(result.stdout, "");
       assertNoWorkCreated(root);
     }
@@ -327,13 +148,13 @@ test("options that require values fail clearly and before filesystem access", as
   await withTemporaryProject((root) => {
     for (const args of [
       ["run", "--config"],
-      ["run", "--stage", "--quiet"],
-      ["serve", "--port="],
-      ["models", "prefetch", "--user-id"],
+      ["serve", "model-id", "--port="],
+      ["models", "prefetch", "--config"],
+      ["init", "--name"],
     ]) {
       const result = runCli(args, root);
       assert.equal(result.status, 1);
-      assert.match(result.stderr, /^Option --(?:config|stage|port|user-id) requires a value\./);
+      assert.match(result.stderr, /^Option --(?:config|port|name) requires a value\./);
       assert.equal(result.stdout, "");
       assertNoWorkCreated(root);
     }
@@ -353,10 +174,210 @@ test("extra positional arguments and duplicate options are rejected", async () =
   });
 });
 
+test("removed generalized commands are no longer part of the CLI", async () => {
+  await withTemporaryProject((root) => {
+    const cases = [
+      { args: ["label", "rows.jsonl"], message: /^Unknown command: label/ },
+      { args: ["specs", "list"], message: /^Unknown command: specs/ },
+      { args: ["store", "rebuild-index"], message: /^Unknown command: store/ },
+      { args: ["runs", "reconcile"], message: /^Unknown runs command: reconcile/ },
+      { args: ["runs", "watch", "run-id"], message: /^Unknown runs command: watch/ },
+      { args: ["runs", "cancel", "run-id"], message: /^Unknown runs command: cancel/ },
+    ];
+    for (const { args, message } of cases) {
+      const result = runCli(args, root);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, message);
+      assert.equal(result.stdout, "");
+      assertNoWorkCreated(root);
+    }
+  });
+});
+
+test("public workflow commands reject full run-request JSON", async () => {
+  await withTemporaryProject(async (root) => {
+    const requestPath = join(root, "request.json");
+    await writeFile(requestPath, `${JSON.stringify({
+      run_id: "99999999-9999-4999-8999-999999999999",
+      user_id: "hosted-user",
+      behavior_spec_id: "88888888-8888-4888-8888-888888888888",
+      run_number: 42,
+      spec_snapshot: {
+        name: "Hosted request",
+        description: "",
+        system_prompt: "Answer briefly.",
+        guidelines: [],
+        constraints: [],
+        base_model: "Qwen/Qwen3.5-2B",
+        examples: [
+          { input: "One", output: "1" },
+          { input: "Two", output: "2" },
+        ],
+      },
+      hyperparameters: { n_epochs: 1 },
+    })}\n`, "utf8");
+
+    for (const command of ["doctor", "validate", "run"] as const) {
+      const result = runCli([command, requestPath], root);
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /expects a tunedtensor\.json behavior spec, not a full run request/);
+      assertNoWorkCreated(root);
+    }
+  });
+});
+
+test("adjacent config is discovered for init, doctor, validate, and dry-run", async () => {
+  await withTemporaryProject(async (root) => {
+    const project = join(root, "project");
+    const specPath = join(project, "tunedtensor.json");
+    const configPath = join(project, "local-runner.json");
+    await mkdir(project, { recursive: true });
+    await writeFile(configPath, `${JSON.stringify({
+      artifactRoot: "artifacts",
+      storeRoot: "state",
+      dryRun: true,
+    })}\n`, "utf8");
+
+    const initialized = runCli(["init", "--output", specPath], root);
+    assert.equal(initialized.status, 0, initialized.stderr);
+    assert.equal(JSON.parse(initialized.stdout).config_path, configPath);
+
+    await writeFile(specPath, `${JSON.stringify({
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      name: "Adjacent config",
+      description: "",
+      system_prompt: "Answer the user accurately and briefly.",
+      guidelines: [],
+      constraints: [],
+      base_model: "Qwen/Qwen3.5-2B",
+      examples: [
+        { input: "Say yes.", output: "Yes." },
+        { input: "Say no.", output: "No." },
+      ],
+      hyperparameters: { n_epochs: 1 },
+    })}\n`, "utf8");
+
+    const doctor = runCli(["doctor", specPath], root);
+    assert.ok(doctor.status === 0 || doctor.status === 1, doctor.stderr);
+    assert.equal(JSON.parse(doctor.stdout).config_path, configPath);
+
+    const defaultDoctor = runCli(["doctor"], project);
+    assert.ok(defaultDoctor.status === 0 || defaultDoctor.status === 1, defaultDoctor.stderr);
+    const defaultDoctorOutput = JSON.parse(defaultDoctor.stdout) as {
+      config_path: string;
+      checks: Array<{ name: string }>;
+    };
+    assert.equal(
+      await realpath(defaultDoctorOutput.config_path),
+      await realpath(configPath),
+    );
+    assert.ok(defaultDoctorOutput.checks.some((check) => check.name === "spec-content"));
+
+    const validated = runCli(["validate", specPath], root);
+    assert.equal(validated.status, 0, validated.stderr);
+    const validation = JSON.parse(validated.stdout) as Record<string, unknown>;
+    assert.equal(validation.config_path, configPath);
+    assert.equal(validation.artifact_root, join(project, "artifacts"));
+    assert.equal(validation.store_root, join(project, "state"));
+    assert.equal(validation.dry_run, true);
+    assert.equal("training_method" in validation, false);
+
+    const run = runCli(["run", specPath, "--quiet"], root);
+    assert.equal(run.status, 0, run.stderr);
+    const output = JSON.parse(run.stdout) as Record<string, unknown>;
+    assert.equal(output.status, "completed");
+    assert.equal("model_id" in output, false);
+    assert.equal("fine_tuned_model_id" in output, false);
+    assert.ok(String(output.artifact_dir).startsWith(join(project, "artifacts")));
+
+    const runs = runCli(["runs", "list"], project);
+    assert.equal(runs.status, 0, runs.stderr);
+    assert.equal(JSON.parse(runs.stdout).length, 1);
+
+    const models = runCli(["models", "list"], project);
+    assert.equal(models.status, 0, models.stderr);
+    assert.deepEqual(JSON.parse(models.stdout), []);
+  });
+});
+
+test("one-command real runs prefetch and pin an immutable base-model revision", async () => {
+  await withTemporaryProject(async (root) => {
+    const project = join(root, "project");
+    const fakeBin = join(root, "bin");
+    const callsPath = join(root, "uv-calls.log");
+    const specPath = join(project, "tunedtensor.json");
+    await mkdir(project, { recursive: true });
+    await mkdir(fakeBin, { recursive: true });
+    await writeFile(join(project, "local-runner.json"), `${JSON.stringify({
+      artifactRoot: "artifacts",
+      storeRoot: "state",
+      dryRun: false,
+    })}\n`, "utf8");
+    await writeFile(specPath, `${JSON.stringify({
+      id: "77777777-7777-4777-8777-777777777777",
+      name: "Pinned run",
+      description: "",
+      system_prompt: "Answer accurately.",
+      guidelines: [],
+      constraints: [],
+      base_model: "Qwen/Qwen3.5-2B",
+      examples: [
+        { input: "One", output: "1" },
+        { input: "Two", output: "2" },
+      ],
+      hyperparameters: { n_epochs: 1 },
+    })}\n`, "utf8");
+    const fakeUv = join(fakeBin, "uv");
+    await writeFile(fakeUv, `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const isPrefetch = args.some((value) => value.endsWith("prefetch.py"));
+fs.appendFileSync(${JSON.stringify(callsPath)}, isPrefetch ? "prefetch\\n" : "other\\n");
+if (!isPrefetch) process.exit(23);
+const outputIndex = args.indexOf("--output");
+if (outputIndex === -1 || !args[outputIndex + 1]) process.exit(24);
+fs.writeFileSync(args[outputIndex + 1], JSON.stringify({
+  ok: true,
+  base_model: "Qwen/Qwen3.5-2B",
+  snapshot_revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  snapshot_path: "/fake/snapshot",
+  file_count: 4,
+  size_bytes: 100,
+}) + "\\n");
+`, "utf8");
+    await chmod(fakeUv, 0o755);
+
+    const result = runCli(["run", specPath, "--quiet"], root, {
+      PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /exited (?:with code )?23/);
+
+    const calls = (await readFile(callsPath, "utf8")).trim().split("\n");
+    assert.deepEqual(calls.slice(0, 2), ["prefetch", "other"]);
+    assert.equal(calls.filter((call) => call === "prefetch").length, 1);
+
+    const store = createLocalStore(join(project, "state"));
+    const runs = await store.listRuns();
+    assert.equal(runs.length, 1);
+    const persisted = fineTuneRunRequestSchema.parse(JSON.parse(
+      await readFile(join(store.paths.runsDir, runs[0]!.id, "request.json"), "utf8"),
+    ));
+    assert.equal(
+      persisted.hyperparameters.base_model_revision,
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+  });
+});
+
 test("stored models are verified before a serving launch plan is produced", async () => {
   await withTemporaryProject(async (root) => {
     const runId = "11111111-1111-4111-8111-111111111111";
     const specId = "22222222-2222-4222-8222-222222222222";
+    const modelStoreRoot = join(root, "model-state");
+    await writeFile(join(root, "local-runner.json"), `${JSON.stringify({
+      storeRoot: "model-state",
+    })}\n`, "utf8");
     const request = fineTuneRunRequestSchema.parse({
       run_id: runId,
       user_id: "local-user",
@@ -373,13 +394,10 @@ test("stored models are verified before a serving launch plan is produced", asyn
       },
       hyperparameters: {
         n_epochs: 1,
-        augment: false,
-        use_llm_judge: false,
-        save_adapter_only: true,
       },
     });
     const artifacts = resolveRunArtifacts({ artifactRoot: join(root, "artifacts"), prefix: "run" });
-    const store = createLocalStore(join(root, "store"));
+    const store = createLocalStore(modelStoreRoot);
     await prepareRunDirectories(artifacts);
     await store.startRun({ request, artifactDir: artifacts.runDir });
     const adapterWeights = join(artifacts.trainingModelDir, "adapter_model.safetensors");
@@ -400,7 +418,7 @@ test("stored models are verified before a serving launch plan is produced", asyn
     await writeArtifactManifest(artifacts, {
       model: {
         artifact_kind: "directory",
-        format: "peft-directory",
+        format: "huggingface-directory",
         framework: "transformers-peft",
         base_model: request.spec_snapshot.base_model,
         base_model_revision: "revision-a",
@@ -424,49 +442,27 @@ test("stored models are verified before a serving launch plan is produced", asyn
     const verifiedManifest = runCli(["models", "verify", artifacts.artifactManifestJson], root);
     assert.equal(verifiedManifest.status, 0, verifiedManifest.stderr);
 
-    const launch = runCli(["models", "serve", modelId, "--print-command"], root);
+    const launch = runCli(["serve", modelId, "--print-command"], root);
     assert.equal(launch.status, 0, launch.stderr);
     const launchPlan = JSON.parse(launch.stdout) as { ok: boolean; url: string; command: string[] };
     assert.equal(launchPlan.ok, true);
     assert.equal(launchPlan.url, "http://127.0.0.1:8000");
     assert.ok(launchPlan.command.some((part) => part.endsWith("training/local-runner/src/serve.py")));
 
-    const childRunId = "33333333-3333-4333-8333-333333333333";
-    const childRequest = fineTuneRunRequestSchema.parse({
-      ...request,
-      run_id: childRunId,
-      run_number: 2,
-    });
-    const childPath = join(root, "child-request.json");
-    await writeFile(childPath, `${JSON.stringify(childRequest)}\n`, "utf8");
-    const continued = runCli([
-      "run", childPath, "--parent-model", modelId, "--dry-run", "--stage", "prepare", "--quiet",
-    ], root);
-    assert.equal(continued.status, 0, continued.stderr);
-    const persistedChild = fineTuneRunRequestSchema.parse(JSON.parse(
-      await readFile(join(store.paths.runsDir, childRunId, "request.json"), "utf8"),
-    ));
-    assert.equal(persistedChild.hyperparameters.base_model_revision, "revision-a");
-    assert.equal(persistedChild.hyperparameters.parent_model_artifact, training.model_artifact_uri);
+    const aliasLaunch = runCli(["models", "serve", modelId, "--print-command"], root);
+    assert.equal(aliasLaunch.status, 0, aliasLaunch.stderr);
+    assert.equal(JSON.parse(aliasLaunch.stdout).url, launchPlan.url);
 
-    const mismatchPath = join(root, "mismatched-child-request.json");
-    await writeFile(mismatchPath, `${JSON.stringify({
-      ...childRequest,
-      run_id: "44444444-4444-4444-8444-444444444444",
-      hyperparameters: { ...childRequest.hyperparameters, base_model_revision: "revision-b" },
-    })}\n`, "utf8");
-    const mismatchedRevision = runCli([
-      "run", mismatchPath, "--parent-model", modelId, "--dry-run", "--stage", "prepare", "--quiet",
-    ], root);
-    assert.equal(mismatchedRevision.status, 1);
-    assert.match(mismatchedRevision.stderr, /uses base revision revision-a, but this run requests revision-b/);
+    const unsupportedDevice = runCli(["serve", modelId, "--device", "mps", "--print-command"], root);
+    assert.equal(unsupportedDevice.status, 1);
+    assert.match(unsupportedDevice.stderr, /--device must be cuda or cpu/);
 
     const runRequestPath = join(store.paths.runsDir, runId, "request.json");
     await writeFile(runRequestPath, `${JSON.stringify({
       ...request,
       spec_snapshot: { ...request.spec_snapshot, system_prompt: "Changed after training." },
     })}\n`, "utf8");
-    const mismatchedPrompt = runCli(["models", "serve", modelId, "--print-command"], root);
+    const mismatchedPrompt = runCli(["serve", modelId, "--print-command"], root);
     assert.equal(mismatchedPrompt.status, 1);
     assert.match(mismatchedPrompt.stderr, /do not match the prompt fingerprint/);
     await writeFile(runRequestPath, `${JSON.stringify(request)}\n`, "utf8");

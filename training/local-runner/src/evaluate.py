@@ -1,31 +1,34 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import tarfile
 import time
-import urllib.request
-from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
+
+from model_contract import (
+    CERTIFIED_BASE_MODEL,
+    assert_certified_model_config,
+)
 
 MAX_ARCHIVE_MEMBERS = 20_000
 MAX_ARCHIVE_EXPANDED_BYTES = 20 * 1024 * 1024 * 1024
 
 
 def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text())
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected a JSON object in {path}")
+    return value
 
 
 def configure_hugging_face_cache(cache_home: str | None) -> None:
     """Treat model_cache as HF_HOME and keep legacy overrides consistent."""
     if not cache_home:
         return
-    # Preserve the lexical absolute path chosen by the Node runner rather than
-    # canonicalizing platform symlinks such as macOS /var -> /private/var.
     home = Path(cache_home).expanduser().absolute()
     hub = home / "hub"
     os.environ.update({
@@ -42,27 +45,19 @@ def configure_hugging_face_cache(cache_home: str | None) -> None:
 
 
 def import_runtime_dependencies() -> None:
-    """Import libraries that read Hugging Face cache settings at import time."""
-    global torch, PeftModel, Image
-    global AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
+    """Import libraries only after Hugging Face cache settings are final."""
+    global torch, PeftModel, AutoModelForCausalLM, AutoTokenizer
 
     import torch as torch_module
     from peft import PeftModel as peft_model
-    from PIL import Image as pil_image
     from transformers import (
         AutoModelForCausalLM as auto_model_for_causal_lm,
-        AutoModelForImageTextToText as auto_model_for_image_text_to_text,
-        AutoProcessor as auto_processor,
         AutoTokenizer as auto_tokenizer,
     )
 
     torch = torch_module
     PeftModel = peft_model
-    Image = pil_image
-    Image.MAX_IMAGE_PIXELS = 20_000_000
     AutoModelForCausalLM = auto_model_for_causal_lm
-    AutoModelForImageTextToText = auto_model_for_image_text_to_text
-    AutoProcessor = auto_processor
     AutoTokenizer = auto_tokenizer
 
 
@@ -74,6 +69,27 @@ def strip_file_uri(value: str | None) -> str | None:
     return value
 
 
+def _extract_adapter_archive(path: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    destination_root = destination.resolve()
+    with tarfile.open(path, "r:gz") as archive:
+        members = archive.getmembers()
+        if len(members) > MAX_ARCHIVE_MEMBERS:
+            raise ValueError(f"Model archive exceeds {MAX_ARCHIVE_MEMBERS} members")
+        expanded_bytes = sum(max(0, member.size) for member in members if member.isfile())
+        if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
+            raise ValueError("Model archive exceeds the 20 GiB expanded-size limit")
+        for member in members:
+            member_path = (destination / member.name).resolve()
+            try:
+                member_path.relative_to(destination_root)
+            except ValueError as exc:
+                raise ValueError(f"Unsafe archive member: {member.name}") from exc
+            if member.issym() or member.islnk() or member.isdev():
+                raise ValueError(f"Unsafe archive member type: {member.name}")
+        archive.extractall(destination)
+
+
 def resolve_adapter_path(value: str | None, tmp: Path) -> str | None:
     path_value = strip_file_uri(value)
     if not path_value:
@@ -81,40 +97,20 @@ def resolve_adapter_path(value: str | None, tmp: Path) -> str | None:
     path = Path(path_value)
     if path.is_file() and path.name.endswith(".tar.gz"):
         extracted = tmp / "adapter"
-        extracted.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(path, "r:gz") as tar:
-            members = tar.getmembers()
-            if len(members) > MAX_ARCHIVE_MEMBERS:
-                raise ValueError(f"Model archive exceeds {MAX_ARCHIVE_MEMBERS} members")
-            expanded_bytes = sum(max(0, member.size) for member in members if member.isfile())
-            if expanded_bytes > MAX_ARCHIVE_EXPANDED_BYTES:
-                raise ValueError("Model archive exceeds the 20 GiB expanded-size limit")
-            for member in members:
-                destination = (extracted / member.name).resolve()
-                try:
-                    destination.relative_to(extracted.resolve())
-                except ValueError:
-                    raise ValueError(f"Unsafe archive member: {member.name}")
-                if member.issym() or member.islnk() or member.isdev():
-                    raise ValueError(f"Unsafe archive member type: {member.name}")
-            tar.extractall(extracted)
-        candidates = [candidate for candidate in extracted.rglob("adapter_config.json")]
+        _extract_adapter_archive(path, extracted)
+        candidates = sorted(extracted.rglob("adapter_config.json"))
         if candidates:
             return str(candidates[0].parent)
-        directories = [candidate for candidate in extracted.iterdir() if candidate.is_dir()]
-        return str(directories[0] if len(directories) == 1 else extracted)
+        raise ValueError(f"Adapter archive contains no adapter_config.json: {path}")
+    if not path.is_dir():
+        raise ValueError(f"Adapter path is not a directory or .tar.gz archive: {path}")
     return str(path)
-
-
-def fallback_prompt(system: str, prompt: str) -> str:
-    return f"system: {system}\nuser: {prompt}\nassistant:"
 
 
 def format_prompt(
     tokenizer: Any,
     system: str,
     prompt: str,
-    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> str:
     messages = [
         {"role": "system", "content": system},
@@ -125,90 +121,59 @@ def format_prompt(
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            **(chat_template_kwargs or {}),
         )
-    except Exception:
-        return fallback_prompt(system, prompt)
+    except Exception as exc:
+        raise ValueError(f"Qwen chat-template rendering failed: {exc}") from exc
 
 
 def resolve_device(device: str) -> str:
-    if device == "auto":
-        if torch.cuda.is_available():
-            return "cuda"
-        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
+    if device not in {"cuda", "cpu"}:
+        raise ValueError(f"device must be cuda or cpu; got {device!r}")
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA evaluation was requested, but torch.cuda.is_available() is false")
     return device
 
 
-def image_from_data_uri(value: str) -> Image.Image:
-    _, encoded = value.split(",", 1)
-    return Image.open(BytesIO(base64.b64decode(encoded))).convert("RGB")
-
-
-def load_image(value: str, base_dir: Path) -> Image.Image:
-    if value.startswith("data:"):
-        return image_from_data_uri(value)
-    if value.startswith("http://") or value.startswith("https://"):
-        with urllib.request.urlopen(value, timeout=30) as response:
-            return Image.open(BytesIO(response.read())).convert("RGB")
-    path_value = value[7:] if value.startswith("file://") else value
-    path = Path(path_value).expanduser()
-    if not path.is_absolute():
-        path = base_dir / path
-    return Image.open(path).convert("RGB")
-
-
-def example_assets(example: dict[str, Any]) -> list[str]:
-    assets = []
-    for asset in example.get("input_assets") or []:
-        if not isinstance(asset, dict):
-            continue
-        for key in ("image", "path", "uri", "data_uri"):
-            value = asset.get(key)
-            if isinstance(value, str) and value:
-                assets.append(value)
-                break
-    return assets
-
-
-def should_use_multimodal(payload: dict[str, Any]) -> bool:
-    if payload.get("model_loader") == "image_text_to_text":
-        return True
-    return any(example_assets(example) for example in payload.get("examples", []))
+def _assert_certified_model_source(base_model: str) -> None:
+    if not Path(base_model).exists() and base_model != CERTIFIED_BASE_MODEL:
+        raise ValueError(
+            f"The bundled evaluator currently certifies only {CERTIFIED_BASE_MODEL}; got {base_model!r}"
+        )
 
 
 def load_text_model(payload: dict[str, Any], adapter_path: str | None):
-    base_model = payload["base_model"]
-    trust_remote_code = bool(payload.get("trust_remote_code", True))
-    device = resolve_device(str(payload.get("device", "auto")))
+    base_model = str(payload["base_model"])
+    _assert_certified_model_source(base_model)
+    device = resolve_device(str(payload.get("device", "cuda")))
     token = os.getenv("HF_TOKEN")
     revision = payload.get("base_model_revision")
     source_kwargs: dict[str, Any] = {
-        "trust_remote_code": trust_remote_code,
+        "trust_remote_code": False,
         "token": token,
     }
+    if not Path(base_model).exists():
+        source_kwargs["local_files_only"] = True
     if revision and not Path(base_model).exists():
         source_kwargs["revision"] = revision
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        base_model,
-        **source_kwargs,
-    )
-    if tokenizer.pad_token is None:
+    tokenizer = AutoTokenizer.from_pretrained(base_model, **source_kwargs)
+    if tokenizer.eos_token_id is None:
+        raise ValueError(f"{CERTIFIED_BASE_MODEL} tokenizer has no EOS token")
+    if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     dtype = None
     if device == "cuda":
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
-    kwargs: dict[str, Any] = dict(source_kwargs)
+    model_kwargs: dict[str, Any] = dict(source_kwargs)
     if dtype is not None:
-        kwargs["torch_dtype"] = dtype
+        model_kwargs["dtype"] = dtype
     if device == "cuda":
-        kwargs["device_map"] = "auto"
+        model_kwargs["device_map"] = {"": torch.cuda.current_device()}
 
-    model = AutoModelForCausalLM.from_pretrained(base_model, **kwargs)
+    model = AutoModelForCausalLM.from_pretrained(base_model, **model_kwargs)
+    assert_certified_model_config(model.config)
     if adapter_path:
         model = PeftModel.from_pretrained(model, adapter_path)
     if device != "cuda":
@@ -217,47 +182,7 @@ def load_text_model(payload: dict[str, Any], adapter_path: str | None):
     return model, tokenizer, device
 
 
-def load_multimodal_model(payload: dict[str, Any], adapter_path: str | None):
-    base_model = payload["base_model"]
-    trust_remote_code = bool(payload.get("trust_remote_code", True))
-    device = resolve_device(str(payload.get("device", "auto")))
-    token = os.getenv("HF_TOKEN")
-    revision = payload.get("base_model_revision")
-    source_kwargs: dict[str, Any] = {
-        "trust_remote_code": trust_remote_code,
-        "token": token,
-    }
-    if revision and not Path(base_model).exists():
-        source_kwargs["revision"] = revision
-
-    processor = AutoProcessor.from_pretrained(
-        base_model,
-        **source_kwargs,
-    )
-    if getattr(processor, "tokenizer", None) is not None and processor.tokenizer.pad_token is None:
-        processor.tokenizer.pad_token = processor.tokenizer.eos_token
-
-    dtype = None
-    if device == "cuda":
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    kwargs: dict[str, Any] = dict(source_kwargs)
-    if dtype is not None:
-        kwargs["torch_dtype"] = dtype
-    if device == "cuda":
-        kwargs["device_map"] = "auto"
-
-    model = AutoModelForImageTextToText.from_pretrained(base_model, **kwargs)
-    if adapter_path:
-        model = PeftModel.from_pretrained(model, adapter_path)
-    if device != "cuda":
-        model = model.to(device)
-    model.eval()
-    return model, processor, device
-
-
 def sampling_kwargs(generation: dict[str, Any]) -> dict[str, Any]:
-    """Greedy decoding must not pass sampling flags: transformers warns that
-    temperature/top_p are ignored when do_sample=False."""
     temperature = float(generation.get("temperature", 0))
     if temperature <= 0:
         return {"do_sample": False}
@@ -274,15 +199,16 @@ def generate_text_one(
     system: str,
     example: dict[str, Any],
     generation: dict[str, Any],
-    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if example.get("input_assets"):
+        raise ValueError("The bundled Qwen SFT evaluator is text-only and does not accept input_assets")
     prompt = str(example["input"])
-    formatted = format_prompt(tokenizer, system, prompt, chat_template_kwargs)
+    formatted = format_prompt(tokenizer, system, prompt)
     inputs = tokenizer(formatted, return_tensors="pt")
     target_device = next(model.parameters()).device
     inputs = {key: value.to(target_device) for key, value in inputs.items()}
     started = time.perf_counter()
-    with torch.no_grad():
+    with torch.inference_mode():
         generated = model.generate(
             **inputs,
             max_new_tokens=int(generation.get("max_new_tokens", 256)),
@@ -300,62 +226,6 @@ def generate_text_one(
     }
 
 
-def generate_multimodal_one(
-    model: Any,
-    processor: Any,
-    system: str,
-    example: dict[str, Any],
-    generation: dict[str, Any],
-    base_dir: Path,
-    chat_template_kwargs: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    prompt = str(example["input"])
-    image_values = example_assets(example)
-    images = [load_image(value, base_dir) for value in image_values]
-    user_content: list[dict[str, str]] = [{"type": "image"} for _ in images]
-    user_content.append({"type": "text", "text": prompt})
-    messages = [
-        {"role": "system", "content": [{"type": "text", "text": system}]},
-        {"role": "user", "content": user_content},
-    ]
-    text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        **(chat_template_kwargs or {}),
-    )
-    inputs = processor(
-        text=[text],
-        images=images or None,
-        return_tensors="pt",
-    )
-    target_device = next(model.parameters()).device
-    inputs = {
-        key: value.to(target_device) if hasattr(value, "to") else value
-        for key, value in inputs.items()
-    }
-    started = time.perf_counter()
-    with torch.no_grad():
-        generated = model.generate(
-            **inputs,
-            max_new_tokens=int(generation.get("max_new_tokens", 256)),
-            pad_token_id=processor.tokenizer.eos_token_id,
-            **sampling_kwargs(generation),
-        )
-    latency_ms = max(0, round((time.perf_counter() - started) * 1000))
-    input_length = int(inputs["input_ids"].shape[-1])
-    actual = processor.batch_decode(
-        generated[:, input_length:],
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )[0].strip()
-    return {
-        "id": str(example["id"]),
-        "actual": actual,
-        "latency_ms": latency_ms,
-    }
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
@@ -365,41 +235,27 @@ def main() -> None:
     payload = load_json(Path(args.input))
     if payload.get("protocol_version") != 2:
         raise ValueError("Unsupported inference protocol; expected protocol_version 2")
+    if payload.get("model_loader") not in (None, "causal_lm"):
+        raise ValueError("The bundled evaluator is text-only and requires model_loader=causal_lm")
     configure_hugging_face_cache(payload.get("model_cache"))
     import_runtime_dependencies()
 
-    with TemporaryDirectory() as tmp_dir:
+    with TemporaryDirectory(prefix="tt-local-evaluate-") as tmp_dir:
         adapter_path = resolve_adapter_path(payload.get("adapter_path"), Path(tmp_dir))
         generation = payload.get("generation", {})
-        chat_template_kwargs = payload.get("chat_template_kwargs") or None
-        base_dir = Path(args.input).parent
-        if should_use_multimodal(payload):
-            model, processor, _device = load_multimodal_model(payload, adapter_path)
-            results = [
-                generate_multimodal_one(
-                    model,
-                    processor,
-                    str(payload.get("system", "")),
-                    example,
-                    generation,
-                    base_dir,
-                    chat_template_kwargs,
-                )
-                for example in payload.get("examples", [])
-            ]
-        else:
-            model, tokenizer, _device = load_text_model(payload, adapter_path)
-            results = [
-                generate_text_one(
-                    model,
-                    tokenizer,
-                    str(payload.get("system", "")),
-                    example,
-                    generation,
-                    chat_template_kwargs,
-                )
-                for example in payload.get("examples", [])
-            ]
+        if not isinstance(generation, dict):
+            raise ValueError("generation must be a JSON object")
+        model, tokenizer, _device = load_text_model(payload, adapter_path)
+        results = [
+            generate_text_one(
+                model,
+                tokenizer,
+                str(payload.get("system", "")),
+                example,
+                generation,
+            )
+            for example in payload.get("examples", [])
+        ]
 
     output = {
         "provider": "transformers",
@@ -409,8 +265,9 @@ def main() -> None:
         "generation_config": generation,
         "results": results,
     }
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.output).write_text(json.dumps(output, indent=2))
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

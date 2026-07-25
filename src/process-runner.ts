@@ -1,78 +1,65 @@
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { createWriteStream, type WriteStream } from "node:fs";
+import { createWriteStream, readFileSync, type WriteStream } from "node:fs";
 import { mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
 import { forwardStreamLines, reportInBackground, type LocalRunReporter } from "./run-reporter.js";
 
-export interface UvPythonEntrypointConfig {
-  backend?: "uv" | "command";
-  command?: string[];
-  project?: string;
-  cwd?: string;
-  module?: string;
-  script?: string;
-  args?: string[];
-  with?: string[];
-}
-
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const bundledLocalRunnerPrefix = "training/local-runner";
-
-function resolveBundledLocalRunnerPath(path: string | undefined): string | undefined {
-  if (!path) return undefined;
-  if (path === bundledLocalRunnerPrefix || path.startsWith(`${bundledLocalRunnerPrefix}/`)) {
-    return join(packageRoot, path);
+const bundledProject = join(packageRoot, "training/local-runner");
+const bundledRuntimeHash = (() => {
+  const hash = createHash("sha256");
+  for (const name of ["pyproject.toml", "uv.lock"]) {
+    hash.update(readFileSync(join(bundledProject, name)));
   }
-  return path;
-}
+  return hash.digest("hex").slice(0, 20);
+})();
+export const BUNDLED_PYTHON_ENVIRONMENT = join(
+  resolve(process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache")),
+  "tuned-tensor-local",
+  "uv",
+  bundledRuntimeHash,
+);
+type BundledPythonEntrypoint =
+  | "train.py"
+  | "evaluate.py"
+  | "prefetch.py"
+  | "serve.py"
+  | "-c";
 
-export function buildUvPythonArgs(
-  entrypoint: UvPythonEntrypointConfig,
-  options: { defaultScript?: string; extraArgs?: string[] } = {},
-): string[] {
-  const args: string[] = ["run"];
-  const project = resolveBundledLocalRunnerPath(entrypoint.project);
-  if (project) args.push("--project", project);
-  for (const dependency of entrypoint.with ?? []) args.push("--with", dependency);
-  args.push("python");
-  if (entrypoint.module) {
-    args.push("-m", entrypoint.module);
-  } else if (entrypoint.script) {
-    args.push(resolveBundledLocalRunnerPath(entrypoint.script) ?? entrypoint.script);
-  } else if (options.defaultScript) {
-    args.push(resolveBundledLocalRunnerPath(options.defaultScript) ?? options.defaultScript);
-  } else {
-    throw new Error("uv python entrypoint requires module, script, or defaultScript");
-  }
-  args.push(...(entrypoint.args ?? []), ...(options.extraArgs ?? []));
-  return args;
-}
-
-export function buildEntrypointCommand(
-  entrypoint: UvPythonEntrypointConfig,
-  options: { defaultScript?: string; extraArgs?: string[] } = {},
-): { command: string; commandArgs: string[]; displayCommand: string[]; kind: "uv" | "command" } {
-  if (entrypoint.backend === "command") {
-    const [command, ...baseArgs] = entrypoint.command ?? [];
-    if (!command) {
-      throw new Error("command entrypoint requires command");
-    }
-    const commandArgs = [...baseArgs, ...(entrypoint.args ?? []), ...(options.extraArgs ?? [])];
-    return {
-      command,
-      commandArgs,
-      displayCommand: [command, ...commandArgs],
-      kind: "command",
-    };
-  }
-
-  const commandArgs = buildUvPythonArgs(entrypoint, options);
+/** Build a command for the one locked Python runtime shipped with TT Local. */
+export function buildBundledPythonCommand(
+  entrypoint: BundledPythonEntrypoint,
+  args: string[] = [],
+): { command: "uv"; commandArgs: string[]; displayCommand: string[] } {
+  const target = entrypoint === "-c"
+    ? entrypoint
+    : join(bundledProject, "src", entrypoint);
+  const commandArgs = [
+    "run",
+    "--frozen",
+    "--project",
+    bundledProject,
+    "python",
+    target,
+    ...args,
+  ];
   return {
     command: "uv",
     commandArgs,
     displayCommand: ["uv", ...commandArgs],
-    kind: "uv",
+  };
+}
+
+/** Keep uv's mutable virtualenv outside a possibly read-only npm install. */
+export function withBundledPythonEnvironment(
+  env: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  return {
+    ...env,
+    UV_PROJECT_ENVIRONMENT: BUNDLED_PYTHON_ENVIRONMENT,
   };
 }
 
@@ -267,127 +254,4 @@ export async function runLoggedProcess(args: {
       });
     }
   }
-}
-
-export async function runJsonStdInCommand(args: {
-  command: string[];
-  payload: unknown;
-  timeoutMs: number;
-  timeoutMessage: string;
-  errorPrefix: string;
-  shouldCancel?: () => boolean | Promise<boolean>;
-  cancelPollMs?: number;
-}): Promise<string> {
-  const [cmd, ...cmdArgs] = args.command;
-  if (!cmd) throw new Error(`${args.errorPrefix} has no executable.`);
-  return await new Promise((resolvePromise, reject) => {
-    const child = spawn(cmd, cmdArgs, {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
-      detached: process.platform !== "win32",
-    });
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let cancelled = false;
-    let cancellationCheckRunning = false;
-    let cancellationError: unknown;
-    let forceKillTimer: NodeJS.Timeout | null = null;
-    const killProcessGroup = (signal: NodeJS.Signals) => {
-      if (child.pid && process.platform !== "win32") {
-        try {
-          process.kill(-child.pid, signal);
-          return;
-        } catch {
-          // Fall through when the process group has already exited.
-        }
-      }
-      child.kill(signal);
-    };
-    const requestStop = (signal: NodeJS.Signals = "SIGTERM") => {
-      killProcessGroup(signal);
-      if (!forceKillTimer) {
-        forceKillTimer = setTimeout(() => killProcessGroup("SIGKILL"), 5_000);
-        forceKillTimer.unref();
-      }
-    };
-    const onSigint = () => {
-      cancelled = true;
-      requestStop("SIGINT");
-    };
-    const onSigterm = () => {
-      cancelled = true;
-      requestStop("SIGTERM");
-    };
-    const timer = setTimeout(() => {
-      timedOut = true;
-      requestStop();
-    }, args.timeoutMs);
-    timer.unref();
-    const cancellationTimer = args.shouldCancel
-      ? setInterval(() => {
-          if (cancellationCheckRunning || cancelled) return;
-          cancellationCheckRunning = true;
-          Promise.resolve(args.shouldCancel?.())
-            .then((requested) => {
-              if (!requested || cancelled) return;
-              cancelled = true;
-              requestStop();
-            })
-            .catch((error) => {
-              cancellationError = error;
-              requestStop();
-            })
-            .finally(() => { cancellationCheckRunning = false; });
-        }, args.cancelPollMs ?? 250)
-      : null;
-    cancellationTimer?.unref();
-    process.once("SIGINT", onSigint);
-    process.once("SIGTERM", onSigterm);
-    const cleanup = () => {
-      clearTimeout(timer);
-      if (cancellationTimer) clearInterval(cancellationTimer);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
-      process.off("SIGINT", onSigint);
-      process.off("SIGTERM", onSigterm);
-    };
-
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.on("error", (error) => {
-      cleanup();
-      reject(error);
-    });
-    child.on("close", (code) => {
-      cleanup();
-      if (timedOut) {
-        reject(new Error(args.timeoutMessage));
-        return;
-      }
-      if (cancellationError) {
-        reject(cancellationError);
-        return;
-      }
-      if (cancelled) {
-        reject(new ProcessCancelledError(`${args.errorPrefix} was cancelled.`));
-        return;
-      }
-      if (code !== 0) {
-        reject(new Error(`${args.errorPrefix} exited ${code}: ${stderr.slice(0, 1000)}`));
-        return;
-      }
-      const trimmed = stdout.trim();
-      try {
-        const parsed = JSON.parse(trimmed) as { content?: unknown; output?: unknown; actual?: unknown };
-        const content = parsed.content ?? parsed.output ?? parsed.actual;
-        resolvePromise(typeof content === "string" ? content : trimmed);
-      } catch {
-        resolvePromise(trimmed);
-      }
-    });
-    child.stdin.on("error", () => undefined);
-    child.stdin.end(JSON.stringify(args.payload));
-  });
 }

@@ -3,78 +3,26 @@ import { join, resolve } from "node:path";
 import type { FineTuneRunRequest, LocalRunnerConfig, TrainingReport } from "./contracts.js";
 import type { RunArtifacts } from "./artifacts.js";
 import { copyDatasetToTrainingChannel, fileUri, writeJson } from "./artifacts.js";
-import { isExternalTrainingModel, resolveTrainingModel } from "./model-registry.js";
-import { buildEntrypointCommand, runLoggedProcess } from "./process-runner.js";
+import { resolveTrainingModel } from "./model-registry.js";
+import {
+  buildBundledPythonCommand,
+  runLoggedProcess,
+  withBundledPythonEnvironment,
+} from "./process-runner.js";
 import { reportInBackground, type LocalRunReporter } from "./run-reporter.js";
-import { minimalMachineLearningEnvironment, withHuggingFaceCacheEnvironment } from "./huggingface-cache.js";
-
-function serializeHyperparameter(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (typeof value === "number" || typeof value === "boolean") return String(value);
-  if (value === null || value === undefined) return "";
-  return JSON.stringify(value);
-}
-
-function buildCommandTrainingHyperparameters(
-  request: FineTuneRunRequest,
-  baseModelRevision?: string,
-): Record<string, string> {
-  const hyperparameters = Object.fromEntries(
-    Object.entries(request.hyperparameters)
-      .filter(([, value]) => value !== undefined)
-      .map(([key, value]) => [key, serializeHyperparameter(value)]),
-  );
-  return {
-    ...hyperparameters,
-    run_id: request.run_id,
-    base_model: request.spec_snapshot.base_model,
-    training_method: request.training_method,
-    model_mode: isExternalTrainingModel(request.spec_snapshot.base_model) ? "external" : "supported",
-    ...(baseModelRevision ? { base_model_revision: baseModelRevision } : {}),
-  };
-}
-
-function defaultTrainingScript(request: FineTuneRunRequest): string {
-  return request.training_method === "dpo"
-    ? "training/local-runner/src/train_dpo.py"
-    : "training/local-runner/src/train.py";
-}
-
-function buildDpoHyperparameters(request: FineTuneRunRequest): Record<string, string> {
-  if (request.training_method !== "dpo") return {};
-  const hyper = request.hyperparameters;
-  return {
-    dpo_beta: String(hyper.dpo_beta ?? 0.1),
-    dpo_loss_type: hyper.dpo_loss_type ?? "sigmoid",
-    dpo_label_smoothing: String(hyper.dpo_label_smoothing ?? 0),
-    dpo_reference_free: String(hyper.dpo_reference_free ?? false),
-    ...(hyper.max_prompt_length ? { max_prompt_length: String(hyper.max_prompt_length) } : {}),
-    ...(hyper.max_completion_length ? { max_completion_length: String(hyper.max_completion_length) } : {}),
-  };
-}
+import {
+  minimalMachineLearningEnvironment,
+  withOfflineHuggingFaceCacheEnvironment,
+} from "./huggingface-cache.js";
 
 export function buildTrainingHyperparameters(
   request: FineTuneRunRequest,
-  options: {
-    backend?: LocalRunnerConfig["training"]["backend"];
-    baseModelRevision?: string;
-  } = {},
+  options: { baseModelRevision?: string } = {},
 ): Record<string, string> {
-  if (options.backend === "command") {
-    return buildCommandTrainingHyperparameters(request, options.baseModelRevision);
-  }
-
   const model = resolveTrainingModel(request.spec_snapshot.base_model);
-  if (request.training_method === "dpo" && model.loader === "image_text_to_text") {
-    throw new Error("Bundled DPO training supports text causal-LM models only in v1. Use a causal_lm base model or training.backend=command for a custom DPO trainer.");
-  }
   const hyper = request.hyperparameters;
   return {
-    run_id: request.run_id,
     base_model: model.id,
-    model_family: model.family,
-    model_loader: model.loader,
-    training_method: request.training_method,
     ...(options.baseModelRevision ? { base_model_revision: options.baseModelRevision } : {}),
     n_epochs: String(hyper.n_epochs),
     learning_rate: String(hyper.learning_rate ?? model.defaultLearningRate),
@@ -86,16 +34,6 @@ export function buildTrainingHyperparameters(
     lora_alpha: String(hyper.lora_alpha ?? model.defaultLoraAlpha),
     lora_dropout: String(hyper.lora_dropout ?? model.defaultLoraDropout),
     max_seq_length: String(hyper.max_seq_length ?? model.defaultMaxSeqLength),
-    save_adapter_only: String(hyper.save_adapter_only),
-    requires_hf_token: String(model.requiresHfToken),
-    trust_remote_code: String(model.trustRemoteCode),
-    ...buildDpoHyperparameters(request),
-    ...(hyper.chat_template_kwargs
-      ? { chat_template_kwargs: JSON.stringify(hyper.chat_template_kwargs) }
-      : {}),
-    ...(hyper.parent_model_artifact
-      ? { parent_model_artifact: hyper.parent_model_artifact }
-      : {}),
   };
 }
 
@@ -206,57 +144,46 @@ export async function launchProcessTraining(args: {
 }): Promise<TrainingReport> {
   const { request, artifacts, config } = args;
   const jobName = `tt-local-${request.run_id}`;
-  const parentModelArtifact = request.hyperparameters.parent_model_artifact;
   await mkdir(artifacts.trainingDir, { recursive: true });
   await copyDatasetToTrainingChannel(artifacts);
   const hyperparameters = buildTrainingHyperparameters(request, {
-    backend: config.training.backend,
     baseModelRevision: args.baseModelRevision,
   });
   await writeJson(join(artifacts.trainingConfigDir, "hyperparameters.json"), hyperparameters);
 
+  const entrypoint = buildBundledPythonCommand("train.py");
+
   if (config.dryRun) {
-    const dryCommand = config.training.backend === "command" && !config.training.command
-      ? null
-      : buildEntrypointCommand(config.training, { defaultScript: defaultTrainingScript(request) });
     await writeFile(
       artifacts.trainingLog,
       "Dry run enabled. Training process was not launched.\n",
       "utf8",
     );
     return {
-      provider: config.training.backend === "command" ? "local-command" : "local-uv",
+      provider: "local-uv",
       training_job_name: jobName,
       model_artifact_uri: fileUri(artifacts.trainingModelDir),
       base_model_artifact_uri: config.paths.baseModel ? fileUri(config.paths.baseModel) : undefined,
-      parent_model_artifact_uri: parentModelArtifact,
-      artifact_metadata: config.training.artifact,
       metrics: { dry_run: true },
       exit_code: 0,
       log_uri: fileUri(artifacts.trainingLog),
-      command: dryCommand?.displayCommand,
+      command: entrypoint.displayCommand,
     };
   }
 
-  const entrypoint = buildEntrypointCommand(config.training, { defaultScript: defaultTrainingScript(request) });
   const command = entrypoint.displayCommand;
-  const provider = entrypoint.kind === "uv" ? "local-uv" : "local-command";
-  const resolvedModel = entrypoint.kind === "uv"
-    ? resolveTrainingModel(request.spec_snapshot.base_model)
-    : undefined;
-  const inheritedEnv = entrypoint.kind === "uv"
-    ? minimalMachineLearningEnvironment(process.env, { includeHfToken: resolvedModel?.requiresHfToken })
-    : process.env;
-  const childEnv: NodeJS.ProcessEnv = withHuggingFaceCacheEnvironment({
-    ...inheritedEnv,
-    ...config.training.env,
-    BACKEND: "local",
-    SM_CHANNEL_TRAINING: resolve(artifacts.trainingInputDir),
-    SM_CHANNEL_BASE_MODEL: config.paths.baseModel ? resolve(config.paths.baseModel) : undefined,
-    SM_MODEL_DIR: resolve(artifacts.trainingModelDir),
-    SM_OUTPUT_DIR: resolve(artifacts.trainingOutputDir),
-    TT_HYPERPARAMETERS_PATH: resolve(artifacts.trainingConfigDir, "hyperparameters.json"),
-  }, config.paths.modelCache);
+  const inheritedEnv = minimalMachineLearningEnvironment(process.env);
+  const childEnv: NodeJS.ProcessEnv = withBundledPythonEnvironment(
+    withOfflineHuggingFaceCacheEnvironment({
+      ...inheritedEnv,
+      BACKEND: "local",
+      SM_CHANNEL_TRAINING: resolve(artifacts.trainingInputDir),
+      SM_CHANNEL_BASE_MODEL: config.paths.baseModel ? resolve(config.paths.baseModel) : undefined,
+      SM_MODEL_DIR: resolve(artifacts.trainingModelDir),
+      SM_OUTPUT_DIR: resolve(artifacts.trainingOutputDir),
+      TT_HYPERPARAMETERS_PATH: resolve(artifacts.trainingConfigDir, "hyperparameters.json"),
+    }, config.paths.modelCache),
+  );
   for (const [key, value] of Object.entries(childEnv)) {
     if (value === undefined) delete childEnv[key];
   }
@@ -279,7 +206,6 @@ export async function launchProcessTraining(args: {
   const { exitCode } = await runLoggedProcess({
     command: entrypoint.command,
     commandArgs: entrypoint.commandArgs,
-    cwd: config.training.cwd,
     env: childEnv,
     logPath: artifacts.trainingLog,
     reporter: args.reporter,
@@ -314,12 +240,10 @@ export async function launchProcessTraining(args: {
   });
 
   return {
-    provider,
+    provider: "local-uv",
     training_job_name: jobName,
     model_artifact_uri: modelUri,
     base_model_artifact_uri: config.paths.baseModel ? fileUri(config.paths.baseModel) : undefined,
-    parent_model_artifact_uri: parentModelArtifact,
-    artifact_metadata: config.training.artifact,
     metrics,
     exit_code: exitCode,
     log_uri: fileUri(artifacts.trainingLog),

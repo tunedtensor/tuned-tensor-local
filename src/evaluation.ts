@@ -1,7 +1,6 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { performance } from "node:perf_hooks";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import {
   evalReportSchema,
   type BehaviorSpecExample,
@@ -10,37 +9,40 @@ import {
   type EvalSplit,
   type LocalRunnerConfig,
 } from "./contracts.js";
-import { writeJson, fileUri } from "./artifacts.js";
-import { resolveTrainingModel } from "./model-registry.js";
-import { openRouterChat } from "./openrouter.js";
-import { buildEntrypointCommand, runJsonStdInCommand, runLoggedProcess } from "./process-runner.js";
+import { fileUri, writeJson } from "./artifacts.js";
+import {
+  buildBundledPythonCommand,
+  runLoggedProcess,
+  withBundledPythonEnvironment,
+} from "./process-runner.js";
 import type { LocalRunReporter } from "./run-reporter.js";
 import { defaultLocalHome } from "./store.js";
-import { minimalMachineLearningEnvironment, withHuggingFaceCacheEnvironment } from "./huggingface-cache.js";
+import {
+  minimalMachineLearningEnvironment,
+  withOfflineHuggingFaceCacheEnvironment,
+} from "./huggingface-cache.js";
 
 function normalize(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
-function scoreActual(expected: string, actual: string): number {
+function exactScore(expected: string, actual: string): number {
   return normalize(expected) === normalize(actual) ? 1 : 0;
 }
 
-/**
- * Token-overlap F1 between expected and actual output (bag-of-words, case and
- * whitespace insensitive). This is a cheap deterministic reference-similarity
- * signal for free-text tasks where exact match is always 0 and an LLM judge
- * can be noisy; both scoring paths keep working unchanged alongside it.
- */
+/** Cheap deterministic free-text similarity reported beside exact match. */
 export function tokenF1(expected: string, actual: string): number {
-  const tokenize = (value: string): string[] => normalize(value).match(/[\p{L}\p{N}]+/gu) ?? [];
+  const tokenize = (value: string): string[] =>
+    normalize(value).match(/[\p{L}\p{N}]+/gu) ?? [];
   const expectedTokens = tokenize(expected);
   const actualTokens = tokenize(actual);
   if (expectedTokens.length === 0 || actualTokens.length === 0) {
     return expectedTokens.length === actualTokens.length ? 1 : 0;
   }
   const counts = new Map<string, number>();
-  for (const token of expectedTokens) counts.set(token, (counts.get(token) ?? 0) + 1);
+  for (const token of expectedTokens) {
+    counts.set(token, (counts.get(token) ?? 0) + 1);
+  }
   let overlap = 0;
   for (const token of actualTokens) {
     const remaining = counts.get(token) ?? 0;
@@ -52,10 +54,10 @@ export function tokenF1(expected: string, actual: string): number {
   if (overlap === 0) return 0;
   const precision = overlap / actualTokens.length;
   const recall = overlap / expectedTokens.length;
-  return (2 * precision * recall) / (precision + recall);
+  return 2 * precision * recall / (precision + recall);
 }
 
-/** Derives a deterministic 32-bit seed from an arbitrary string (FNV-1a). */
+/** Deterministic 32-bit FNV-1a seed. */
 export function deriveSampleSeed(value: string): number {
   let hash = 0x811c9dc5;
   for (let index = 0; index < value.length; index += 1) {
@@ -69,18 +71,12 @@ function mulberry32(seed: number): () => number {
   let state = seed >>> 0;
   return () => {
     state = (state + 0x6d2b79f5) | 0;
-    let t = Math.imul(state ^ (state >>> 15), 1 | state);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    let value = Math.imul(state ^ (state >>> 15), 1 | state);
+    value = (value + Math.imul(value ^ (value >>> 7), 61 | value)) ^ value;
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
   };
 }
 
-/**
- * Selects `count` examples with a seeded shuffle so that truncated evaluation
- * is a deterministic random sample instead of a dataset-order prefix. The
- * selected examples keep their original relative order, so baseline and
- * candidate evaluations that use the same seed score identical examples.
- */
 export function sampleExamples<T>(examples: T[], count: number, seed: number): T[] {
   if (count >= examples.length) return examples;
   const indices = examples.map((_, index) => index);
@@ -89,16 +85,15 @@ export function sampleExamples<T>(examples: T[], count: number, seed: number): T
     const swap = Math.floor(random() * (index + 1));
     [indices[index], indices[swap]] = [indices[swap], indices[index]];
   }
-  return indices.slice(0, count).sort((left, right) => left - right).map((index) => examples[index]);
+  return indices
+    .slice(0, count)
+    .sort((left, right) => left - right)
+    .map((index) => examples[index]);
 }
 
 /**
- * Deterministically splits spec examples into a training split and an eval
- * holdout so that default spec runs do not evaluate on their own training
- * data. The holdout is a seeded random sample of about `holdoutRatio` of the
- * examples, with at least 1 holdout and at least 1 training example. Both
- * splits preserve the original example order. With fewer than 2 examples the
- * holdout is empty and callers should fall back to training-set evaluation.
+ * Inline specs get a deterministic holdout. A real run with fewer than two
+ * examples is rejected by the shared validator before this function is used.
  */
 export function splitSpecExamples<T>(
   examples: T[],
@@ -116,10 +111,10 @@ export function splitSpecExamples<T>(
     const swap = Math.floor(random() * (index + 1));
     [indices[index], indices[swap]] = [indices[swap], indices[index]];
   }
-  const holdoutIndices = new Set(indices.slice(0, holdoutCount));
+  const heldOut = new Set(indices.slice(0, holdoutCount));
   return {
-    train: examples.filter((_, index) => !holdoutIndices.has(index)),
-    holdout: examples.filter((_, index) => holdoutIndices.has(index)),
+    train: examples.filter((_, index) => !heldOut.has(index)),
+    holdout: examples.filter((_, index) => heldOut.has(index)),
   };
 }
 
@@ -130,7 +125,6 @@ function extractJsonObject(value: string): Record<string, unknown> | null {
   if (fenced?.[1]) candidates.push(fenced[1].trim());
   const objectLike = trimmed.match(/\{[\s\S]*\}/);
   if (objectLike?.[0]) candidates.push(objectLike[0]);
-
   for (const candidate of candidates) {
     try {
       const parsed = JSON.parse(candidate) as unknown;
@@ -138,26 +132,22 @@ function extractJsonObject(value: string): Record<string, unknown> | null {
         return parsed as Record<string, unknown>;
       }
     } catch {
-      // Try the next candidate.
+      // Try the next representation.
     }
   }
   return null;
 }
 
-function normalizeJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map((item) => normalizeJsonValue(item));
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson);
   if (value && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
         .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, item]) => [key, normalizeJsonValue(item)]),
+        .map(([key, item]) => [key, canonicalJson(item)]),
     );
   }
   return value;
-}
-
-function jsonValuesEqual(left: unknown, right: unknown): boolean {
-  return JSON.stringify(normalizeJsonValue(left)) === JSON.stringify(normalizeJsonValue(right));
 }
 
 interface JsonFieldScore {
@@ -170,22 +160,25 @@ interface JsonFieldScore {
   fieldResults: Record<string, boolean>;
 }
 
-function scoreJsonFields(expected: string, actual: string, configuredFields?: string[]): JsonFieldScore {
+function scoreJsonFields(
+  expected: string,
+  actual: string,
+  configuredFields?: string[],
+): JsonFieldScore {
   const expectedJson = extractJsonObject(expected);
   const actualJson = extractJsonObject(actual);
   if (!expectedJson) {
-    const exactScore = scoreActual(expected, actual);
+    const score = exactScore(expected, actual);
     return {
-      score: exactScore,
-      passed: exactScore === 1,
-      reasoning: "Expected output is not a JSON object; fell back to normalized exact match.",
+      score,
+      passed: score === 1,
+      reasoning: "Expected output is not JSON; used normalized exact match.",
       actualJsonValid: Boolean(actualJson),
       schemaMatch: false,
       fields: [],
       fieldResults: {},
     };
   }
-
   const fields = configuredFields?.length
     ? configuredFields
     : Object.keys(expectedJson).sort();
@@ -195,31 +188,20 @@ function scoreJsonFields(expected: string, actual: string, configuredFields?: st
     && expectedKeys.length === actualKeys.length
     && expectedKeys.every((key, index) => key === actualKeys[index]);
   const fieldResults: Record<string, boolean> = {};
-  const missingExpectedFields: string[] = [];
-
   for (const field of fields) {
-    // A configured field that the expected output does not define cannot be
-    // verified, so it must never count as correct.
-    if (!Object.prototype.hasOwnProperty.call(expectedJson, field)) {
-      missingExpectedFields.push(field);
-      fieldResults[field] = false;
-      continue;
-    }
-    fieldResults[field] = actualJson ? jsonValuesEqual(expectedJson[field], actualJson[field]) : false;
+    fieldResults[field] = Object.prototype.hasOwnProperty.call(expectedJson, field)
+      && Boolean(actualJson)
+      && JSON.stringify(canonicalJson(expectedJson[field]))
+        === JSON.stringify(canonicalJson(actualJson?.[field]));
   }
-
   const correct = Object.values(fieldResults).filter(Boolean).length;
   const score = fields.length > 0 ? correct / fields.length : 0;
-  const passed = fields.length > 0 && correct === fields.length;
-  const missingNote = missingExpectedFields.length > 0
-    ? ` Configured fields missing from expected output scored as incorrect: ${missingExpectedFields.join(", ")}.`
-    : "";
   return {
     score,
-    passed,
-    reasoning: (actualJson
-      ? `JSON field score: ${correct}/${fields.length} configured fields matched.`
-      : "Actual output is not a JSON object.") + missingNote,
+    passed: fields.length > 0 && correct === fields.length,
+    reasoning: actualJson
+      ? `JSON field score: ${correct}/${fields.length} fields matched.`
+      : "Actual output is not a JSON object.",
     actualJsonValid: Boolean(actualJson),
     schemaMatch,
     fields,
@@ -230,14 +212,18 @@ function scoreJsonFields(expected: string, actual: string, configuredFields?: st
 function aggregateJsonFieldMetrics(scores: JsonFieldScore[], total: number) {
   if (total === 0 || scores.length === 0) return undefined;
   const fields = [...new Set(scores.flatMap((score) => score.fields))].sort();
-  const field_accuracy: Record<string, { correct: number; total: number; accuracy: number }> = {};
+  const field_accuracy: Record<string, {
+    correct: number;
+    total: number;
+    accuracy: number;
+  }> = {};
   for (const field of fields) {
-    const scored = scores.filter((score) => score.fields.includes(field));
-    const correct = scored.filter((score) => score.fieldResults[field]).length;
+    const applicable = scores.filter((score) => score.fields.includes(field));
+    const correct = applicable.filter((score) => score.fieldResults[field]).length;
     field_accuracy[field] = {
       correct,
-      total: scored.length,
-      accuracy: scored.length > 0 ? correct / scored.length : 0,
+      total: applicable.length,
+      accuracy: applicable.length > 0 ? correct / applicable.length : 0,
     };
   }
   const validJsonCount = scores.filter((score) => score.actualJsonValid).length;
@@ -262,131 +248,75 @@ function fileUriToPath(value?: string): string | undefined {
 
 export const INFERENCE_PROTOCOL_VERSION = 2;
 
-async function runInferenceCommand(args: {
-  command: string[];
-  prompt: string;
-  system: string;
-  timeoutMs: number;
-  shouldCancel?: () => boolean | Promise<boolean>;
-}): Promise<string> {
-  return runJsonStdInCommand({
-    command: args.command,
-    payload: {
-      protocol_version: INFERENCE_PROTOCOL_VERSION,
-      system: args.system,
-      prompt: args.prompt,
-    },
-    timeoutMs: args.timeoutMs,
-    timeoutMessage: `Inference command timed out after ${args.timeoutMs}ms`,
-    errorPrefix: "Inference command",
-    shouldCancel: args.shouldCancel,
-  });
-}
-
 interface BatchInferenceResult {
-  provider: "transformers" | "batch_command";
   model_id?: string;
   base_model?: string;
   adapter_path?: string;
   generation_config?: Record<string, unknown>;
-  results: Array<{
-    id: string;
-    actual: string;
-    latency_ms: number;
-  }>;
-}
-
-function inferenceExample(example: BehaviorSpecExample, index: number): Record<string, unknown> {
-  return {
-    id: String(index),
-    input: example.input,
-    ...(example.input_assets ? { input_assets: example.input_assets } : {}),
-    ...(example.modality ? { modality: example.modality } : {}),
-  };
+  results: Array<{ id: string; actual: string; latency_ms: number }>;
 }
 
 function parseBatchInferenceResult(
   value: unknown,
-  provider: BatchInferenceResult["provider"],
   expectedIds: string[],
 ): BatchInferenceResult {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${provider} inference output must be a JSON object`);
+    throw new Error("Transformers inference output must be a JSON object");
   }
   const output = value as Record<string, unknown>;
-  if (!Array.isArray(output.results)) {
-    throw new Error(`${provider} inference output must include a results array`);
-  }
-  if (output.results.length !== expectedIds.length) {
-    const noun = output.results.length === 1 ? "prediction" : "predictions";
+  if (!Array.isArray(output.results) || output.results.length !== expectedIds.length) {
     throw new Error(
-      `${provider} inference returned ${output.results.length} ${noun}; expected ${expectedIds.length}`,
+      `Transformers inference returned ${Array.isArray(output.results) ? output.results.length : 0} `
+      + `predictions; expected ${expectedIds.length}`,
     );
   }
-  const expectedIdSet = new Set(expectedIds);
-  const predictionsById = new Map<string, BatchInferenceResult["results"][number]>();
-  output.results.forEach((entry, index) => {
+  const expected = new Set(expectedIds);
+  const byId = new Map<string, BatchInferenceResult["results"][number]>();
+  for (const [index, entry] of output.results.entries()) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-      throw new Error(`${provider} inference prediction ${index} must be a JSON object`);
+      throw new Error(`Transformers prediction ${index} must be an object`);
     }
     const prediction = entry as Record<string, unknown>;
-    if (typeof prediction.id !== "string" || !expectedIdSet.has(prediction.id)) {
-      throw new Error(`${provider} inference prediction ${index} has unknown or missing id`);
+    if (typeof prediction.id !== "string" || !expected.has(prediction.id)) {
+      throw new Error(`Transformers prediction ${index} has an unknown or missing id`);
     }
-    if (predictionsById.has(prediction.id)) {
-      throw new Error(`${provider} inference returned duplicate prediction id ${prediction.id}`);
+    if (byId.has(prediction.id)) {
+      throw new Error(`Transformers inference returned duplicate id ${prediction.id}`);
     }
     if (typeof prediction.actual !== "string") {
-      throw new Error(`${provider} inference prediction ${index} must include string actual`);
+      throw new Error(`Transformers prediction ${index} must include string actual`);
     }
     if (
       typeof prediction.latency_ms !== "number"
-      || !Number.isFinite(prediction.latency_ms)
       || !Number.isInteger(prediction.latency_ms)
       || prediction.latency_ms < 0
     ) {
-      throw new Error(`${provider} inference prediction ${index} must include non-negative latency_ms`);
+      throw new Error(
+        `Transformers prediction ${index} must include non-negative integer latency_ms`,
+      );
     }
-    const parsed = {
+    byId.set(prediction.id, {
       id: prediction.id,
       actual: prediction.actual,
       latency_ms: prediction.latency_ms,
-    };
-    predictionsById.set(parsed.id, parsed);
-  });
-  const optionalString = (key: string): string | undefined => (
-    typeof output[key] === "string" ? output[key] : undefined
-  );
-  const modelId = optionalString("model_id");
-  const baseModel = optionalString("base_model");
-  const adapterPath = optionalString("adapter_path");
-  const generationConfig = output.generation_config;
+    });
+  }
+  const optionalString = (key: string) =>
+    typeof output[key] === "string" ? output[key] as string : undefined;
   return {
-    provider,
-    ...(modelId ? { model_id: modelId } : {}),
-    ...(baseModel ? { base_model: baseModel } : {}),
-    ...(adapterPath ? { adapter_path: adapterPath } : {}),
-    ...(generationConfig && typeof generationConfig === "object" && !Array.isArray(generationConfig)
-      ? { generation_config: generationConfig as Record<string, unknown> }
+    ...(optionalString("model_id") ? { model_id: optionalString("model_id") } : {}),
+    ...(optionalString("base_model") ? { base_model: optionalString("base_model") } : {}),
+    ...(optionalString("adapter_path") ? { adapter_path: optionalString("adapter_path") } : {}),
+    ...(output.generation_config
+      && typeof output.generation_config === "object"
+      && !Array.isArray(output.generation_config)
+      ? { generation_config: output.generation_config as Record<string, unknown> }
       : {}),
-    results: expectedIds.map((id) => predictionsById.get(id)!),
+    results: expectedIds.map((id) => byId.get(id)!),
   };
 }
 
-function buildBatchInferenceCommand(config: LocalRunnerConfig, inputPath: string, outputPath: string) {
-  if (config.evaluation.inference.provider === "batch_command") {
-    return buildEntrypointCommand(
-      { ...config.evaluation.inference, backend: "command" },
-      { extraArgs: ["--input", inputPath, "--output", outputPath] },
-    );
-  }
-  return buildEntrypointCommand(config.evaluation.inference, {
-    defaultScript: "training/local-runner/src/evaluate.py",
-    extraArgs: ["--input", inputPath, "--output", outputPath],
-  });
-}
-
-async function runBatchInference(args: {
+async function runTransformersInference(args: {
   kind: "baseline" | "candidate";
   modelId: string;
   baseModelId: string;
@@ -399,32 +329,28 @@ async function runBatchInference(args: {
   reporter?: LocalRunReporter;
   shouldCancel?: () => boolean | Promise<boolean>;
 }): Promise<BatchInferenceResult> {
-  const provider = args.config.evaluation.inference.provider === "batch_command" ? "batch_command" : "transformers";
-  const label = provider === "batch_command" ? "batch command" : "Transformers";
   const inputPath = `${args.outputPath}.inference-input.json`;
   const outputPath = `${args.outputPath}.inference-output.json`;
   const logPath = `${args.outputPath}.inference.log`;
   await mkdir(dirname(inputPath), { recursive: true });
-  let modelLoader: string | undefined;
-  try {
-    modelLoader = resolveTrainingModel(args.baseModelId).loader;
-  } catch {
-    modelLoader = undefined;
-  }
   await writeFile(inputPath, `${JSON.stringify({
     protocol_version: INFERENCE_PROTOCOL_VERSION,
     kind: args.kind,
     model_id: args.modelId,
     base_model: args.baseModelId,
     base_model_revision: args.baseModelRevision,
-    model_loader: modelLoader,
+    model_loader: "causal_lm",
     adapter_path: fileUriToPath(args.adapterPath),
     system: args.system,
-    examples: args.examples.map(inferenceExample),
-    model_cache: args.config.paths.modelCache ? resolve(args.config.paths.modelCache) : undefined,
-    trust_remote_code: args.config.evaluation.inference.trustRemoteCode,
+    examples: args.examples.map((example, index) => ({
+      id: String(index),
+      input: example.input,
+    })),
+    model_cache: args.config.paths.modelCache
+      ? resolve(args.config.paths.modelCache)
+      : undefined,
+    trust_remote_code: false,
     device: args.config.evaluation.inference.device,
-    chat_template_kwargs: args.config.evaluation.inference.chatTemplateKwargs,
     generation: {
       max_new_tokens: args.config.evaluation.inference.maxNewTokens,
       temperature: args.config.evaluation.inference.temperature,
@@ -432,278 +358,109 @@ async function runBatchInference(args: {
     },
   }, null, 2)}\n`, "utf8");
   await rm(outputPath, { force: true });
-
-  const entrypoint = buildBatchInferenceCommand(args.config, inputPath, outputPath);
-  const command = entrypoint.displayCommand;
-  const inheritedEnv = provider === "transformers"
-    ? minimalMachineLearningEnvironment(process.env, {
-        includeHfToken: (() => {
-          try {
-            return resolveTrainingModel(args.baseModelId).requiresHfToken;
-          } catch {
-            return false;
-          }
-        })(),
-      })
-    : process.env;
+  const entrypoint = buildBundledPythonCommand(
+    "evaluate.py",
+    ["--input", inputPath, "--output", outputPath],
+  );
   await args.reporter?.onEvent?.({
     stage: `evaluating_${args.kind}`,
     status: "running",
-    message: `Starting ${args.kind} ${label} inference.`,
+    message: `Starting ${args.kind} Transformers inference.`,
     details: {
       model_id: args.modelId,
       examples: args.examples.length,
-      command,
+      command: entrypoint.displayCommand,
       log_path: logPath,
     },
   });
   const result = await runLoggedProcess({
     command: entrypoint.command,
     commandArgs: entrypoint.commandArgs,
-    cwd: args.config.evaluation.inference.cwd,
-    env: withHuggingFaceCacheEnvironment({
-      ...inheritedEnv,
-      ...args.config.evaluation.inference.env,
-    }, args.config.paths.modelCache),
+    env: withBundledPythonEnvironment(
+      withOfflineHuggingFaceCacheEnvironment(
+        minimalMachineLearningEnvironment(process.env),
+        args.config.paths.modelCache,
+      ),
+    ),
     logPath,
     timeoutMs: args.config.evaluation.timeoutMs,
-    timeoutMessage: `${label} inference timed out after ${args.config.evaluation.timeoutMs}ms`,
+    timeoutMessage:
+      `Transformers inference timed out after ${args.config.evaluation.timeoutMs}ms`,
     reporter: args.reporter,
     stage: `evaluating_${args.kind}`,
     shouldCancel: args.shouldCancel,
   });
   if (result.exitCode !== 0) {
-    throw new Error(`${label} inference exited ${result.exitCode}: ${result.stderr.slice(0, 1000)}`);
-  }
-  await args.reporter?.onEvent?.({
-    stage: `evaluating_${args.kind}`,
-    status: "running",
-    message: `Finished ${args.kind} ${label} inference.`,
-    details: { output_path: outputPath, log_path: logPath },
-  });
-  let inferenceOutput: unknown;
-  try {
-    inferenceOutput = JSON.parse(await readFile(outputPath, "utf8"));
-  } catch (error) {
-    throw new Error(`${label} inference did not write valid JSON output: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  return parseBatchInferenceResult(inferenceOutput, provider, args.examples.map((_, index) => String(index)));
-}
-
-/**
- * Builds the judge messages. The spec's compiled system message (system
- * prompt, guidelines, and constraints) is forwarded as task_instructions so
- * the judge scores conformance to the task, not just similarity to the
- * reference. Without it, a judge treats `expected` as a fact checklist and
- * systematically penalizes outputs trained toward a different style (for
- * example concise summaries) even when they follow the spec.
- */
-export function buildJudgeMessages(args: {
-  prompt: string;
-  expected: string;
-  actual: string;
-  taskInstructions?: string;
-}): Array<{ role: "system" | "user"; content: string }> {
-  return [
-    {
-      role: "system",
-      content: "You are a strict evaluator. Score how well the actual output fulfills the task instructions "
-        + "for the given prompt. The expected output is a reference answer showing the desired style, length, "
-        + "and content; treat it as one correct answer, not an exhaustive checklist. Penalize factual errors, "
-        + "contradictions of the prompt, and violations of the task instructions. Do not penalize an output "
-        + "merely for omitting secondary reference details when the task instructions call for that brevity. "
-        + "Return JSON only with keys score (0 to 1), passed (boolean), and reasoning (string).",
-    },
-    {
-      role: "user",
-      content: JSON.stringify({
-        ...(args.taskInstructions ? { task_instructions: args.taskInstructions } : {}),
-        prompt: args.prompt,
-        expected: args.expected,
-        actual: args.actual,
-      }),
-    },
-  ];
-}
-
-async function judgeWithOpenRouter(args: {
-  prompt: string;
-  expected: string;
-  actual: string;
-  taskInstructions?: string;
-  config: LocalRunnerConfig;
-}): Promise<{ score: number; passed: boolean; reasoning: string; model: string | null }> {
-  if (!args.config.llm) {
-    throw new Error("evaluation.scoring.mode=llm_judge requires llm OpenRouter config");
-  }
-  const result = await openRouterChat(buildJudgeMessages(args), {
-    model: args.config.llm.model,
-    apiKeyEnv: args.config.llm.apiKeyEnv,
-    appName: args.config.llm.appName,
-    siteUrl: args.config.llm.siteUrl,
-    timeoutMs: args.config.evaluation.timeoutMs,
-  });
-  const parsed = extractJsonObject(result.content) as { score?: unknown; passed?: unknown; reasoning?: unknown } | null;
-  if (!parsed) {
-    throw new Error(`OpenRouter judge returned malformed JSON: ${result.content.slice(0, 200)}`);
-  }
-  const score = typeof parsed.score === "number"
-    ? Math.max(0, Math.min(1, parsed.score))
-    : 0;
-  return {
-    score,
-    passed: typeof parsed.passed === "boolean" ? parsed.passed : score === 1,
-    reasoning: typeof parsed.reasoning === "string" ? parsed.reasoning : "OpenRouter judge returned no reasoning.",
-    model: result.model ?? args.config.llm.model,
-  };
-}
-
-export interface EvaluationJudgeAvailability {
-  available: boolean;
-  reason?: string;
-}
-
-export function evaluationJudgeAvailability(config: LocalRunnerConfig): EvaluationJudgeAvailability {
-  if (!config.llm) {
-    return {
-      available: false,
-      reason: "the llm OpenRouter configuration is missing",
-    };
-  }
-  if (!process.env[config.llm.apiKeyEnv]?.trim()) {
-    return {
-      available: false,
-      reason: `${config.llm.apiKeyEnv} is not set`,
-    };
-  }
-  return { available: true };
-}
-
-/**
- * Fail before model inference when judge scoring cannot run. Exact-match
- * fallback is allowed only when the user opted into it explicitly in config.
- */
-export function assertEvaluationScoringReady(
-  config: LocalRunnerConfig,
-  scoringMode: "exact_match" | "llm_judge" | "json_fields" = config.evaluation.scoring.mode,
-): EvaluationJudgeAvailability {
-  if (scoringMode !== "llm_judge") return { available: false };
-  const availability = evaluationJudgeAvailability(config);
-  if (!availability.available && config.evaluation.scoring.fallback !== "exact_match") {
     throw new Error(
-      `evaluation.scoring.mode=llm_judge cannot start because ${availability.reason}. `
-      + "Configure llm and its API key, or explicitly set "
-      + "evaluation.scoring.fallback=exact_match.",
+      `Transformers inference exited ${result.exitCode}: ${result.stderr.slice(0, 1000)}`,
     );
   }
-  return availability;
-}
-
-export type RegressionCategory = "factual" | "omission" | "style" | "fallback" | "other";
-
-const FACTUAL_REASONING = /incorrect|error|misstate|mis-state|contradict|wrong|inaccurate|not supported|misattribut|invent|fabricat|halluc/i;
-const OMISSION_REASONING = /omit|missing|leaves out|leave out|lacks|does not (?:mention|include|cover)|fails to (?:mention|include|cover)/i;
-const STYLE_REASONING = /verbose|too long|too short|format|style|tone|first person|markdown|preamble/i;
-
-/**
- * Coarse category for a judge reasoning string so comparison reports can
- * answer "what kind of worse?" without re-reading every example. Factual
- * problems dominate omissions, which dominate style notes; fallback marks
- * examples that were never judge-scored (their score is not comparable to
- * judged ones).
- */
-export function classifyJudgeReasoning(reasoning: string | null, scoredBy?: string): RegressionCategory {
-  if (scoredBy === "exact_match_fallback") return "fallback";
-  if (!reasoning) return "other";
-  if (reasoning.startsWith("LLM judge failed")) return "fallback";
-  if (FACTUAL_REASONING.test(reasoning)) return "factual";
-  if (OMISSION_REASONING.test(reasoning)) return "omission";
-  if (STYLE_REASONING.test(reasoning)) return "style";
-  return "other";
+  let output: unknown;
+  try {
+    output = JSON.parse(await readFile(outputPath, "utf8"));
+  } catch (error) {
+    throw new Error(
+      `Transformers inference did not write valid JSON: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  return parseBatchInferenceResult(
+    output,
+    args.examples.map((_, index) => String(index)),
+  );
 }
 
 /**
- * Cache key for a baseline evaluation. Baseline outputs are deterministic for
- * a given model, example set, and generation settings, and judge scores only
- * depend on those plus the scoring configuration, so re-running a spec with
- * an unchanged baseline can reuse the previous report instead of paying for
- * inference and judge calls again. The package version participates so rubric
- * or evaluator changes invalidate old entries.
+ * Deterministic local scoring needs no network credentials. This function is
+ * kept as the shared preflight hook used by validate, doctor, and run.
  */
+export function assertEvaluationScoringReady(config: LocalRunnerConfig): void {
+  if (
+    config.evaluation.scoring.mode === "json_fields"
+    && config.evaluation.scoring.fields?.some((field) => !field.trim())
+  ) {
+    throw new Error("evaluation.scoring.fields must contain non-empty field names");
+  }
+}
+
 export function baselineCacheKey(args: {
   modelId: string;
   baseModelRevision?: string;
   sourceFingerprint?: string;
   system: string;
   examples: BehaviorSpecExample[];
+  evalExamplesTotal: number;
+  evalSplit?: EvalSplit;
+  evalSampleSeed?: number | null;
   config: LocalRunnerConfig;
   packageVersion: string;
 }): string {
-  const judgeAvailability = evaluationJudgeAvailability(args.config);
-  const payload = {
-    v: 4,
+  return createHash("sha256").update(JSON.stringify({
+    v: 6,
     inference_protocol_version: INFERENCE_PROTOCOL_VERSION,
     package_version: args.packageVersion,
     model_id: args.modelId,
     base_model_revision: args.baseModelRevision ?? null,
     source_fingerprint: args.sourceFingerprint ?? null,
     system: args.system,
-    examples: args.examples.map((example) => ({
-      input: example.input,
-      output: example.output,
-      assets: example.input_assets ?? null,
-    })),
-    // The full inference config participates: a different evaluator script,
-    // project, or generation setting must produce a different cache entry.
+    examples: args.examples,
+    eval_examples_total: args.evalExamplesTotal,
+    eval_split: args.evalSplit ?? null,
+    eval_sample_seed: args.evalSampleSeed ?? null,
     inference: args.config.evaluation.inference,
-    scoring: {
-      mode: args.config.evaluation.scoring.mode,
-      fallback: args.config.evaluation.scoring.fallback,
-      fields: args.config.evaluation.scoring.fields ?? null,
-      judge: args.config.llm ?? null,
-      judge_available: judgeAvailability.available,
-    },
-  };
-  return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+    scoring: args.config.evaluation.scoring,
+  })).digest("hex");
 }
 
-function clearlyLocalReference(value: string): boolean {
-  return value.startsWith("file://")
-    || isAbsolute(value)
-    || value.startsWith("./")
-    || value.startsWith("../")
-    || value === "~"
-    || value.startsWith("~/");
-}
-
-/**
- * A cache hit is safe only when every mutable input has a content identity.
- * Remote model branches and remote image URLs may change while retaining the
- * same string, so those evaluations deliberately bypass the shared cache.
- */
-function baselineInputsAreCacheStable(args: {
-  modelId: string;
-  baseModelId?: string;
+function baselineInputsAreStable(args: {
   baseModelRevision?: string;
-  adapterPath?: string;
   sourceFingerprint?: string;
-  examples: BehaviorSpecExample[];
   config: LocalRunnerConfig;
 }): boolean {
-  const baseModel = args.baseModelId ?? args.modelId;
-  const localBase = Boolean(args.config.paths.baseModel) || clearlyLocalReference(baseModel);
-  if (localBase ? !args.sourceFingerprint : !args.baseModelRevision) return false;
-  if (args.adapterPath && !args.sourceFingerprint) return false;
-
-  for (const example of args.examples) {
-    for (const asset of example.input_assets ?? []) {
-      const reference = asset.image ?? asset.data_uri ?? asset.uri ?? asset.path;
-      if (!reference || reference.startsWith("data:")) continue;
-      if (/^[a-z][a-z0-9+.-]*:/i.test(reference) && !reference.startsWith("file://")) return false;
-      if (!args.sourceFingerprint) return false;
-    }
-  }
-  return true;
+  return args.config.paths.baseModel
+    ? Boolean(args.sourceFingerprint)
+    : Boolean(args.baseModelRevision);
 }
 
 function baselineCachePath(config: LocalRunnerConfig, key: string): string {
@@ -722,48 +479,16 @@ async function readBaselineCache(path: string): Promise<EvalReport | null> {
 let cachedPackageVersion: string | null = null;
 
 async function packageVersion(): Promise<string> {
-  if (cachedPackageVersion === null) {
-    try {
-      const raw = await readFile(new URL("../package.json", import.meta.url), "utf8");
-      cachedPackageVersion = String((JSON.parse(raw) as { version?: unknown }).version ?? "unknown");
-    } catch {
-      cachedPackageVersion = "unknown";
-    }
+  if (cachedPackageVersion !== null) return cachedPackageVersion;
+  try {
+    const raw = await readFile(new URL("../package.json", import.meta.url), "utf8");
+    cachedPackageVersion = String(
+      (JSON.parse(raw) as { version?: unknown }).version ?? "unknown",
+    );
+  } catch {
+    cachedPackageVersion = "unknown";
   }
   return cachedPackageVersion;
-}
-
-function resolveEvaluationRuntime(args: {
-  kind: "baseline" | "candidate";
-  config: LocalRunnerConfig;
-}): {
-  command?: string[];
-  inferenceProvider: "none" | "command" | "batch_command" | "transformers";
-  scoringMode: "exact_match" | "llm_judge" | "json_fields";
-} {
-  const command = args.kind === "baseline"
-    ? args.config.evaluation.baselineCommand
-    : args.config.evaluation.candidateCommand;
-  const provider = args.config.evaluation.inference.provider;
-  const inferenceProvider: "none" | "command" | "batch_command" | "transformers" =
-    args.config.dryRun
-      ? "none"
-      : provider === "command"
-        ? "command"
-        : provider;
-  if (inferenceProvider === "command" && !command) {
-    throw new Error(`evaluation.inference.provider=command requires evaluation.${args.kind}Command`);
-  }
-  if (inferenceProvider === "batch_command" && !args.config.evaluation.inference.command) {
-    throw new Error("evaluation.inference.provider=batch_command requires evaluation.inference.command");
-  }
-  const configuredScoringMode: "exact_match" | "llm_judge" | "json_fields" =
-    args.config.evaluation.scoring.mode;
-  const scoringMode: "exact_match" | "llm_judge" | "json_fields" =
-    (args.config.dryRun || inferenceProvider === "none") && configuredScoringMode === "llm_judge"
-      ? "exact_match"
-      : configuredScoringMode;
-  return { command, inferenceProvider, scoringMode };
 }
 
 interface GeneratedEvalResult {
@@ -773,129 +498,55 @@ interface GeneratedEvalResult {
   latency_ms: number;
 }
 
-async function scoreGeneratedEvalResults(args: {
+async function scoreGenerated(args: {
   kind: "baseline" | "candidate";
   modelId: string;
   generated: GeneratedEvalResult[];
   evalExamplesTotal: number;
   config: LocalRunnerConfig;
   outputPath: string;
-  scoringMode: "exact_match" | "llm_judge" | "json_fields";
-  inferenceProvider: "none" | "command" | "batch_command" | "transformers";
-  system?: string;
+  inferenceProvider: "none" | "transformers";
   evalSplit?: EvalSplit;
   evalSampleSeed?: number | null;
   generationConfig?: Record<string, unknown>;
   logUri?: string;
-  reporter?: LocalRunReporter;
 }): Promise<EvalReport> {
-  const results: EvalExampleResult[] = [];
-  const jsonFieldScores: JsonFieldScore[] = [];
-  let judgeModelId: string | null = null;
-  const judgeAvailability = assertEvaluationScoringReady(args.config, args.scoringMode);
-  const shouldJudge = args.scoringMode === "llm_judge" && judgeAvailability.available;
-
-  for (const [index, generated] of args.generated.entries()) {
-    const exactScore = scoreActual(generated.expected, generated.actual);
-    if (shouldJudge && index === 0) {
-      await args.reporter?.onEvent?.({
-        stage: `evaluating_${args.kind}`,
-        status: "running",
-        message: `Scoring ${args.kind} outputs with OpenRouter judge.`,
-        details: { model: args.config.llm?.model, examples: args.generated.length },
-      });
-    }
-    let judged: { score: number; passed: boolean; reasoning: string; model: string | null } | null = null;
-    let judgeFellBack = false;
-    if (args.scoringMode === "llm_judge" && !shouldJudge) {
-      judgeFellBack = true;
-      judged = {
-        score: exactScore,
-        passed: exactScore === 1,
-        reasoning: `LLM judge unavailable (${judgeAvailability.reason}); scored by normalized exact match.`,
-        model: null,
-      };
-    } else if (shouldJudge) {
-      try {
-        judged = await judgeWithOpenRouter({
-          prompt: generated.prompt,
-          expected: generated.expected,
-          actual: generated.actual,
-          taskInstructions: args.system?.trim() || undefined,
-          config: args.config,
-        });
-      } catch (error) {
-        if (args.config.evaluation.scoring.fallback === "fail") throw error;
-        const message = error instanceof Error ? error.message : String(error);
-        judgeFellBack = true;
-        judged = {
-          score: exactScore,
-          passed: exactScore === 1,
-          reasoning: `LLM judge failed (${message.slice(0, 300)}); scored by normalized exact match.`,
-          model: null,
-        };
-      }
-    }
-    if (judged?.model) judgeModelId = judged.model;
-    const jsonFieldScore = args.scoringMode === "json_fields"
-      ? scoreJsonFields(generated.expected, generated.actual, args.config.evaluation.scoring.fields)
+  const jsonScores: JsonFieldScore[] = [];
+  const results: EvalExampleResult[] = args.generated.map((generated) => {
+    const json = args.config.evaluation.scoring.mode === "json_fields"
+      ? scoreJsonFields(
+          generated.expected,
+          generated.actual,
+          args.config.evaluation.scoring.fields,
+        )
       : null;
-    if (jsonFieldScore) jsonFieldScores.push(jsonFieldScore);
-    const score = judged?.score ?? jsonFieldScore?.score ?? exactScore;
-    const scoredBy: EvalExampleResult["scored_by"] = judged
-      ? (judgeFellBack ? "exact_match_fallback" : "llm_judge")
-      : jsonFieldScore
-        ? "json_fields"
-        : args.inferenceProvider === "none"
-          ? "heuristic"
-          : "exact_match";
-    results.push({
+    if (json) jsonScores.push(json);
+    const score = json?.score ?? exactScore(generated.expected, generated.actual);
+    return {
       prompt: generated.prompt,
       expected: generated.expected,
       actual: generated.actual,
-      passed: judged?.passed ?? jsonFieldScore?.passed ?? score === 1,
+      passed: json?.passed ?? score === 1,
       score,
-      reasoning: judged?.reasoning ?? jsonFieldScore?.reasoning ?? (args.inferenceProvider === "none"
-        ? "No inference command configured; recorded an empty local response."
-        : args.scoringMode === "llm_judge"
-          ? "OpenRouter judge unavailable; fell back to normalized exact match."
-          : "Scored by normalized exact match."),
+      reasoning: json?.reasoning ?? (
+        args.inferenceProvider === "none"
+          ? "Dry run: model inference was not executed."
+          : "Scored by normalized exact match."
+      ),
       latency_ms: generated.latency_ms,
-      scored_by: scoredBy,
-    });
-  }
-
-  const total = results.length;
-  const avgScore = total > 0
-    ? results.reduce((sum, result) => sum + result.score, 0) / total
-    : 0;
-  const passRate = total > 0
-    ? results.filter((result) => result.passed).length / total
-    : 0;
-  const exactMatchRate = total > 0
-    ? results.filter((result) => scoreActual(result.expected, result.actual) === 1).length / total
-    : 0;
-  const avgTokenF1 = total > 0
-    ? results.reduce((sum, result) => sum + tokenF1(result.expected, result.actual), 0) / total
-    : 0;
-  const judgeScored = results.filter((result) => result.scored_by === "llm_judge");
-  const fallbackScoredCount = results.filter((result) => result.scored_by === "exact_match_fallback").length;
-  const judgeOnlyAvgScore = judgeScored.length > 0
-    ? judgeScored.reduce((sum, result) => sum + result.score, 0) / judgeScored.length
-    : null;
-  const avgLatency = total > 0
-    ? Math.round(results.reduce((sum, result) => sum + result.latency_ms, 0) / total)
-    : 0;
-  const scoringMethod = judgeModelId
-    ? "llm_judge"
-    : args.scoringMode === "json_fields"
-      ? "json_fields"
-      : args.inferenceProvider === "command"
-        ? "command"
+      scored_by: json
+        ? "json_fields"
         : args.inferenceProvider === "none"
           ? "heuristic"
-          : "exact_match";
-  const report: EvalReport = {
+          : "exact_match",
+    };
+  });
+  const total = results.length;
+  const mean = (values: number[]) =>
+    values.length > 0
+      ? values.reduce((sum, value) => sum + value, 0) / values.length
+      : 0;
+  const report = evalReportSchema.parse({
     kind: args.kind,
     model_id: args.modelId,
     total,
@@ -904,26 +555,30 @@ async function scoreGeneratedEvalResults(args: {
     eval_truncated: args.evalExamplesTotal > total,
     eval_split: args.evalSplit,
     eval_sample_seed: args.evalSampleSeed ?? null,
-    avg_score: avgScore,
-    pass_rate: passRate,
-    exact_match_rate: exactMatchRate,
-    avg_token_f1: avgTokenF1,
-    avg_latency_ms: avgLatency,
-    judge_scored_count: judgeScored.length,
-    fallback_scored_count: fallbackScoredCount,
-    judge_only_avg_score: judgeOnlyAvgScore,
+    avg_score: mean(results.map((result) => result.score)),
+    pass_rate: mean(results.map((result) => result.passed ? 1 : 0)),
+    exact_match_rate: mean(
+      results.map((result) => exactScore(result.expected, result.actual)),
+    ),
+    avg_token_f1: mean(
+      results.map((result) => tokenF1(result.expected, result.actual)),
+    ),
+    avg_latency_ms: Math.round(mean(results.map((result) => result.latency_ms))),
     results,
     artifact_uri: fileUri(args.outputPath),
-    scoring_method: scoringMethod,
-    judge_model_id: judgeModelId,
+    scoring_method: args.config.evaluation.scoring.mode === "json_fields"
+      ? "json_fields"
+      : args.inferenceProvider === "none"
+        ? "heuristic"
+        : "exact_match",
     inference_provider: args.inferenceProvider,
-    scoring_mode: args.scoringMode,
-    json_field_metrics: args.scoringMode === "json_fields"
-      ? aggregateJsonFieldMetrics(jsonFieldScores, total)
+    scoring_mode: args.config.evaluation.scoring.mode,
+    json_field_metrics: args.config.evaluation.scoring.mode === "json_fields"
+      ? aggregateJsonFieldMetrics(jsonScores, total)
       : undefined,
     generation_config: args.generationConfig,
     log_uri: args.logUri,
-  };
+  });
   await writeJson(args.outputPath, report);
   return report;
 }
@@ -945,41 +600,22 @@ export async function evaluateExamples(args: {
   sampleSeed?: number;
   shouldCancel?: () => boolean | Promise<boolean>;
 }): Promise<EvalReport> {
-  // Explicit config takes precedence over the per-run request hyperparameter
-  // (passed by the orchestrator via args.maxExamples).
+  assertEvaluationScoringReady(args.config);
   const maxExamples = args.config.evaluation.maxExamples
     ?? args.maxExamples
     ?? args.examples.length;
   const truncated = args.examples.length > maxExamples;
-  // When truncating, take a deterministic seeded sample (not a prefix) so a
-  // sorted or grouped eval file does not bias the evaluated subset. Baseline
-  // and candidate runs receive the same seed and therefore identical examples.
-  const sampleSeed = args.config.evaluation.sampleSeed ?? args.sampleSeed ?? 0;
-  const selected = truncated
-    ? sampleExamples(args.examples, maxExamples, sampleSeed)
+  const seed = args.config.evaluation.sampleSeed ?? args.sampleSeed ?? 0;
+  const examples = truncated
+    ? sampleExamples(args.examples, maxExamples, seed)
     : args.examples;
-  const { command, inferenceProvider, scoringMode } = resolveEvaluationRuntime({
-    kind: args.kind,
-    config: args.config,
-  });
-  const judgeAvailability = assertEvaluationScoringReady(args.config, scoringMode);
-  let generationConfig: Record<string, unknown> | undefined;
-
-  // Baseline outputs and scores are fully determined by the cache key inputs,
-  // so an unchanged baseline can reuse the previous report instead of paying
-  // for inference and judge calls on every run of the same spec.
+  const evalSampleSeed = truncated || args.evalSplit === "spec_holdout" ? seed : null;
   const cacheEligible = args.kind === "baseline"
     && args.config.evaluation.baselineCache
     && !args.config.dryRun
-    && inferenceProvider === "transformers"
-    && (scoringMode !== "llm_judge" || judgeAvailability.available)
-    && baselineInputsAreCacheStable({
-      modelId: args.modelId,
-      baseModelId: args.baseModelId,
+    && baselineInputsAreStable({
       baseModelRevision: args.baseModelRevision,
-      adapterPath: args.adapterPath,
       sourceFingerprint: args.sourceFingerprint,
-      examples: selected,
       config: args.config,
     });
   const cacheKey = cacheEligible
@@ -988,7 +624,10 @@ export async function evaluateExamples(args: {
         baseModelRevision: args.baseModelRevision,
         sourceFingerprint: args.sourceFingerprint,
         system: args.system,
-        examples: selected,
+        examples,
+        evalExamplesTotal: args.examples.length,
+        evalSplit: args.evalSplit,
+        evalSampleSeed,
         config: args.config,
         packageVersion: await packageVersion(),
       })
@@ -996,174 +635,98 @@ export async function evaluateExamples(args: {
   if (cacheKey) {
     const cached = await readBaselineCache(baselineCachePath(args.config, cacheKey));
     if (cached) {
-      const report: EvalReport = {
+      const report = evalReportSchema.parse({
         ...cached,
         cached: true,
         cache_key: cacheKey,
         artifact_uri: fileUri(args.outputPath),
         eval_split: args.evalSplit ?? cached.eval_split,
-      };
-      await writeJson(args.outputPath, report);
-      await args.reporter?.onEvent?.({
-        stage: `evaluating_${args.kind}`,
-        status: "running",
-        message: "Reusing cached baseline evaluation (identical model, examples, and scoring).",
-        details: { cache_key: cacheKey, examples: report.total },
+        eval_examples_total: args.examples.length,
+        eval_examples_used: examples.length,
+        eval_truncated: truncated,
+        eval_sample_seed: evalSampleSeed,
       });
+      await writeJson(args.outputPath, report);
       return report;
     }
   }
 
-  const inferred = inferenceProvider === "transformers" || inferenceProvider === "batch_command"
-    ? await runBatchInference({
+  const inference = args.config.dryRun
+    ? null
+    : await runTransformersInference({
         kind: args.kind,
         modelId: args.modelId,
         baseModelId: args.baseModelId ?? args.modelId,
         baseModelRevision: args.baseModelRevision,
         adapterPath: args.adapterPath,
-        examples: selected,
+        examples,
         system: args.system,
         config: args.config,
         outputPath: args.outputPath,
         reporter: args.reporter,
         shouldCancel: args.shouldCancel,
-      })
-    : null;
-  generationConfig = inferred?.generation_config;
-
-  const generated: GeneratedEvalResult[] = [];
-  for (const [index, example] of selected.entries()) {
-    const started = performance.now();
-    const commandActual = inferenceProvider === "command" && command
-      ? await runInferenceCommand({
-          command,
-          prompt: example.input,
-          system: args.system,
-          timeoutMs: args.config.evaluation.timeoutMs,
-          shouldCancel: args.shouldCancel,
-        })
-      : undefined;
-    const inferredResult = inferred?.results[index];
-    const actual = commandActual ?? inferredResult?.actual ?? "";
-    const latencyMs = inferredResult?.latency_ms ?? Math.max(0, Math.round(performance.now() - started));
-    generated.push({
-      prompt: example.input,
-      expected: example.output,
-      actual,
-      latency_ms: latencyMs,
-    });
-  }
-
-  const report = await scoreGeneratedEvalResults({
+      });
+  const generated = examples.map((example, index) => ({
+    prompt: example.input,
+    expected: example.output,
+    actual: inference?.results[index]?.actual ?? "",
+    latency_ms: inference?.results[index]?.latency_ms ?? 0,
+  }));
+  const report = await scoreGenerated({
     kind: args.kind,
     modelId: args.modelId,
     generated,
     evalExamplesTotal: args.examples.length,
     config: args.config,
     outputPath: args.outputPath,
-    scoringMode,
-    inferenceProvider,
-    system: args.system,
+    inferenceProvider: inference ? "transformers" : "none",
     evalSplit: args.evalSplit,
-    evalSampleSeed: truncated ? sampleSeed : null,
-    generationConfig,
-    logUri: inferenceProvider === "transformers" || inferenceProvider === "batch_command"
-      ? fileUri(`${args.outputPath}.inference.log`)
-      : undefined,
-    reporter: args.reporter,
+    evalSampleSeed,
+    generationConfig: inference?.generation_config,
+    logUri: inference ? fileUri(`${args.outputPath}.inference.log`) : undefined,
   });
   if (cacheKey) {
-    // Do not cache reports with fallback-scored examples: a transient judge
-    // failure would otherwise be replayed into every future run.
-    if ((report.fallback_scored_count ?? 0) === 0
-      && (scoringMode !== "llm_judge" || report.judge_scored_count === report.total)) {
-      await writeJson(baselineCachePath(args.config, cacheKey), { ...report, cache_key: cacheKey });
-    }
+    await writeJson(
+      baselineCachePath(args.config, cacheKey),
+      { ...report, cache_key: cacheKey },
+    );
   }
   return report;
-}
-
-export async function rescoreEvalReport(args: {
-  report: EvalReport;
-  config: LocalRunnerConfig;
-  outputPath: string;
-  system?: string;
-  reporter?: LocalRunReporter;
-}): Promise<EvalReport> {
-  const configuredScoringMode = args.config.evaluation.scoring.mode;
-  const scoringMode: "exact_match" | "llm_judge" | "json_fields" =
-    args.config.dryRun && configuredScoringMode === "llm_judge"
-      ? "exact_match"
-      : configuredScoringMode;
-  const inferenceProvider = args.report.inference_provider ?? "none";
-  return scoreGeneratedEvalResults({
-    kind: args.report.kind,
-    modelId: args.report.model_id,
-    generated: args.report.results.map((result) => ({
-      prompt: result.prompt,
-      expected: result.expected,
-      actual: result.actual,
-      latency_ms: result.latency_ms,
-    })),
-    evalExamplesTotal: args.report.eval_examples_total,
-    config: args.config,
-    outputPath: args.outputPath,
-    scoringMode,
-    inferenceProvider,
-    system: args.system,
-    evalSplit: args.report.eval_split,
-    evalSampleSeed: args.report.eval_sample_seed ?? null,
-    generationConfig: args.report.generation_config,
-    logUri: args.report.log_uri,
-    reporter: args.reporter,
-  });
 }
 
 export function compareEvalReports(baseline: EvalReport, candidate: EvalReport) {
   let regressions = 0;
   let improvements = 0;
-  const regressedExamples = [];
-  // All categories are always present: zod v4 enum-keyed records are
-  // exhaustive, so a partial taxonomy fails runReportSchema validation.
-  const taxonomy: Record<RegressionCategory, number> = {
-    factual: 0,
-    omission: 0,
-    style: 0,
-    fallback: 0,
-    other: 0,
-  };
+  const regressedExamples: Array<{
+    prompt: string;
+    old_score: number;
+    new_score: number;
+  }> = [];
   const count = Math.min(baseline.results.length, candidate.results.length);
   for (let index = 0; index < count; index += 1) {
     const oldScore = baseline.results[index]?.score ?? 0;
-    const newResult = candidate.results[index];
-    const newScore = newResult?.score ?? 0;
+    const result = candidate.results[index];
+    const newScore = result?.score ?? 0;
     if (newScore < oldScore) {
       regressions += 1;
-      const category = classifyJudgeReasoning(newResult?.reasoning ?? null, newResult?.scored_by);
-      taxonomy[category] = (taxonomy[category] ?? 0) + 1;
       regressedExamples.push({
         prompt: baseline.results[index]?.prompt ?? "",
         old_score: oldScore,
         new_score: newScore,
-        category,
       });
     } else if (newScore > oldScore) {
       improvements += 1;
     }
   }
-  const judgeOnlyDelta = typeof baseline.judge_only_avg_score === "number"
-    && typeof candidate.judge_only_avg_score === "number"
-    ? candidate.judge_only_avg_score - baseline.judge_only_avg_score
-    : null;
   return {
     avg_score_delta: candidate.avg_score - baseline.avg_score,
     pass_rate_delta: candidate.pass_rate - baseline.pass_rate,
-    exact_match_rate_delta: candidate.exact_match_rate - baseline.exact_match_rate,
-    token_f1_delta: (candidate.avg_token_f1 ?? 0) - (baseline.avg_token_f1 ?? 0),
-    judge_only_avg_score_delta: judgeOnlyDelta,
+    exact_match_rate_delta:
+      candidate.exact_match_rate - baseline.exact_match_rate,
+    token_f1_delta:
+      (candidate.avg_token_f1 ?? 0) - (baseline.avg_token_f1 ?? 0),
     regressions,
     improvements,
-    regression_taxonomy: regressions > 0 ? taxonomy : undefined,
     regressed_examples: regressedExamples,
   };
 }

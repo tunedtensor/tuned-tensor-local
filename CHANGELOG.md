@@ -4,49 +4,42 @@ All notable changes to TT Local will be documented in this file.
 
 ## Unreleased
 
-### Added
+### Removed
 
-- Added a separate versioned StudySpec for binary-classification benchmarks,
-  with explicit feature allowlists and predefined CSV training, validation,
-  and test splits.
-- Added `tt-local studies lock` and read-only `tt-local studies validate` to
-  record and verify deterministic dataset hashes, schemas, row counts, and
-  split ID integrity without opening the run store.
-- Added `tt-local studies run` for write-once command-backed binary
-  classification trials. It exposes allowlisted training data and
-  target-free validation data, accepts strict ID-keyed positive-class
-  probabilities, and computes trusted AP, ROC AUC, and fixed-threshold F1
-  reports without exposing the test split to the command protocol.
-- Added a bundled numeric logistic-regression Study runner with median
-  imputation, missingness indicators, feature scaling, strict parameters, a
-  small isolated locked scikit-learn runtime, and hashed model artifacts.
-- Added deterministic Study trial provenance for declared runner source,
-  dependency locks, immutable implementation snapshots, and independently
-  inventoried model artifacts.
-- Added optional temporal Study certification for strict UTC event and label
-  windows, declared horizon-and-embargo purge boundaries, deterministic lock
-  evidence, and trial-report provenance.
-- Added explicit write-once Study candidate promotion for the bundled numeric
-  logistic-regression runner. Promotion copies the fitted model and locked
-  predictor, strictly revalidates their provenance, and replay-checks
-  label-free validation probabilities before publishing a candidate lock.
-- Added optional, versioned prediction-time runtime evidence for the bundled
-  runner's saved-model mode.
-- Added `tt-local studies test` for one-shot held-out evaluation of a promoted
-  bundled candidate. It uses a path-independent global claim, passes only
-  allowlisted label-free inputs to the frozen predictor, computes trusted
-  metrics, and publishes durable success or metric-free failure evidence.
+- **Breaking:** reduced TT Local to its end-to-end verified purpose: text LoRA
+  SFT of `Qwen/Qwen3.5-2B` on CUDA. Removed DPO, multimodal and continuation
+  inputs, arbitrary training/evaluation commands, external model contracts,
+  cloud teacher labeling and LLM judging, the classic-ML Study subsystem, and
+  the local dashboard.
+- Removed the SQLite metadata mirror. Canonical JSON/JSONL files are now the
+  only state store and remain directly inspectable and recoverable.
+- Removed implicit working-directory `.env` loading. Credentials and serving
+  keys must be provided explicitly through the process environment.
+- Removed the incomplete detached-run, watch, and remote-cancel surfaces.
+  Workflows now run in the foreground so process and state lifecycles cannot
+  diverge after a host restart or worker crash.
 
 ### Changed
 
+- Training now computes loss only on assistant answer tokens and truncates the
+  prompt before the answer. CUDA training and tokenizer chat-template failures
+  fail fast instead of silently changing behavior.
+- Runner, spec, and hyperparameter schemas are strict; obsolete and misspelled
+  fields are rejected rather than ignored.
+- Training, evaluation, and serving now always use the bundled locked Python
+  project. Removed public runner project, working-directory, provider, and
+  environment overrides.
+- Bundled `uv` commands now use `--frozen` and a content-keyed virtual
+  environment in the writable user cache instead of modifying the npm package.
+- Explicit base-model revisions must be immutable 40-character Hugging Face
+  commit SHAs; moving branches and tags are rejected.
+- Default holdout sampling is stable across runs of the same behavior spec,
+  and baseline cache identity no longer includes the per-run UUID.
+- The supported workflow is now documented and tested as one coherent path:
+  initialize, preflight, prepare held-out data, train, compare, verify, and
+  serve a local PEFT adapter.
 - Prebuilt datasets with both validation and test files now use validation for
   normal iterative evaluation, preserving test as a separate holdout.
-- **Breaking:** inference protocol v2 no longer sends expected outputs to
-  command or batch evaluators. Batch evaluators must echo each opaque input
-  `id` with string `actual` and non-negative integer `latency_ms`. TT Local
-  validates predictions and joins them to trusted references before scoring.
-- Split shared Study trial contracts, trial execution, and candidate promotion
-  into focused acyclic modules without changing the public package API.
 
 ### Fixed
 

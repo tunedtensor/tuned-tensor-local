@@ -32,6 +32,20 @@ jobs:
         with:
           enable-cache: false
 
+      - name: Check Python lock
+        run: uv lock --check --project training/local-runner
+
+      - name: Check Python syntax
+        run: python3 -m compileall -q training/local-runner/src training/local-runner/tests
+
+      - name: Test Python SFT data
+        run: python3 -m unittest discover -s training/local-runner/tests -p 'test_*.py'
+
+      - name: Smoke-test Python runtime imports
+        run: |
+          uv run --frozen --project training/local-runner python -c \
+            "import sys; sys.path.insert(0, 'training/local-runner/src'); import evaluate, prefetch, sft_data, train; evaluate.import_runtime_dependencies(); print('python runtime imports ok')"
+
       - name: Typecheck
         run: npm run typecheck
 

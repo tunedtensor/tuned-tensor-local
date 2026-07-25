@@ -17,86 +17,79 @@ const model: LocalModelRecord = {
   created_at: "2026-07-13T00:00:00.000Z",
 };
 
-test("local model server loads the adapter with its recorded base model and shared cache", () => {
-  const previousOpenRouter = process.env.OPENROUTER_API_KEY;
-  const previousHfToken = process.env.HF_TOKEN;
-  process.env.OPENROUTER_API_KEY = "must-not-leak";
-  process.env.HF_TOKEN = "public-model-must-not-receive-this";
-  try {
-    const config = localRunnerConfigSchema.parse({
-      paths: { modelCache: "/tmp/huggingface" },
-      evaluation: {
-        inference: {
-          provider: "transformers",
-          project: "training/local-runner",
-          device: "cuda",
-        },
-        scoring: { mode: "exact_match" },
-      },
-    });
-    const launch = buildLocalModelServerLaunch({
-      model,
-      config,
-      options: {
-        port: 8123,
-        systemPrompt: "Be concise.",
-        maxTokens: 64,
-        baseModelRevision: "revision-123",
-      },
-    });
-
-    assert.equal(launch.command, "uv");
-    assert.ok(launch.commandArgs.includes("--project"));
-    assert.ok(launch.commandArgs.some((value) => value.endsWith("training/local-runner/src/serve.py")));
-    assert.equal(launch.env.TT_MODEL_ARTIFACT, "/tmp/model.tar.gz");
-    assert.equal(launch.env.TT_BASE_MODEL, "Qwen/Qwen3.5-2B");
-    assert.equal(launch.env.TT_BASE_MODEL_REVISION, "revision-123");
-    assert.equal(launch.env.TT_MODEL_LOADER, "causal_lm");
-    assert.equal(launch.env.HF_HOME, "/tmp/huggingface");
-    assert.equal(launch.env.TT_SYSTEM_PROMPT, "Be concise.");
-    assert.equal(launch.env.OPENROUTER_API_KEY, undefined);
-    assert.equal(launch.env.HF_TOKEN, undefined);
-    assert.equal(launch.env.TT_MAX_CONCURRENT_REQUESTS, "1");
-    assert.equal(launch.url, "http://127.0.0.1:8123");
-  } finally {
-    if (previousOpenRouter === undefined) delete process.env.OPENROUTER_API_KEY;
-    else process.env.OPENROUTER_API_KEY = previousOpenRouter;
-    if (previousHfToken === undefined) delete process.env.HF_TOKEN;
-    else process.env.HF_TOKEN = previousHfToken;
-  }
-});
-
-test("only gated models inherit the Hugging Face token", () => {
-  const config = localRunnerConfigSchema.parse({ evaluation: { scoring: { mode: "exact_match" } } });
-  const previous = process.env.HF_TOKEN;
-  process.env.HF_TOKEN = "gated-model-token";
-  try {
-    const launch = buildLocalModelServerLaunch({
-      model: { ...model, base_model: "meta-llama/Llama-3.2-3B-Instruct" },
-      config,
-    });
-    assert.equal(launch.env.HF_TOKEN, "gated-model-token");
-  } finally {
-    if (previous === undefined) delete process.env.HF_TOKEN;
-    else process.env.HF_TOKEN = previous;
-  }
-});
-
-test("local model server rejects non-local artifacts and invalid ports", () => {
+test("serving launches the bundled text-only Qwen adapter with safe model settings", () => {
   const config = localRunnerConfigSchema.parse({
-    evaluation: { scoring: { mode: "exact_match" } },
+    paths: {
+      baseModel: "/tmp/qwen-snapshot",
+      modelCache: "/tmp/huggingface",
+    },
+    evaluation: {
+      inference: {
+        device: "cuda",
+      },
+      scoring: { mode: "exact_match" },
+    },
+  });
+  const launch = buildLocalModelServerLaunch({
+    model,
+    config,
+    options: {
+      port: 8123,
+      systemPrompt: "Be concise.",
+      maxTokens: 64,
+      maxConcurrentRequests: 2,
+      baseModelArtifactUri: "file:///tmp/qwen-snapshot",
+      baseModelRevision: "ignored-for-local-snapshot",
+    },
+  });
+
+  assert.equal(launch.command, "uv");
+  assert.ok(launch.commandArgs.includes("--project"));
+  assert.ok(launch.commandArgs.some((value) =>
+    value.endsWith("training/local-runner/src/serve.py")
+  ));
+  assert.equal(launch.env.TT_MODEL_ARTIFACT, "/tmp/model.tar.gz");
+  assert.equal(launch.env.TT_BASE_MODEL, "/tmp/qwen-snapshot");
+  assert.equal(launch.env.TT_BASE_MODEL_REVISION, undefined);
+  assert.equal(launch.env.TT_MODEL_LOADER, "causal_lm");
+  assert.equal(launch.env.TT_TRUST_REMOTE_CODE, "false");
+  assert.equal(launch.env.TT_CHAT_TEMPLATE_KWARGS, undefined);
+  assert.equal(launch.env.HF_HOME, "/tmp/huggingface");
+  assert.equal(launch.env.HF_HUB_CACHE, "/tmp/huggingface/hub");
+  assert.equal(launch.env.HF_HUB_OFFLINE, "1");
+  assert.equal(launch.env.TRANSFORMERS_OFFLINE, "1");
+  assert.ok(launch.env.UV_PROJECT_ENVIRONMENT);
+  assert.equal(launch.env.TT_SYSTEM_PROMPT, "Be concise.");
+  assert.equal(launch.env.TT_MAX_CONCURRENT_REQUESTS, "2");
+  assert.equal(launch.url, "http://127.0.0.1:8123");
+});
+
+test("serving rejects unsafe artifacts, base-model mismatches, and invalid network bounds", () => {
+  const config = localRunnerConfigSchema.parse({
+    paths: { baseModel: "/tmp/qwen-snapshot" },
   });
   assert.throws(
-    () => buildLocalModelServerLaunch({ model: { ...model, artifact_uri: "s3://bucket/model" }, config }),
+    () => buildLocalModelServerLaunch({
+      model: { ...model, artifact_uri: "s3://bucket/model" },
+      config,
+    }),
     /local file artifact/,
+  );
+  assert.throws(
+    () => buildLocalModelServerLaunch({
+      model,
+      config,
+      options: { baseModelArtifactUri: "file:///tmp/different-snapshot" },
+    }),
+    /does not match the base model recorded/,
   );
   assert.throws(
     () => buildLocalModelServerLaunch({ model, config, options: { port: 70_000 } }),
     /port must be between/,
   );
   assert.throws(
-    () => buildLocalModelServerLaunch({ model, config, options: { port: 8000.5 } }),
-    /port must be between/,
+    () => buildLocalModelServerLaunch({ model, config, options: { maxConcurrentRequests: 9 } }),
+    /maxConcurrentRequests must be between/,
   );
   assert.throws(
     () => buildLocalModelServerLaunch({ model, config, options: { host: "0.0.0.0" } }),
@@ -104,14 +97,13 @@ test("local model server rejects non-local artifacts and invalid ports", () => {
   );
 });
 
-test("remote model serving requires an explicit bind opt-in and bearer token", () => {
-  const config = localRunnerConfigSchema.parse({ evaluation: { scoring: { mode: "exact_match" } } });
+test("an explicitly remote bind requires and forwards only the selected bearer token", () => {
   const previous = process.env.TT_TEST_SERVE_KEY;
   process.env.TT_TEST_SERVE_KEY = "local-test-token";
   try {
     const launch = buildLocalModelServerLaunch({
       model,
-      config,
+      config: localRunnerConfigSchema.parse({}),
       options: {
         host: "0.0.0.0",
         allowRemote: true,
@@ -120,6 +112,7 @@ test("remote model serving requires an explicit bind opt-in and bearer token", (
     });
     assert.equal(launch.env.TT_API_KEY, "local-test-token");
     assert.equal(launch.env.TT_TEST_SERVE_KEY, undefined);
+    assert.equal(launch.url, "http://0.0.0.0:8000");
   } finally {
     if (previous === undefined) delete process.env.TT_TEST_SERVE_KEY;
     else process.env.TT_TEST_SERVE_KEY = previous;

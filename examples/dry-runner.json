@@ -1,0 +1,14 @@
+{
+  "artifactRoot": ".tt-local/dry-artifacts",
+  "storeRoot": ".tt-local/dry-store",
+  "dryRun": true,
+  "evaluation": {
+    "inference": {
+      "device": "cuda"
+    },
+    "scoring": {
+      "mode": "exact_match"
+    },
+    "maxExamples": 2
+  }
+}

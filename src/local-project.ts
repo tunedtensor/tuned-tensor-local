@@ -1,10 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { homedir } from "node:os";
 import { mkdir } from "node:fs/promises";
 import {
-  fineTuneHyperparametersSchema,
   fineTuneRunRequestSchema,
   localBehaviorSpecFileSchema,
   type FineTuneRunRequest,
@@ -30,8 +29,6 @@ export interface CreateLocalRunnerConfigArgs {
 
 export interface RunRequestFromSpecOptions {
   runId?: string;
-  userId?: string;
-  runNumber?: number;
 }
 
 export interface LocalRunInput {
@@ -39,7 +36,6 @@ export interface LocalRunInput {
   path: string;
   request: FineTuneRunRequest;
   spec?: LocalBehaviorSpecFile;
-  warnings: string[];
 }
 
 function resolveLocalReference(value: unknown, baseDirectory: string): unknown {
@@ -51,7 +47,7 @@ function resolveLocalReference(value: unknown, baseDirectory: string): unknown {
   return resolve(baseDirectory, value);
 }
 
-/** Resolve file-bearing spec fields relative to the spec/request file itself. */
+/** Resolve dataset paths relative to the spec/request file itself. */
 export function resolveLocalRunInputPaths(raw: unknown, inputPath: string): unknown {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
   const baseDirectory = dirname(resolve(inputPath));
@@ -63,40 +59,7 @@ export function resolveLocalRunInputPaths(raw: unknown, inputPath: string): unkn
       if (fields[key] !== undefined) fields[key] = resolveLocalReference(fields[key], baseDirectory);
     }
   }
-  const spec = value.spec_snapshot && typeof value.spec_snapshot === "object" && !Array.isArray(value.spec_snapshot)
-    ? value.spec_snapshot as Record<string, unknown>
-    : value;
-  if (Array.isArray(spec.examples)) {
-    for (const example of spec.examples) {
-      if (!example || typeof example !== "object" || Array.isArray(example)) continue;
-      const assets = (example as Record<string, unknown>).input_assets;
-      if (!Array.isArray(assets)) continue;
-      for (const asset of assets) {
-        if (!asset || typeof asset !== "object" || Array.isArray(asset)) continue;
-        const fields = asset as Record<string, unknown>;
-        for (const key of ["image", "path", "uri"] as const) {
-          if (fields[key] !== undefined) fields[key] = resolveLocalReference(fields[key], baseDirectory);
-        }
-      }
-    }
-  }
   return value;
-}
-
-/**
- * Custom command workflows may pass arbitrary hyperparameter keys through to
- * their adapter. Still surface unfamiliar keys because the bundled trainer
- * ignores them, and a typo like `per_device_train_batch_size` can otherwise
- * look valid while the run trains with defaults.
- */
-export function unknownHyperparameterWarnings(raw: unknown): string[] {
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
-  const hyperparameters = (raw as Record<string, unknown>).hyperparameters;
-  if (!hyperparameters || typeof hyperparameters !== "object" || Array.isArray(hyperparameters)) return [];
-  const knownKeys = new Set(Object.keys(fineTuneHyperparametersSchema.shape));
-  return Object.keys(hyperparameters as Record<string, unknown>)
-    .filter((key) => !knownKeys.has(key))
-    .map((key) => `Unknown hyperparameter "${key}" will be passed through but may be ignored by the default trainer. Known keys: ${[...knownKeys].join(", ")}.`);
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -124,15 +87,16 @@ export async function initLocalSpecFile(args: CreateLocalSpecArgs): Promise<Loca
     base_model: args.baseModel,
     examples: [
       {
-        input: "Replace this with a representative input.",
-        output: "Replace this with the expected output.",
+        input: "Replace this with representative training input.",
+        output: "Replace this with the expected training output.",
+      },
+      {
+        input: "Replace this with a different validation input.",
+        output: "Replace this with the expected validation output.",
       },
     ],
     hyperparameters: {
       n_epochs: 1,
-      save_adapter_only: true,
-      augment: false,
-      use_llm_judge: false,
     },
   });
   await mkdir(dirname(args.outputPath), { recursive: true });
@@ -147,18 +111,12 @@ export async function initLocalRunnerConfigFile(args: CreateLocalRunnerConfigArg
   const config = {
     artifactRoot: ".tt-local/artifacts",
     storeRoot: ".tt-local/store",
-    training: {
-      project: "training/local-runner",
-    },
     evaluation: {
       inference: {
-        provider: "transformers",
-        project: "training/local-runner",
         device: "cuda",
       },
       scoring: {
         mode: "exact_match",
-        fallback: "fail",
       },
       timeoutMs: 1_800_000,
     },
@@ -194,25 +152,39 @@ export function runRequestFromLocalSpec(
 ): FineTuneRunRequest {
   const {
     id,
-    user_id: userId,
-    run_number: runNumber,
-    training_method: trainingMethod,
     hyperparameters,
-    artifacts,
     dataset_prebuilt: datasetPrebuilt,
     ...specSnapshot
   } = spec;
+  const behaviorSpecId = id ?? deterministicBehaviorSpecId(specSnapshot);
   return fineTuneRunRequestSchema.parse({
     run_id: options.runId ?? randomUUID(),
-    user_id: options.userId ?? userId,
-    behavior_spec_id: id ?? randomUUID(),
-    run_number: options.runNumber ?? runNumber,
-    training_method: trainingMethod,
+    user_id: "local-user",
+    behavior_spec_id: behaviorSpecId,
+    run_number: 1,
     spec_snapshot: specSnapshot,
     hyperparameters,
-    artifacts,
     dataset_prebuilt: datasetPrebuilt,
   });
+}
+
+function deterministicBehaviorSpecId(spec: FineTuneRunRequest["spec_snapshot"]): string {
+  const namespace = Buffer.from("9f783f01340457bea061942004259253", "hex");
+  const digest = createHash("sha1")
+    .update(namespace)
+    .update(JSON.stringify(spec))
+    .digest()
+    .subarray(0, 16);
+  digest[6] = (digest[6]! & 0x0f) | 0x50;
+  digest[8] = (digest[8]! & 0x3f) | 0x80;
+  const hex = digest.toString("hex");
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20),
+  ].join("-");
 }
 
 export async function loadLocalRunInput(
@@ -220,10 +192,9 @@ export async function loadLocalRunInput(
   options: RunRequestFromSpecOptions = {},
 ): Promise<LocalRunInput> {
   const raw = resolveLocalRunInputPaths(JSON.parse(await readFile(path, "utf8")) as unknown, path);
-  const warnings = unknownHyperparameterWarnings(raw);
   const request = fineTuneRunRequestSchema.safeParse(raw);
   if (request.success) {
-    return { kind: "request", path, request: request.data, warnings };
+    return { kind: "request", path, request: request.data };
   }
   const spec = localBehaviorSpecFileSchema.parse(raw);
   return {
@@ -231,6 +202,5 @@ export async function loadLocalRunInput(
     path,
     spec,
     request: runRequestFromLocalSpec(spec, options),
-    warnings,
   };
 }

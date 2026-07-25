@@ -235,16 +235,15 @@ export interface ArtifactManifest {
 
 export interface ArtifactManifestModel {
   artifact_kind: "file" | "directory";
-  format: string;
-  framework: string;
+  format: "tar.gz" | "huggingface-directory";
+  framework: "transformers-peft";
   base_model: string;
   base_model_revision?: string;
   base_model_artifact_uri?: string;
   base_model_fingerprint?: string;
-  parent_model_artifact?: string;
   artifact_uri: string;
   artifact_root: string;
-  servable: boolean;
+  servable: true;
   files: ArtifactManifestFile[];
 }
 
@@ -276,7 +275,6 @@ const MANIFEST_IGNORED_PATHS = new Set([
   // records the next stage event or refreshes the canonical request copy.
   "progress.jsonl",
   "request.json",
-  "detached.log",
   RUN_OWNER_FILE,
   ARTIFACT_WORKFLOW_LOCK_FILE,
 ]);
@@ -357,6 +355,18 @@ function assertManifestFiles(value: unknown, label: string): asserts value is Ar
   }
 }
 
+function hasPeftAdapterFiles(files: ArtifactManifestFile[]): boolean {
+  const names = new Set(
+    files
+      .filter((file) => file.size_bytes > 0)
+      .map((file) => file.path.split("/").at(-1)?.toLowerCase()),
+  );
+  return (
+    names.has("adapter_config.json")
+    && (names.has("adapter_model.safetensors") || names.has("adapter_model.bin"))
+  );
+}
+
 function parseArtifactManifest(value: unknown): ArtifactManifest {
   if (!value || typeof value !== "object") throw new Error("Artifact manifest must be an object.");
   const candidate = value as Partial<ArtifactManifest>;
@@ -366,12 +376,26 @@ function parseArtifactManifest(value: unknown): ArtifactManifest {
   assertManifestFiles(candidate.files, "file");
   if (candidate.model) {
     const model = candidate.model;
+    const allowedModelKeys = new Set([
+      "artifact_kind",
+      "format",
+      "framework",
+      "base_model",
+      "base_model_revision",
+      "base_model_artifact_uri",
+      "base_model_fingerprint",
+      "artifact_uri",
+      "artifact_root",
+      "servable",
+      "files",
+    ]);
     const hasBaseArtifact = model.base_model_artifact_uri !== undefined;
     const hasBaseFingerprint = model.base_model_fingerprint !== undefined;
     if (
-      (model.artifact_kind !== "file" && model.artifact_kind !== "directory")
-      || typeof model.format !== "string"
-      || typeof model.framework !== "string"
+      Object.keys(model).some((key) => !allowedModelKeys.has(key))
+      || (model.artifact_kind !== "file" && model.artifact_kind !== "directory")
+      || (model.format !== "tar.gz" && model.format !== "huggingface-directory")
+      || model.framework !== "transformers-peft"
       || typeof model.base_model !== "string"
       || (model.base_model_revision !== undefined && typeof model.base_model_revision !== "string")
       || (model.base_model_artifact_uri !== undefined && typeof model.base_model_artifact_uri !== "string")
@@ -379,14 +403,18 @@ function parseArtifactManifest(value: unknown): ArtifactManifest {
       || hasBaseArtifact !== hasBaseFingerprint
       || typeof model.artifact_uri !== "string"
       || typeof model.artifact_root !== "string"
-      || typeof model.servable !== "boolean"
-      || (model.parent_model_artifact !== undefined && typeof model.parent_model_artifact !== "string")
+      || model.servable !== true
       || !Array.isArray(model.files)
       || model.files.length === 0
+      || (model.artifact_kind === "file" && model.format !== "tar.gz")
+      || (model.artifact_kind === "directory" && model.format !== "huggingface-directory")
     ) {
       throw new Error("Artifact manifest contains invalid model contract metadata.");
     }
     assertManifestFiles(model.files, "model file");
+    if (model.artifact_kind === "directory" && !hasPeftAdapterFiles(model.files)) {
+      throw new Error("PEFT model manifest requires adapter weights and adapter_config.json.");
+    }
   }
   return candidate as ArtifactManifest;
 }
@@ -400,6 +428,14 @@ export async function writeArtifactManifest(
   let model: ArtifactManifestModel | undefined;
   if (options.model) {
     if (
+      options.model.framework !== "transformers-peft"
+      || options.model.servable !== true
+      || (options.model.artifact_kind === "file" && options.model.format !== "tar.gz")
+      || (options.model.artifact_kind === "directory" && options.model.format !== "huggingface-directory")
+    ) {
+      throw new Error("TT Local model artifacts must be verified, servable Transformers PEFT adapters.");
+    }
+    if (
       (options.model.base_model_artifact_uri === undefined)
       !== (options.model.base_model_fingerprint === undefined)
     ) {
@@ -410,31 +446,26 @@ export async function writeArtifactManifest(
       ? [portableRelative(dirname(modelRoot), modelRoot)]
       : await listArtifactFiles(modelRoot);
     const checksumRoot = options.model.artifact_kind === "file" ? dirname(modelRoot) : modelRoot;
-    if (
-      options.model.artifact_kind === "file"
-      && (options.model.format === "tar.gz" || modelRoot.endsWith(".tar.gz"))
-    ) {
+    if (options.model.artifact_kind === "file") {
+      if (!modelRoot.toLowerCase().endsWith(".tar.gz")) {
+        throw new Error(`PEFT file artifacts must be .tar.gz archives: ${modelRoot}`);
+      }
       const archive = await verifyTarGzipArchive(modelRoot);
-      if (
-        (options.model.framework === "transformers-peft" || options.model.servable)
-        && archive.adapter_weight_entries === 0
-      ) {
+      if (archive.adapter_weight_entries === 0 || archive.adapter_weight_bytes === 0) {
         throw new Error(`PEFT model archive contains no adapter_model.safetensors or adapter_model.bin: ${modelRoot}`);
       }
-      if (
-        (options.model.framework === "transformers-peft" || options.model.servable)
-        && archive.adapter_config_entries === 0
-      ) {
+      if (archive.adapter_config_entries === 0) {
         throw new Error(`PEFT model archive contains no adapter_config.json: ${modelRoot}`);
       }
-      if (options.model.framework === "transformers-full" && archive.full_model_weight_entries === 0) {
-        throw new Error(`Full-model archive contains no Transformers model weights: ${modelRoot}`);
-      }
+    }
+    const modelFiles = await Promise.all(modelPaths.map((path) => describeArtifactFile(checksumRoot, path)));
+    if (options.model.artifact_kind === "directory" && !hasPeftAdapterFiles(modelFiles)) {
+      throw new Error(`PEFT model directory requires adapter weights and adapter_config.json: ${modelRoot}`);
     }
     model = {
       ...options.model,
       artifact_root: modelRoot,
-      files: await Promise.all(modelPaths.map((path) => describeArtifactFile(checksumRoot, path))),
+      files: modelFiles,
     };
   }
   const manifest: ArtifactManifest = {
@@ -513,30 +544,22 @@ export async function verifyArtifactManifest(
       const expectedModelPaths = new Set(manifest.model.files.map((file) => file.path));
       unexpected.push(...modelActualPaths.filter((path) => !expectedModelPaths.has(path)).map((path) => `model:${path}`));
     }
-    if (
-      manifest.model.artifact_kind === "file"
-      && (manifest.model.format === "tar.gz" || modelRoot.endsWith(".tar.gz"))
-    ) {
+    if (manifest.model.artifact_kind === "file") {
       try {
         const archive = await verifyTarGzipArchive(modelRoot);
-        if (
-          (manifest.model.framework === "transformers-peft" || manifest.model.servable)
-          && archive.adapter_weight_entries === 0
-        ) {
+        if (archive.adapter_weight_entries === 0 || archive.adapter_weight_bytes === 0) {
           changed.push(`model:${portableRelative(checksumRoot, modelRoot)}:missing_adapter_weights`);
         }
-        if (
-          (manifest.model.framework === "transformers-peft" || manifest.model.servable)
-          && archive.adapter_config_entries === 0
-        ) {
+        if (archive.adapter_config_entries === 0) {
           changed.push(`model:${portableRelative(checksumRoot, modelRoot)}:missing_adapter_config`);
-        }
-        if (manifest.model.framework === "transformers-full" && archive.full_model_weight_entries === 0) {
-          changed.push(`model:${portableRelative(checksumRoot, modelRoot)}:missing_full_model_weights`);
         }
       } catch {
         changed.push(`model:${portableRelative(checksumRoot, modelRoot)}:invalid_archive`);
       }
+    } else if (!hasPeftAdapterFiles(
+      await Promise.all(modelActualPaths.map((path) => describeArtifactFile(checksumRoot, path))),
+    )) {
+      changed.push("model:missing_peft_adapter");
     }
   }
   return {
@@ -693,12 +716,6 @@ export async function verifyTarGzipArchive(path: string): Promise<TarGzipVerific
         && (
           name!.endsWith(".safetensors")
           || name!.endsWith(".bin")
-          || name!.endsWith(".pt")
-          || name!.endsWith(".pth")
-          || name!.endsWith(".gguf")
-          || name!.endsWith(".onnx")
-          || name!.endsWith(".ckpt")
-          || name!.endsWith(".npz")
         );
       const adapterWeight = name === "adapter_model.safetensors" || name === "adapter_model.bin";
       const fullModelWeight = Boolean(name)
