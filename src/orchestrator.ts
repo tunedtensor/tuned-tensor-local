@@ -37,6 +37,7 @@ import {
 import {
   buildSystemMessage,
   compileSpecToJsonl,
+  evaluationSuiteFromChatJsonl,
   examplesFromChatJsonl,
   examplesFromSpec,
   normalizeChatJsonlForRelocation,
@@ -55,6 +56,7 @@ import type { LocalRunReporter } from "./run-reporter.js";
 import { createLocalStore, type LocalRunStatus, type LocalStore } from "./store.js";
 import { withHuggingFaceCacheEnvironment } from "./huggingface-cache.js";
 import { verifyLocalBaseModel } from "./prefetch.js";
+import { evaluateGeneralRegressionGate } from "./general-regression.js";
 
 export interface LocalRunResult {
   request: FineTuneRunRequest;
@@ -95,6 +97,12 @@ interface PreparedRun {
   system: string;
   baseModelForEvaluation: string;
   maxEvalExamples?: number;
+  generalRegression?: {
+    datasetPath: string;
+    datasetSha256: string;
+    examples: BehaviorSpecExample[];
+    system: string;
+  };
 }
 
 export async function loadJsonFile<T>(path: string): Promise<T> {
@@ -123,6 +131,15 @@ export async function loadLocalRunnerConfig(path?: string): Promise<LocalRunnerC
     paths: {
       baseModel: configPathValue(config.paths.baseModel),
       modelCache: configPathValue(config.paths.modelCache),
+    },
+    evaluation: {
+      ...config.evaluation,
+      generalRegression: config.evaluation.generalRegression
+        ? {
+            ...config.evaluation.generalRegression,
+            dataset: configPathValue(config.evaluation.generalRegression.dataset)!,
+          }
+        : undefined,
     },
   };
 }
@@ -311,6 +328,12 @@ export async function validateLocalFineTuneInput(input: {
   const config = localRunnerConfigSchema.parse(input.config);
   const request = fineTuneRunRequestSchema.parse(addDryRunPlaceholders(input.request, config.dryRun));
   await validateDatasetInputs(request, config);
+  if (config.evaluation.generalRegression) {
+    await evaluationSuiteFromChatJsonl(
+      config.evaluation.generalRegression.dataset,
+      config.evaluation.generalRegression.systemPrompt,
+    );
+  }
   return { request, config };
 }
 
@@ -502,6 +525,8 @@ async function cleanupStageArtifacts(
     await Promise.all([
       removePrefixedArtifacts(artifacts.baselineEvalJson),
       removePrefixedArtifacts(artifacts.candidateEvalJson),
+      removePrefixedArtifacts(artifacts.generalBaselineEvalJson),
+      removePrefixedArtifacts(artifacts.generalCandidateEvalJson),
       rm(artifacts.trainingDir, { recursive: true, force: true }),
       removePrefixedArtifacts(artifacts.trainingReportJson),
       rm(resolve(artifacts.runDir, "model.tar.gz"), { force: true }),
@@ -513,6 +538,7 @@ async function cleanupStageArtifacts(
   if (stage === "baseline") {
     await Promise.all([
       removePrefixedArtifacts(artifacts.baselineEvalJson),
+      removePrefixedArtifacts(artifacts.generalBaselineEvalJson),
       removeReport(),
     ]);
     return;
@@ -523,6 +549,7 @@ async function cleanupStageArtifacts(
       removePrefixedArtifacts(artifacts.trainingReportJson),
       rm(resolve(artifacts.runDir, "model.tar.gz"), { force: true }),
       removePrefixedArtifacts(artifacts.candidateEvalJson),
+      removePrefixedArtifacts(artifacts.generalCandidateEvalJson),
       removeReport(),
     ]);
     await prepareRunDirectories(artifacts);
@@ -531,6 +558,7 @@ async function cleanupStageArtifacts(
   if (stage === "candidate") {
     await Promise.all([
       removePrefixedArtifacts(artifacts.candidateEvalJson),
+      removePrefixedArtifacts(artifacts.generalCandidateEvalJson),
       removeReport(),
     ]);
     return;
@@ -727,6 +755,12 @@ async function stageFingerprint(args: {
     scoring: args.config.evaluation.scoring,
     timeout_ms: args.config.evaluation.timeoutMs,
     baseline_cache: args.config.evaluation.baselineCache,
+    general_regression: args.prepared.generalRegression
+      ? {
+          dataset_sha256: args.prepared.generalRegression.datasetSha256,
+          system_prompt: args.prepared.generalRegression.system,
+        }
+      : null,
     model_cache: args.config.paths.modelCache,
   };
   return hashJson({
@@ -891,6 +925,17 @@ async function computePreparedRun(args: {
   const maxEvalExamples = config.evaluation.maxExamples ?? request.hyperparameters.max_eval_examples;
   const evalExamplesUsed = Math.min(maxEvalExamples ?? examples.length, examples.length);
   const fingerprints = await datasetFingerprints(request);
+  const generalRegressionConfig = config.evaluation.generalRegression;
+  const generalRegression = generalRegressionConfig
+    ? {
+        datasetPath: generalRegressionConfig.dataset,
+        datasetSha256: await hashFile(generalRegressionConfig.dataset),
+        ...await evaluationSuiteFromChatJsonl(
+          generalRegressionConfig.dataset,
+          generalRegressionConfig.systemPrompt,
+        ),
+      }
+    : undefined;
   const requestFingerprint = hashJson(request);
   const runtimeFingerprintValue = await runtimeFingerprint();
   const baseModelRevision = await resolveBaseModelRevision(request, config);
@@ -941,7 +986,25 @@ async function computePreparedRun(args: {
     system,
     baseModelForEvaluation,
     maxEvalExamples,
+    generalRegression,
   };
+}
+
+function generalRegressionEvaluationConfig(config: LocalRunnerConfig): LocalRunnerConfig {
+  const { maxExamples: _maxExamples, sampleSeed: _sampleSeed, ...evaluation } = config.evaluation;
+  return { ...config, evaluation };
+}
+
+function generalRegressionRequiredPaths(
+  prepared: PreparedRun,
+  kind: "baseline" | "candidate",
+): string[] {
+  if (!prepared.generalRegression) return [];
+  return [
+    kind === "baseline"
+      ? prepared.artifacts.generalBaselineEvalJson
+      : prepared.artifacts.generalCandidateEvalJson,
+  ];
 }
 
 async function prepareStage(args: {
@@ -1006,6 +1069,7 @@ async function runBaselineStage(args: {
       stage: "baseline",
       prepared: args.prepared,
       config: args.config,
+      additionalPaths: generalRegressionRequiredPaths(args.prepared, "baseline"),
     })
   ) {
     await throwIfCancelled(args.store, args.prepared.request);
@@ -1057,6 +1121,36 @@ async function runBaselineStage(args: {
     sampleSeed: args.prepared.metadata.eval_sample_seed,
     shouldCancel: () => args.store.isCancellationRequested(args.prepared.request.run_id),
   });
+  if (args.prepared.generalRegression) {
+    await updateRun({
+      store: args.store,
+      reporter: args.reporter,
+      request: args.prepared.request,
+      status: "evaluating_baseline",
+      stage: "evaluating_baseline",
+      message: "Running baseline general regression evaluation.",
+      details: {
+        examples: args.prepared.generalRegression.examples.length,
+        dataset: args.prepared.generalRegression.datasetPath,
+      },
+    });
+    await evaluateExamples({
+      kind: "baseline",
+      modelId: args.prepared.baseModelForEvaluation,
+      baseModelId: args.prepared.baseModelForEvaluation,
+      baseModelRevision: args.config.paths.baseModel
+        ? undefined
+        : args.prepared.metadata.base_model_revision ?? undefined,
+      sourceFingerprint: args.prepared.metadata.base_model_fingerprint ?? undefined,
+      examples: args.prepared.generalRegression.examples,
+      system: args.prepared.generalRegression.system,
+      config: generalRegressionEvaluationConfig(args.config),
+      outputPath: args.prepared.artifacts.generalBaselineEvalJson,
+      reporter: args.runReporter,
+      evalSplit: "general_regression",
+      shouldCancel: () => args.store.isCancellationRequested(args.prepared.request.run_id),
+    });
+  }
   await throwIfCancelled(args.store, args.prepared.request);
   await writeStageFingerprint({ stage: "baseline", prepared: args.prepared, config: args.config });
   return report;
@@ -1174,6 +1268,7 @@ async function runCandidateStage(args: {
       additionalPaths: [
         args.prepared.artifacts.trainingReportJson,
         stageFingerprintPath(args.prepared, "train"),
+        ...generalRegressionRequiredPaths(args.prepared, "candidate"),
       ],
     })
   ) {
@@ -1246,6 +1341,36 @@ async function runCandidateStage(args: {
     sampleSeed: args.prepared.metadata.eval_sample_seed,
     shouldCancel: () => args.store.isCancellationRequested(args.prepared.request.run_id),
   });
+  if (args.prepared.generalRegression) {
+    await updateRun({
+      store: args.store,
+      reporter: args.reporter,
+      request: args.prepared.request,
+      status: "evaluating_candidate",
+      stage: "evaluating_candidate",
+      message: "Running candidate general regression evaluation.",
+      details: {
+        examples: args.prepared.generalRegression.examples.length,
+        dataset: args.prepared.generalRegression.datasetPath,
+      },
+    });
+    await evaluateExamples({
+      kind: "candidate",
+      modelId: modelArtifact,
+      baseModelId: args.prepared.baseModelForEvaluation,
+      baseModelRevision: args.config.paths.baseModel
+        ? undefined
+        : args.prepared.metadata.base_model_revision ?? undefined,
+      adapterPath: modelArtifact,
+      examples: args.prepared.generalRegression.examples,
+      system: args.prepared.generalRegression.system,
+      config: generalRegressionEvaluationConfig(args.config),
+      outputPath: args.prepared.artifacts.generalCandidateEvalJson,
+      reporter: args.runReporter,
+      evalSplit: "general_regression",
+      shouldCancel: () => args.store.isCancellationRequested(args.prepared.request.run_id),
+    });
+  }
   await throwIfCancelled(args.store, args.prepared.request);
   await writeStageFingerprint({
     stage: "candidate",
@@ -1273,6 +1398,15 @@ async function runReportStage(args: {
   if (!await pathExists(args.prepared.artifacts.trainingReportJson)) {
     throw new Error("Run reporting requires training-report.json.");
   }
+  if (
+    args.prepared.generalRegression
+    && (
+      !await pathExists(args.prepared.artifacts.generalBaselineEvalJson)
+      || !await pathExists(args.prepared.artifacts.generalCandidateEvalJson)
+    )
+  ) {
+    throw new Error("Run reporting requires both general regression evaluations.");
+  }
   const currentTraining = await canReuseStageArtifact({
     stage: "train",
     prepared: args.prepared,
@@ -1283,12 +1417,18 @@ async function runReportStage(args: {
     stage: "baseline",
     prepared: args.prepared,
     config: args.config,
+    additionalPaths: generalRegressionRequiredPaths(args.prepared, "baseline"),
   });
   const currentCandidate = await canReuseStageArtifact({
     stage: "candidate",
     prepared: args.prepared,
     config: args.config,
     verifyModel: true,
+    additionalPaths: [
+      args.prepared.artifacts.trainingReportJson,
+      stageFingerprintPath(args.prepared, "train"),
+      ...generalRegressionRequiredPaths(args.prepared, "candidate"),
+    ],
   });
   if (!currentTraining || !currentBaseline || !currentCandidate) {
     throw new Error("report stage inputs are stale for the current request/config. Re-run baseline, train, and candidate as needed.");
@@ -1300,6 +1440,8 @@ async function runReportStage(args: {
     stageFingerprintPath(args.prepared, "candidate"),
     args.prepared.artifacts.trainingReportJson,
     stageFingerprintPath(args.prepared, "train"),
+    ...generalRegressionRequiredPaths(args.prepared, "baseline"),
+    ...generalRegressionRequiredPaths(args.prepared, "candidate"),
   ], { verifyModel: true });
   await throwIfCancelled(args.store, args.prepared.request);
   await args.store.invalidateRunOutputs(args.prepared.request.run_id, { report: true });
@@ -1317,6 +1459,31 @@ async function runReportStage(args: {
   const candidate = evalReportSchema.parse(await readJson<unknown>(args.prepared.artifacts.candidateEvalJson));
   const training = trainingReportSchema.parse(await readJson<unknown>(args.prepared.artifacts.trainingReportJson));
   const comparison = compareEvalReports(baseline, candidate);
+  let generalRegression: RunReport["general_regression"];
+  if (args.prepared.generalRegression) {
+    const generalBaseline = evalReportSchema.parse(
+      await readJson<unknown>(args.prepared.artifacts.generalBaselineEvalJson),
+    );
+    const generalCandidate = evalReportSchema.parse(
+      await readJson<unknown>(args.prepared.artifacts.generalCandidateEvalJson),
+    );
+    const generalComparison = compareEvalReports(generalBaseline, generalCandidate);
+    const policy = args.config.evaluation.generalRegression!;
+    const gate = evaluateGeneralRegressionGate(generalComparison, policy);
+    generalRegression = {
+      dataset_uri: fileUri(args.prepared.generalRegression.datasetPath),
+      dataset_sha256: args.prepared.generalRegression.datasetSha256,
+      baseline: generalBaseline,
+      candidate: generalCandidate,
+      comparison: generalComparison,
+      policy: {
+        max_score_drop: policy.maxScoreDrop,
+        max_pass_rate_drop: policy.maxPassRateDrop,
+      },
+      passed: gate.passed,
+      failures: gate.failures,
+    };
+  }
   const completedAt = new Date().toISOString();
   const duration = elapsed(args.startedPerf);
   const report = runReportSchema.parse({
@@ -1330,11 +1497,18 @@ async function runReportStage(args: {
     baseline,
     candidate,
     comparison,
+    general_regression: generalRegression,
     training,
     artifact_uris: {
       dataset: fileUri(args.prepared.artifacts.trainingJsonl),
       baseline_eval: fileUri(args.prepared.artifacts.baselineEvalJson),
       candidate_eval: fileUri(args.prepared.artifacts.candidateEvalJson),
+      general_baseline_eval: generalRegression
+        ? fileUri(args.prepared.artifacts.generalBaselineEvalJson)
+        : undefined,
+      general_candidate_eval: generalRegression
+        ? fileUri(args.prepared.artifacts.generalCandidateEvalJson)
+        : undefined,
       report: fileUri(args.prepared.artifacts.runReportJson),
     },
     run_metadata: {
@@ -1375,6 +1549,7 @@ async function runReportStage(args: {
       report_path: args.prepared.artifacts.runReportJson,
       ...(!isDryTraining(training) ? { model_id: `local-${args.prepared.request.run_id}` } : {}),
       avg_score_delta: comparison.avg_score_delta,
+      general_regression_passed: generalRegression?.passed,
       elapsed_seconds: duration.seconds,
     },
   });

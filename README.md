@@ -72,6 +72,41 @@ tt-local runs report <run-id>
 tt-local models verify local-<run-id>
 ```
 
+To protect broad capability, configure a separate chat JSONL suite in
+`local-runner.json`:
+
+```json
+{
+  "evaluation": {
+    "generalRegression": {
+      "dataset": "evals/general.jsonl",
+      "maxScoreDrop": 0.03,
+      "maxPassRateDrop": 0.05
+    }
+  }
+}
+```
+
+TT Local evaluates the protected base and candidate adapter on this suite,
+records both reports, and marks whether the configured score and pass-rate
+budgets were respected. The base result uses the existing immutable baseline
+cache.
+
+After a passing run, activation is a lightweight pointer to the existing model
+record:
+
+```bash
+tt-local models activate local-<run-id>
+tt-local models active
+tt-local serve active --config local-runner.json
+tt-local models rollback
+tt-local serve base --config local-runner.json
+```
+
+Activation re-verifies the model artifact and requires a completed run with a
+passing general-regression result. Rollback restores the previous adapter or
+the protected base; it does not copy or delete model files.
+
 The report is evidence on the selected evaluation rows, not a guarantee of
 general model improvement.
 

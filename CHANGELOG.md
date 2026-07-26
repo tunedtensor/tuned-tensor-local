@@ -4,6 +4,33 @@ All notable changes to TT Local will be documented in this file.
 
 ## Unreleased
 
+## 0.4.0 - 2026-07-26
+
+### Added
+
+- Added an independent chat JSONL general-regression suite that evaluates the
+  protected base and tuned adapter with configurable score and pass-rate
+  budgets, immutable artifacts, and explicit pass/fail evidence in run reports.
+- Added lightweight active-model promotion and rollback through
+  `models activate`, `models active`, `models rollback`, `serve active`, and
+  protected-base serving. Activation requires a completed run, a passing
+  general-regression gate, and verified run and model artifacts.
+
+### Changed
+
+- General-regression dataset or prompt changes now invalidate only the
+  affected evaluations, while policy-only changes recalculate the report
+  without retraining or repeating inference.
+- The bundled OpenAI-compatible server can now launch the certified protected
+  base without attaching a PEFT adapter.
+
+### Fixed
+
+- Repeated activation of the already-active model is idempotent and preserves
+  its rollback target.
+- Regression-budget comparisons tolerate insignificant floating-point noise at
+  the configured boundary.
+
 ## 0.3.0 - 2026-07-26
 
 ### Added

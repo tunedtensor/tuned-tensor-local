@@ -22,7 +22,7 @@ from evaluate import (
 )
 
 
-MODEL_ARTIFACT = os.environ["TT_MODEL_ARTIFACT"]
+MODEL_ARTIFACT = os.environ.get("TT_MODEL_ARTIFACT")
 BASE_MODEL = os.environ["TT_BASE_MODEL"]
 BASE_MODEL_REVISION = os.environ.get("TT_BASE_MODEL_REVISION")
 MODEL_NAME = os.environ.get("TT_MODEL_NAME", "tuned-tensor-local")
@@ -47,7 +47,11 @@ if MODEL_LOADER != "causal_lm":
 configure_hugging_face_cache(os.environ.get("HF_HOME"))
 import_runtime_dependencies()
 TEMP_DIR = TemporaryDirectory(prefix="tt-local-serve-")
-ADAPTER_PATH = resolve_adapter_path(MODEL_ARTIFACT, Path(TEMP_DIR.name))
+ADAPTER_PATH = (
+    resolve_adapter_path(MODEL_ARTIFACT, Path(TEMP_DIR.name))
+    if MODEL_ARTIFACT
+    else None
+)
 MODEL_PAYLOAD = {
     "base_model": BASE_MODEL,
     "base_model_revision": BASE_MODEL_REVISION,

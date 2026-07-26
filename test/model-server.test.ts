@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { localRunnerConfigSchema } from "../src/contracts.js";
-import { buildLocalModelServerLaunch } from "../src/model-server.js";
+import {
+  buildLocalBaseModelServerLaunch,
+  buildLocalModelServerLaunch,
+} from "../src/model-server.js";
 import type { LocalModelRecord } from "../src/store.js";
 
 const model: LocalModelRecord = {
@@ -62,6 +65,24 @@ test("serving launches the bundled text-only Qwen adapter with safe model settin
   assert.equal(launch.env.TT_SYSTEM_PROMPT, "Be concise.");
   assert.equal(launch.env.TT_MAX_CONCURRENT_REQUESTS, "2");
   assert.equal(launch.url, "http://127.0.0.1:8123");
+});
+
+test("protected-base serving omits the adapter while remaining offline", () => {
+  const launch = buildLocalBaseModelServerLaunch({
+    baseModel: "Qwen/Qwen3.5-2B",
+    config: localRunnerConfigSchema.parse({
+      paths: {
+        baseModel: "/tmp/qwen-snapshot",
+        modelCache: "/tmp/huggingface",
+      },
+    }),
+  });
+  assert.equal(launch.artifactPath, undefined);
+  assert.equal(launch.env.TT_MODEL_ARTIFACT, undefined);
+  assert.equal(launch.env.TT_BASE_MODEL, "/tmp/qwen-snapshot");
+  assert.equal(launch.env.HF_HUB_OFFLINE, "1");
+  assert.equal(launch.env.TRANSFORMERS_OFFLINE, "1");
+  assert.equal(launch.modelName, "base:Qwen/Qwen3.5-2B");
 });
 
 test("serving rejects unsafe artifacts, base-model mismatches, and invalid network bounds", () => {

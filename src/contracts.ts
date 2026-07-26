@@ -110,6 +110,7 @@ export const evalSplitSchema = z.enum([
   "spec_holdout",
   "prebuilt_test",
   "prebuilt_validation",
+  "general_regression",
 ]);
 
 export const evalReportSchema = z.object({
@@ -174,11 +175,26 @@ export const runReportSchema = z.object({
   baseline: evalReportSchema,
   candidate: evalReportSchema,
   comparison: comparisonReportSchema,
+  general_regression: z.object({
+    dataset_uri: z.string(),
+    dataset_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+    baseline: evalReportSchema,
+    candidate: evalReportSchema,
+    comparison: comparisonReportSchema,
+    policy: z.object({
+      max_score_drop: z.number().min(0).max(1),
+      max_pass_rate_drop: z.number().min(0).max(1),
+    }).strict(),
+    passed: z.boolean(),
+    failures: z.array(z.string()),
+  }).strict().optional(),
   training: trainingReportSchema,
   artifact_uris: z.object({
     dataset: z.string(),
     baseline_eval: z.string(),
     candidate_eval: z.string(),
+    general_baseline_eval: z.string().optional(),
+    general_candidate_eval: z.string().optional(),
     report: z.string(),
   }).strict(),
   run_metadata: z.object({
@@ -225,6 +241,12 @@ const evaluationConfigSchema = z.object({
   maxExamples: z.number().int().min(1).optional(),
   sampleSeed: z.number().int().optional(),
   baselineCache: z.boolean().default(true),
+  generalRegression: z.object({
+    dataset: z.string().min(1),
+    systemPrompt: z.string().optional(),
+    maxScoreDrop: z.number().min(0).max(1).default(0.03),
+    maxPassRateDrop: z.number().min(0).max(1).default(0.05),
+  }).strict().optional(),
 }).strict();
 
 export const localRunnerConfigSchema = z.object({

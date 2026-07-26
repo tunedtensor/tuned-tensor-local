@@ -130,6 +130,127 @@ test("runs the complete dry SFT workflow with distinct train and holdout data", 
   }
 });
 
+test("runs and reports a separate general regression suite", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-general-regression-"));
+  try {
+    const regressionPath = join(root, "general.jsonl");
+    await writeFile(
+      regressionPath,
+      [
+        chatRow("What is 2 + 2?", "4"),
+        chatRow("Return the word blue.", "blue"),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const request = requestFixture({
+      runId: "51515151-5151-4515-8515-515151515151",
+    });
+    const config = configFixture(root, {
+      evaluation: {
+        generalRegression: {
+          dataset: regressionPath,
+          maxScoreDrop: 0.03,
+          maxPassRateDrop: 0.05,
+        },
+      },
+    });
+
+    const result = await runLocalFineTune({ request, config });
+    const regression = result.report.general_regression;
+    assert.ok(regression);
+    assert.equal(regression.passed, true);
+    assert.equal(regression.baseline.eval_split, "general_regression");
+    assert.equal(regression.candidate.eval_split, "general_regression");
+    assert.equal(regression.baseline.eval_examples_used, 2);
+    assert.equal(regression.candidate.eval_examples_used, 2);
+    assert.match(regression.dataset_sha256, /^[a-f0-9]{64}$/);
+    assert.ok(result.report.artifact_uris.general_baseline_eval);
+    assert.ok(result.report.artifact_uris.general_candidate_eval);
+
+    const policyMessages: string[] = [];
+    const policyOnly = configFixture(root, {
+      evaluation: {
+        generalRegression: {
+          dataset: regressionPath,
+          maxScoreDrop: 0.01,
+          maxPassRateDrop: 0.02,
+        },
+      },
+    });
+    const policyResult = await runLocalFineTune({
+      request,
+      config: policyOnly,
+      reporter: {
+        onEvent(event) {
+          policyMessages.push(event.message);
+        },
+      },
+    });
+    assert.equal(policyResult.report.general_regression?.policy.max_score_drop, 0.01);
+    assert.ok(policyMessages.includes("Reusing prepared local run artifacts."));
+    assert.ok(policyMessages.includes("Reusing existing baseline evaluation."));
+    assert.ok(policyMessages.includes("Reusing existing training result."));
+    assert.ok(policyMessages.includes("Reusing existing candidate evaluation."));
+
+    await writeFile(
+      regressionPath,
+      [
+        chatRow("What is 3 + 3?", "6"),
+        chatRow("Return the word green.", "green"),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const datasetMessages: string[] = [];
+    await runLocalFineTune({
+      request,
+      config: policyOnly,
+      reporter: {
+        onEvent(event) {
+          datasetMessages.push(event.message);
+        },
+      },
+    });
+    assert.ok(datasetMessages.includes("Reusing prepared local run artifacts."));
+    assert.ok(datasetMessages.includes("Reusing existing training result."));
+    assert.equal(datasetMessages.includes("Reusing existing baseline evaluation."), false);
+    assert.equal(datasetMessages.includes("Reusing existing candidate evaluation."), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects duplicate prompts in the general regression suite", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-general-regression-duplicate-"));
+  try {
+    const regressionPath = join(root, "general.jsonl");
+    await writeFile(
+      regressionPath,
+      [
+        chatRow("Same prompt", "first"),
+        chatRow("  SAME   PROMPT ", "second"),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    const request = requestFixture({
+      runId: "52525252-5252-4525-8525-525252525252",
+    });
+    const config = configFixture(root, {
+      evaluation: {
+        generalRegression: { dataset: regressionPath },
+      },
+    });
+
+    await assert.rejects(
+      runLocalFineTune({ request, config }),
+      /General regression data contains duplicate inputs/,
+    );
+    assert.equal(await exists(config.artifactRoot), false);
+    assert.equal(await exists(config.storeRoot!), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("repeated runs of one spec use the same held-out prompts", async () => {
   const root = await mkdtemp(join(tmpdir(), "tt-local-stable-holdout-"));
   try {
@@ -571,6 +692,7 @@ test("config resolves data paths and rejects runner overrides", async () => {
       paths: { baseModel: "../models/base", modelCache: "./cache" },
       evaluation: {
         inference: { device: "cuda" },
+        generalRegression: { dataset: "./evals/general.jsonl" },
       },
     }, null, 2)}\n`, "utf8");
 
@@ -579,6 +701,10 @@ test("config resolves data paths and rejects runner overrides", async () => {
     assert.equal(config.storeRoot, join(homedir(), "tt-local-store-test"));
     assert.equal(config.paths.baseModel, join(root, "models", "base"));
     assert.equal(config.paths.modelCache, join(configDir, "cache"));
+    assert.equal(
+      config.evaluation.generalRegression?.dataset,
+      join(configDir, "evals", "general.jsonl"),
+    );
     assert.equal("training" in config, false);
     assert.equal("project" in config.evaluation.inference, false);
 
