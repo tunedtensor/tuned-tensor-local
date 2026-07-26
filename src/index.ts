@@ -18,7 +18,11 @@ import {
 } from "./orchestrator.js";
 import { runDoctor } from "./doctor.js";
 import { assertUsableModelArtifact } from "./model-registry.js";
-import { buildLocalModelServerLaunch, serveLocalModel } from "./model-server.js";
+import {
+  buildLocalBaseModelServerLaunch,
+  buildLocalModelServerLaunch,
+  serveLocalModel,
+} from "./model-server.js";
 import { prefetchBaseModel } from "./prefetch.js";
 import { createLocalStore, type LocalModelRecord, type LocalStore } from "./store.js";
 import {
@@ -29,6 +33,7 @@ import {
   loadLocalRunInput,
 } from "./local-project.js";
 import { sanitizeLogLine, type LocalRunProgressEvent, type LocalRunReporter } from "./run-reporter.js";
+import { activateModel, getActiveModel, rollbackActiveModel } from "./active-model.js";
 
 export * from "./compare.js";
 export * from "./contracts.js";
@@ -39,6 +44,8 @@ export * from "./local-project.js";
 export * from "./prefetch.js";
 export * from "./run-reporter.js";
 export * from "./store.js";
+export * from "./general-regression.js";
+export * from "./active-model.js";
 
 export interface LocalRunnerInfo {
   name: "tuned-tensor-local";
@@ -89,9 +96,9 @@ Commands:
   doctor [tunedtensor.json] [--config local-runner.json]
   validate [tunedtensor.json] [--config local-runner.json]
   run [tunedtensor.json] [--config local-runner.json] [--dry-run] [--verbose] [--quiet]
-  serve <model-id> [--config local-runner.json] [--host 127.0.0.1] [--port 8000]
+  serve <model-id|active|base> [--config local-runner.json] [--host 127.0.0.1] [--port 8000]
   runs list|get|events|report|compare [args] [--config local-runner.json]
-  models list|get|verify|prefetch|verify-base|serve [args] [--config local-runner.json]
+  models list|get|verify|prefetch|verify-base|active|activate|rollback|serve [args] [--config local-runner.json]
 
 Global options:
   -h, --help                       Show help
@@ -194,8 +201,8 @@ const COMMAND_DEFINITIONS: Record<string, CliCommandDefinition> = {
     maxPositionals: 1,
   },
   serve: {
-    usage: "tt-local serve <model-id> [options]",
-    description: "Serve a verified model through an OpenAI-compatible local API.",
+    usage: "tt-local serve <model-id|active|base> [options]",
+    description: "Serve a verified adapter, the active model, or the protected base.",
     options: MODEL_SERVE_OPTIONS,
     minPositionals: 1,
     maxPositionals: 1,
@@ -241,8 +248,28 @@ const COMMAND_GROUPS: Record<string, CliCommandGroup> = {
         options: [CONFIG_OPTION, VERBOSE_OPTION, QUIET_OPTION],
         maxPositionals: 1,
       },
+      active: {
+        usage: "tt-local models active [--config path]",
+        description: "Show the active adapter, or the protected base when none is active.",
+        options: [CONFIG_OPTION],
+        maxPositionals: 0,
+      },
+      activate: {
+        usage: "tt-local models activate <model-id> [--config path]",
+        description: "Activate a verified model whose general regression gate passed.",
+        options: [CONFIG_OPTION],
+        minPositionals: 1,
+        maxPositionals: 1,
+        missingPositionalsMessage: "models activate requires <model-id>",
+      },
+      rollback: {
+        usage: "tt-local models rollback [--config path]",
+        description: "Restore the previously active adapter or protected base.",
+        options: [CONFIG_OPTION],
+        maxPositionals: 0,
+      },
       serve: {
-        usage: "tt-local models serve <model-id> [options]",
+        usage: "tt-local models serve <model-id|active|base> [options]",
         description: "Alias for `tt-local serve`.",
         options: MODEL_SERVE_OPTIONS,
         minPositionals: 1,
@@ -520,6 +547,18 @@ async function verifyStoredModel(model: LocalModelRecord): Promise<{
   };
 }
 
+async function verifyActivationEvidence(model: LocalModelRecord): Promise<void> {
+  await assertArtifactManifest(join(model.artifact_dir, "artifact-manifest.json"), {
+    requiredPaths: [
+      "run-report.json",
+      "general-baseline-eval.json",
+      "general-candidate-eval.json",
+    ],
+    scopeToRequired: true,
+    verifyModel: true,
+  });
+}
+
 async function verifyModelArtifactPath(input: string): Promise<{
   manifest_path: string;
   integrity: Awaited<ReturnType<typeof assertArtifactManifest>>;
@@ -693,6 +732,105 @@ async function serveStoredModelFromCli(args: {
   await serveLocalModel(launch);
 }
 
+function serveOptionsFromArgv(argv: string[]) {
+  return {
+    host: readOption(argv, "--host"),
+    port: readNumberOption(argv, "--port"),
+    device: modelServeDevice(argv),
+    maxTokens: readNumberOption(argv, "--max-tokens"),
+    temperature: readNumberOption(argv, "--temperature"),
+    topP: readNumberOption(argv, "--top-p"),
+    maxConcurrentRequests: readNumberOption(argv, "--max-concurrent-requests"),
+    allowRemote: hasFlag(argv, "--allow-remote"),
+    apiKeyEnv: readOption(argv, "--api-key-env"),
+  };
+}
+
+async function serveBaseModelFromCli(args: {
+  argv: string[];
+  config: LocalRunnerConfig;
+}): Promise<void> {
+  const explicitSpecPath = readOption(args.argv, "--spec");
+  if (explicitSpecPath && hasFlag(args.argv, "--no-spec-prompt")) {
+    throw new Error("Use only one of --spec or --no-spec-prompt.");
+  }
+  const defaultSpecPath = resolve(DEFAULT_LOCAL_SPEC_PATH);
+  const specPath = explicitSpecPath
+    ? resolve(explicitSpecPath)
+    : (await stat(defaultSpecPath).catch(() => null))?.isFile()
+      ? defaultSpecPath
+      : undefined;
+  const spec = specPath
+    ? localBehaviorSpecFileSchema.parse(
+      JSON.parse(await readFile(specPath, "utf8")) as unknown,
+    )
+    : undefined;
+  let baseModel = spec?.base_model;
+  if (!baseModel) {
+    const store = createLocalStore(args.config.storeRoot);
+    const active = await getActiveModel(store);
+    const referenceModel = active.model
+      ?? (active.pointer?.previous_model_id
+        ? await store.getModel(active.pointer.previous_model_id)
+        : null);
+    baseModel = referenceModel?.base_model;
+  }
+  if (!baseModel) {
+    throw new Error(
+      "Cannot identify the protected base model. Pass --spec <tunedtensor.json> "
+      + "or activate a model first.",
+    );
+  }
+  const launch = buildLocalBaseModelServerLaunch({
+    baseModel,
+    config: args.config,
+    options: {
+      ...serveOptionsFromArgv(args.argv),
+      systemPrompt: explicitSpecPath && !hasFlag(args.argv, "--no-spec-prompt")
+        ? buildSystemMessage(spec!)
+        : undefined,
+      baseModelRevision: spec?.hyperparameters?.base_model_revision,
+    },
+  });
+  if (hasFlag(args.argv, "--print-command")) {
+    printJson({
+      ok: true,
+      model_id: null,
+      base_model: baseModel,
+      url: launch.url,
+      command: launch.displayCommand,
+    });
+    return;
+  }
+  process.stderr.write(`[tt-local] protected base model API: ${launch.url}\n`);
+  await serveLocalModel(launch);
+}
+
+async function serveModelTargetFromCli(args: {
+  argv: string[];
+  target: string;
+  config: LocalRunnerConfig;
+}): Promise<void> {
+  if (args.target === "base") {
+    return serveBaseModelFromCli(args);
+  }
+  if (args.target === "active") {
+    const store = createLocalStore(args.config.storeRoot);
+    const active = await getActiveModel(store);
+    if (!active.model) return serveBaseModelFromCli(args);
+    return serveStoredModelFromCli({
+      argv: args.argv,
+      modelId: active.model.id,
+      config: args.config,
+    });
+  }
+  return serveStoredModelFromCli({
+    argv: args.argv,
+    modelId: args.target,
+    config: args.config,
+  });
+}
+
 async function main(argv: string[]): Promise<void> {
   const cli = parseCli(argv);
   const command = cli.command;
@@ -861,15 +999,16 @@ async function main(argv: string[]): Promise<void> {
       baseline_eval: result.report.artifact_uris.baseline_eval,
       candidate_eval: result.report.artifact_uris.candidate_eval,
       comparison: result.report.comparison,
+      general_regression: result.report.general_regression,
     });
     return;
   }
 
   if (command === "serve") {
     const config = await configFromArgv(argv);
-    await serveStoredModelFromCli({
+    await serveModelTargetFromCli({
       argv,
-      modelId: cli.positionals[0]!,
+      target: cli.positionals[0]!,
       config,
     });
     return;
@@ -931,6 +1070,38 @@ async function main(argv: string[]): Promise<void> {
       const verified = await verifyStoredModel(model);
       return printJson({ ok: true, model, ...verified });
     }
+    if (subcommand === "active") {
+      const active = await getActiveModel(store);
+      return printJson({
+        active: active.model?.id ?? "base",
+        pointer: active.pointer,
+        model: active.model,
+      });
+    }
+    if (subcommand === "activate") {
+      const id = cli.positionals[0];
+      if (!id) throw new Error("models activate requires <model-id>");
+      const model = await store.getModel(id);
+      const verified = await verifyStoredModel(model);
+      await verifyActivationEvidence(model);
+      const pointer = await activateModel(store, model.id);
+      return printJson({
+        active: pointer.model_id,
+        pointer,
+        manifest_path: verified.manifest_path,
+        integrity: verified.integrity,
+      });
+    }
+    if (subcommand === "rollback") {
+      const current = await getActiveModel(store);
+      if (current.pointer?.previous_model_id) {
+        const previous = await store.getModel(current.pointer.previous_model_id);
+        await verifyStoredModel(previous);
+        await verifyActivationEvidence(previous);
+      }
+      const pointer = await rollbackActiveModel(store);
+      return printJson({ active: pointer.model_id ?? "base", pointer });
+    }
     if (subcommand === "prefetch" || subcommand === "verify-base") {
       const input = await loadCliBehaviorSpec(modelInputPath!);
       const report = await prefetchBaseModel({
@@ -950,7 +1121,7 @@ async function main(argv: string[]): Promise<void> {
     if (subcommand === "serve") {
       const id = cli.positionals[0];
       if (!id) throw new Error("models serve requires <model-id>");
-      await serveStoredModelFromCli({ argv, modelId: id, config });
+      await serveModelTargetFromCli({ argv, target: id, config });
       return;
     }
     throw new Error(`Unknown models command: ${subcommand}`);

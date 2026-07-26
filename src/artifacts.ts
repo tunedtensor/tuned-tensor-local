@@ -13,6 +13,8 @@ export interface RunArtifacts {
   trainingReportJson: string;
   baselineEvalJson: string;
   candidateEvalJson: string;
+  generalBaselineEvalJson: string;
+  generalCandidateEvalJson: string;
   runReportJson: string;
   artifactManifestJson: string;
   progressJsonl: string;
@@ -68,6 +70,8 @@ export function resolveRunArtifacts(args: {
     trainingReportJson: join(runDir, "training-report.json"),
     baselineEvalJson: join(runDir, "baseline-eval.json"),
     candidateEvalJson: join(runDir, "candidate-eval.json"),
+    generalBaselineEvalJson: join(runDir, "general-baseline-eval.json"),
+    generalCandidateEvalJson: join(runDir, "general-candidate-eval.json"),
     runReportJson: join(runDir, "run-report.json"),
     artifactManifestJson: join(runDir, "artifact-manifest.json"),
     progressJsonl: join(runDir, "progress.jsonl"),

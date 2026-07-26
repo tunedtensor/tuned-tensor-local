@@ -35,7 +35,7 @@ export interface LocalModelServerLaunch {
   env: NodeJS.ProcessEnv;
   url: string;
   modelName: string;
-  artifactPath: string;
+  artifactPath?: string;
 }
 
 function localArtifactPath(uri: string): string {
@@ -61,8 +61,10 @@ function httpHost(host: string): string {
   return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 }
 
-export function buildLocalModelServerLaunch(args: {
-  model: LocalModelRecord;
+function buildModelServerLaunch(args: {
+  modelName: string;
+  baseModel: string;
+  artifactUri?: string;
   config: LocalRunnerConfig;
   options?: LocalModelServeOptions;
 }): LocalModelServerLaunch {
@@ -88,7 +90,9 @@ export function buildLocalModelServerLaunch(args: {
     8,
     true,
   );
-  const artifactPath = localArtifactPath(args.model.artifact_uri);
+  const artifactPath = args.artifactUri
+    ? localArtifactPath(args.artifactUri)
+    : undefined;
   const recordedBaseModelPath = options.baseModelArtifactUri
     ? localArtifactPath(options.baseModelArtifactUri)
     : undefined;
@@ -106,18 +110,17 @@ export function buildLocalModelServerLaunch(args: {
     );
   }
   const localBaseModelPath = recordedBaseModelPath ?? configuredBaseModelPath;
-  resolveTrainingModel(args.model.base_model);
+  resolveTrainingModel(args.baseModel);
   const entrypoint = buildBundledPythonCommand("serve.py");
-  const modelName = args.model.id;
   const env = withBundledPythonEnvironment(
     withOfflineHuggingFaceCacheEnvironment({
       ...minimalMachineLearningEnvironment(process.env),
-      TT_MODEL_ARTIFACT: artifactPath,
-      TT_BASE_MODEL: localBaseModelPath ?? args.model.base_model,
+      ...(artifactPath ? { TT_MODEL_ARTIFACT: artifactPath } : {}),
+      TT_BASE_MODEL: localBaseModelPath ?? args.baseModel,
       ...(options.baseModelRevision && !localBaseModelPath
         ? { TT_BASE_MODEL_REVISION: options.baseModelRevision }
         : {}),
-      TT_MODEL_NAME: modelName,
+      TT_MODEL_NAME: args.modelName,
       TT_MODEL_LOADER: "causal_lm",
       TT_HOST: host,
       TT_PORT: String(port),
@@ -137,9 +140,36 @@ export function buildLocalModelServerLaunch(args: {
     displayCommand: entrypoint.displayCommand,
     env,
     url: `http://${httpHost(host)}:${port}`,
-    modelName,
+    modelName: args.modelName,
     artifactPath,
   };
+}
+
+export function buildLocalModelServerLaunch(args: {
+  model: LocalModelRecord;
+  config: LocalRunnerConfig;
+  options?: LocalModelServeOptions;
+}): LocalModelServerLaunch {
+  return buildModelServerLaunch({
+    modelName: args.model.id,
+    baseModel: args.model.base_model,
+    artifactUri: args.model.artifact_uri,
+    config: args.config,
+    options: args.options,
+  });
+}
+
+export function buildLocalBaseModelServerLaunch(args: {
+  baseModel: string;
+  config: LocalRunnerConfig;
+  options?: LocalModelServeOptions;
+}): LocalModelServerLaunch {
+  return buildModelServerLaunch({
+    modelName: `base:${args.baseModel}`,
+    baseModel: args.baseModel,
+    config: args.config,
+    options: args.options,
+  });
 }
 
 export async function serveLocalModel(launch: LocalModelServerLaunch): Promise<void> {

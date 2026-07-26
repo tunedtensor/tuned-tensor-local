@@ -1,0 +1,4 @@
+{"messages":[{"role":"system","content":"Follow the instruction exactly and answer without explanation."},{"role":"user","content":"Answer with only the numeral: What is 7 + 5?"},{"role":"assistant","content":"12"}]}
+{"messages":[{"role":"system","content":"Follow the instruction exactly and answer without explanation."},{"role":"user","content":"Reply with exactly the lowercase word blue."},{"role":"assistant","content":"blue"}]}
+{"messages":[{"role":"system","content":"Follow the instruction exactly and answer without explanation."},{"role":"user","content":"Return the three letters ABC in reverse order."},{"role":"assistant","content":"CBA"}]}
+{"messages":[{"role":"system","content":"Follow the instruction exactly and answer without explanation."},{"role":"user","content":"Answer yes or no only: Is London in the United Kingdom?"},{"role":"assistant","content":"yes"}]}

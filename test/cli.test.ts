@@ -73,7 +73,7 @@ test("top-level help and version are available without loading project state", a
     assert.equal(help.status, 0);
     assert.match(help.stdout, /^Usage: tt-local <command> \[options\]/);
     assert.match(help.stdout, /-V, --version/);
-    assert.match(help.stdout, /serve <model-id>/);
+    assert.match(help.stdout, /serve <model-id\|active\|base>/);
     assert.doesNotMatch(
       help.stdout,
       /\blabel\b|\bspecs\b|dashboard|rebuild-index|\breconcile\b|parent-model|model-artifact|--stage|--run-id|--detach|\bwatch\b|\bcancel\b/i,
@@ -101,6 +101,9 @@ test("command and nested-command help never execute work", async () => {
       { args: ["models", "prefetch", "--help"], usage: "tt-local models prefetch" },
       { args: ["models", "verify-base", "--help"], usage: "tt-local models verify-base" },
       { args: ["models", "verify", "--help"], usage: "tt-local models verify" },
+      { args: ["models", "active", "--help"], usage: "tt-local models active" },
+      { args: ["models", "activate", "--help"], usage: "tt-local models activate" },
+      { args: ["models", "rollback", "--help"], usage: "tt-local models rollback" },
       { args: ["models", "serve", "--help"], usage: "tt-local models serve" },
       { args: ["runs", "report", "--help"], usage: "tt-local runs report" },
       { args: ["models", "--help"], usage: "tt-local models <command>" },
@@ -452,6 +455,18 @@ test("stored models are verified before a serving launch plan is produced", asyn
     const aliasLaunch = runCli(["models", "serve", modelId, "--print-command"], root);
     assert.equal(aliasLaunch.status, 0, aliasLaunch.stderr);
     assert.equal(JSON.parse(aliasLaunch.stdout).url, launchPlan.url);
+
+    await writeFile(join(modelStoreRoot, "active-model.json"), `${JSON.stringify({
+      schema_version: 1,
+      model_id: modelId,
+      run_id: runId,
+      previous_model_id: null,
+      activated_at: "2026-07-26T00:00:00.000Z",
+      action: "activate",
+    })}\n`, "utf8");
+    const baseLaunch = runCli(["serve", "base", "--print-command"], root);
+    assert.equal(baseLaunch.status, 0, baseLaunch.stderr);
+    assert.equal(JSON.parse(baseLaunch.stdout).base_model, "Qwen/Qwen3.5-2B");
 
     const unsupportedDevice = runCli(["serve", modelId, "--device", "mps", "--print-command"], root);
     assert.equal(unsupportedDevice.status, 1);

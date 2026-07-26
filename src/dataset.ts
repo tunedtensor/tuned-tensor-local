@@ -116,3 +116,56 @@ export async function examplesFromChatJsonl(path: string): Promise<BehaviorSpecE
   }
   return examples;
 }
+
+export interface EvaluationSuite {
+  examples: BehaviorSpecExample[];
+  system: string;
+}
+
+/**
+ * Loads an evaluation-only chat JSONL suite. Rows may omit the system message,
+ * but when they include one it must be identical across the suite.
+ */
+export async function evaluationSuiteFromChatJsonl(
+  path: string,
+  configuredSystem?: string,
+): Promise<EvaluationSuite> {
+  const normalized = await loadNormalizedChatJsonl(path);
+  const inputIdentities = new Set<string>();
+  for (const row of normalized.rows) {
+    const input = row.messages.at(-2)!.content;
+    const identity = input.trim().replace(/\s+/g, " ").toLowerCase();
+    if (inputIdentities.has(identity)) {
+      throw new Error(
+        "General regression data contains duplicate inputs; "
+        + "evaluation prompts must be unique.",
+      );
+    }
+    inputIdentities.add(identity);
+  }
+  const systems = new Set(
+    normalized.rows
+      .map((row) => row.messages.find((message) => message.role === "system")?.content)
+      .filter((value): value is string => value !== undefined),
+  );
+  if (systems.size > 1) {
+    throw new Error("General regression rows must use one consistent system message.");
+  }
+  const embeddedSystem = [...systems][0];
+  if (
+    configuredSystem !== undefined
+    && embeddedSystem !== undefined
+    && configuredSystem !== embeddedSystem
+  ) {
+    throw new Error(
+      "evaluation.generalRegression.systemPrompt must match the system message embedded in the dataset.",
+    );
+  }
+  return {
+    examples: normalized.rows.map((row) => ({
+      input: row.messages.at(-2)!.content,
+      output: row.messages.at(-1)!.content,
+    })),
+    system: configuredSystem ?? embeddedSystem ?? "You are a helpful assistant.",
+  };
+}
