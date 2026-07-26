@@ -9,26 +9,23 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  buildEntrypointCommand,
-  buildUvPythonArgs,
+  buildBundledPythonCommand,
   ProcessCancelledError,
-  runJsonStdInCommand,
   runLoggedProcess,
+  withBundledPythonEnvironment,
 } from "../src/process-runner.js";
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
 test("uv bundled local runner paths resolve relative to the package", () => {
-  const args = buildUvPythonArgs(
-    { backend: "uv", project: "training/local-runner" },
-    { defaultScript: "training/local-runner/src/train.py" },
-  );
+  const command = buildBundledPythonCommand("train.py");
 
-  assert.deepEqual(args, [
+  assert.deepEqual(command.commandArgs, [
     "run",
+    "--frozen",
     "--project",
     join(repoRoot, "training/local-runner"),
     "python",
@@ -36,29 +33,25 @@ test("uv bundled local runner paths resolve relative to the package", () => {
   ]);
 });
 
-test("uv custom project and script paths stay caller-relative", () => {
-  const args = buildUvPythonArgs({
-    backend: "uv",
-    project: "custom-runner",
-    script: "scripts/train.py",
-  });
-
-  assert.deepEqual(args, [
+test("uv Python probes use the same locked project", () => {
+  const command = buildBundledPythonCommand("-c", ["print('ok')"]);
+  assert.deepEqual(command.commandArgs, [
     "run",
+    "--frozen",
     "--project",
-    "custom-runner",
+    join(repoRoot, "training/local-runner"),
     "python",
-    "scripts/train.py",
+    "-c",
+    "print('ok')",
   ]);
 });
 
-test("command entrypoints do not rewrite bundled-looking arguments", () => {
-  const command = buildEntrypointCommand({
-    backend: "command",
-    command: ["python", "training/local-runner/src/train.py"],
-  });
-
-  assert.deepEqual(command.commandArgs, ["training/local-runner/src/train.py"]);
+test("bundled uv environments live outside the package tree", () => {
+  const env = withBundledPythonEnvironment({ PATH: "/bin" });
+  const path = env.UV_PROJECT_ENVIRONMENT ?? "";
+  assert.equal(isAbsolute(path), true);
+  assert.equal(path.startsWith(repoRoot), false);
+  assert.equal(env.PATH, "/bin");
 });
 
 test("logged processes terminate their process group when cancellation is requested", async () => {
@@ -123,7 +116,7 @@ test("process timeouts force-kill descendants that outlive the direct child", as
       runLoggedProcess({
         command: process.execPath,
         commandArgs: ["-e", parent],
-        stage: "study-trial",
+        stage: "process-test",
         timeoutMs: 500,
       }),
       /timed out after 500ms/,
@@ -158,7 +151,7 @@ test("logged processes can clean up descendants after a successful direct child"
     const result = await runLoggedProcess({
       command: process.execPath,
       commandArgs: ["-e", parent],
-      stage: "study-trial",
+      stage: "process-test",
       terminateProcessGroupOnExit: true,
     });
     assert.equal(result.exitCode, 0);
@@ -184,7 +177,7 @@ test("exclusive process logs reject aliases before launching the child", async (
           "-e",
           `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran")`,
         ],
-        stage: "study-test",
+        stage: "process-test",
         logPath,
         exclusiveLog: true,
       }),
@@ -194,27 +187,6 @@ test("exclusive process logs reject aliases before launching the child", async (
     assert.equal(await readFile(target, "utf8"), "preserve me\n");
   } finally {
     await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("JSON command inference terminates its process group when cancelled", async () => {
-  let requested = false;
-  const timer = setTimeout(() => { requested = true; }, 50);
-  try {
-    await assert.rejects(
-      runJsonStdInCommand({
-        command: [process.execPath, "-e", "process.stdin.resume(); setInterval(() => {}, 1000)"],
-        payload: { input: "hello" },
-        timeoutMs: 2_000,
-        timeoutMessage: "inference timeout",
-        errorPrefix: "inference",
-        shouldCancel: () => requested,
-        cancelPollMs: 10,
-      }),
-      ProcessCancelledError,
-    );
-  } finally {
-    clearTimeout(timer);
   }
 });
 

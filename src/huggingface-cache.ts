@@ -12,14 +12,11 @@ export interface HuggingFaceCacheLayout {
 }
 
 /**
- * Builds a deliberately small environment for bundled ML processes. Model
- * repositories that require `trust_remote_code` execute Python supplied by a
- * third party, so unrelated shell credentials must not be inherited. Values
- * added explicitly through runner `env` configuration are applied afterward.
+ * Builds a deliberately small environment for bundled ML processes.
+ * Unrelated shell credentials must not be inherited by training processes.
  */
 export function minimalMachineLearningEnvironment(
   env: NodeJS.ProcessEnv,
-  options: { includeHfToken?: boolean } = {},
 ): NodeJS.ProcessEnv {
   const exact = new Set([
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TEMP", "TMP",
@@ -28,6 +25,7 @@ export function minimalMachineLearningEnvironment(
     "NO_PROXY", "no_proxy",
     "UV_CACHE_DIR", "UV_PYTHON",
     "HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE", "HF_ENDPOINT",
+    "HF_TOKEN",
     "HF_HUB_OFFLINE", "HF_HUB_DISABLE_TELEMETRY", "TRANSFORMERS_OFFLINE",
     "HF_HUB_ENABLE_HF_TRANSFER", "PYTHONUTF8", "PYTHONIOENCODING",
   ]);
@@ -41,10 +39,9 @@ export function minimalMachineLearningEnvironment(
   // PyTorch 2.13 can route ordinary CUDA operations through optional Triton
   // JIT kernels. Triton's first-use helper compilation requires system Python
   // development headers, which are not part of a normal packaged TT Local
-  // install. Prefer PyTorch's eager fallback unless an advanced runner config
+  // install. Prefer PyTorch's eager fallback unless the launching environment
   // explicitly opts back in with TORCH_DISABLE_NATIVE_JIT=0.
   result.TORCH_DISABLE_NATIVE_JIT ??= "1";
-  if (options.includeHfToken && env.HF_TOKEN) result.HF_TOKEN = env.HF_TOKEN;
   return result;
 }
 
@@ -84,4 +81,19 @@ export function withHuggingFaceCacheEnvironment(
   delete result.PYTORCH_TRANSFORMERS_CACHE;
   delete result.PYTORCH_PRETRAINED_BERT_CACHE;
   return result;
+}
+
+/**
+ * Training, evaluation, and serving run only after prefetch has verified the
+ * immutable snapshot. Keep those stages local even when the host has network.
+ */
+export function withOfflineHuggingFaceCacheEnvironment(
+  env: NodeJS.ProcessEnv,
+  modelCache?: string,
+): NodeJS.ProcessEnv {
+  return {
+    ...withHuggingFaceCacheEnvironment(env, modelCache),
+    HF_HUB_OFFLINE: "1",
+    TRANSFORMERS_OFFLINE: "1",
+  };
 }

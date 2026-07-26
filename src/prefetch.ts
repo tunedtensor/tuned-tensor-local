@@ -1,20 +1,26 @@
 import { lstat, mkdir, readFile, readdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { FineTuneRunRequest, LocalRunnerConfig } from "./contracts.js";
+import {
+  baseModelRevisionSchema,
+  type FineTuneRunRequest,
+  type LocalRunnerConfig,
+} from "./contracts.js";
 import { fileUri, writeJson } from "./artifacts.js";
-import { resolveTrainingModel } from "./model-registry.js";
-import { buildEntrypointCommand, runLoggedProcess } from "./process-runner.js";
+import {
+  assertCertifiedBaseModelConfig,
+  resolveTrainingModel,
+} from "./model-registry.js";
+import {
+  buildBundledPythonCommand,
+  runLoggedProcess,
+  withBundledPythonEnvironment,
+} from "./process-runner.js";
 import type { LocalRunReporter } from "./run-reporter.js";
 import { minimalMachineLearningEnvironment, withHuggingFaceCacheEnvironment } from "./huggingface-cache.js";
-
-const PREFETCH_SCRIPT = "training/local-runner/src/prefetch.py";
 
 export interface ModelPrefetchPayload {
   base_model: string;
   revision?: string;
-  loader: string;
-  trust_remote_code: boolean;
-  requires_hf_token: boolean;
   model_cache?: string;
   local_files_only?: boolean;
 }
@@ -23,7 +29,6 @@ export interface ModelPrefetchReport {
   ok: boolean;
   status: "completed" | "skipped";
   base_model: string;
-  loader?: string;
   model_cache?: string;
   hf_home?: string;
   hub_cache?: string;
@@ -51,9 +56,6 @@ export function buildModelPrefetchPayload(
     ...(request.hyperparameters.base_model_revision
       ? { revision: request.hyperparameters.base_model_revision }
       : {}),
-    loader: model.loader,
-    trust_remote_code: model.trustRemoteCode,
-    requires_hf_token: model.requiresHfToken,
     ...(config.paths.modelCache ? { model_cache: resolve(config.paths.modelCache) } : {}),
   };
 }
@@ -106,9 +108,10 @@ export async function verifyLocalBaseModel(path: string): Promise<{ fileCount: n
   };
   if (!await required("config.json")) throw new Error(`Local base-model directory is missing config.json: ${path}`);
   try {
-    JSON.parse(await readFile(join(path, "config.json"), "utf8"));
+    const config = JSON.parse(await readFile(join(path, "config.json"), "utf8")) as unknown;
+    assertCertifiedBaseModelConfig(config, `Local base-model config ${join(path, "config.json")}`);
   } catch (error) {
-    throw new Error(`Local base-model directory has an invalid config.json: ${path}`, { cause: error });
+    throw new Error(`Local base-model directory has an invalid or unsupported config.json: ${path}`, { cause: error });
   }
   const vocabNames = [
     "tokenizer.json", "tokenizer.model", "sentencepiece.bpe.model", "spiece.model", "vocab.json", "tokenizer.tiktoken",
@@ -172,13 +175,10 @@ export async function prefetchBaseModel(args: {
   const logPath = join(artifactDir, "prefetch.log");
   await writeJson(inputPath, payload);
 
-  const entrypoint = buildEntrypointCommand({
-    backend: "uv",
-    project: "training/local-runner",
-    script: PREFETCH_SCRIPT,
-  }, {
-    extraArgs: ["--input", inputPath, "--output", outputPath],
-  });
+  const entrypoint = buildBundledPythonCommand(
+    "prefetch.py",
+    ["--input", inputPath, "--output", outputPath],
+  );
 
   await args.reporter?.onEvent?.({
     stage: "model_prefetch",
@@ -194,9 +194,11 @@ export async function prefetchBaseModel(args: {
     },
   });
 
-  const env = withHuggingFaceCacheEnvironment(
-    minimalMachineLearningEnvironment(process.env, { includeHfToken: payload.requires_hf_token }),
-    payload.model_cache,
+  const env = withBundledPythonEnvironment(
+    withHuggingFaceCacheEnvironment(
+      minimalMachineLearningEnvironment(process.env),
+      payload.model_cache,
+    ),
   );
 
   const { exitCode } = await runLoggedProcess({
@@ -217,7 +219,6 @@ export async function prefetchBaseModel(args: {
   const output = JSON.parse(await readFile(outputPath, "utf8")) as {
     ok?: boolean;
     base_model?: string;
-    loader?: string;
     model_cache?: string;
     hf_home?: string;
     hub_cache?: string;
@@ -227,6 +228,12 @@ export async function prefetchBaseModel(args: {
     size_bytes?: number;
     verified_blob_count?: number;
   };
+  const snapshotRevision = baseModelRevisionSchema.safeParse(output.snapshot_revision);
+  if (!snapshotRevision.success) {
+    throw new Error(
+      "Model prefetch did not resolve the base model to a 40-character immutable commit SHA.",
+    );
+  }
 
   await args.reporter?.onEvent?.({
     stage: "model_prefetch",
@@ -237,7 +244,7 @@ export async function prefetchBaseModel(args: {
       hf_home: output.hf_home ?? output.model_cache ?? payload.model_cache ?? null,
       hub_cache: output.hub_cache ?? null,
       snapshot_path: output.snapshot_path ?? null,
-      snapshot_revision: output.snapshot_revision ?? null,
+      snapshot_revision: snapshotRevision.data,
       file_count: output.file_count ?? null,
       size_bytes: output.size_bytes ?? null,
       verified_blob_count: output.verified_blob_count ?? null,
@@ -248,12 +255,11 @@ export async function prefetchBaseModel(args: {
     ok: true,
     status: "completed",
     base_model: output.base_model ?? payload.base_model,
-    loader: output.loader ?? payload.loader,
     model_cache: output.model_cache ?? payload.model_cache,
     hf_home: output.hf_home ?? output.model_cache ?? payload.model_cache,
     hub_cache: output.hub_cache,
     snapshot_path: output.snapshot_path,
-    snapshot_revision: output.snapshot_revision,
+    snapshot_revision: snapshotRevision.data,
     file_count: output.file_count,
     size_bytes: output.size_bytes,
     verified_blob_count: output.verified_blob_count,

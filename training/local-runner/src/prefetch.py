@@ -2,13 +2,18 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
+
+from model_contract import (
+    CERTIFIED_BASE_MODEL,
+    assert_certified_model_config,
+)
 
 ALLOW_PATTERNS = [
     "*.json",
     "*.model",
-    "*.py",
     "*.safetensors",
     "*.safetensors.index.json",
     "*.tiktoken",
@@ -79,7 +84,8 @@ def verify_snapshot(snapshot: Path) -> tuple[list[Path], int]:
     if not config.is_file() or config.stat().st_size == 0:
         raise ValueError(f"Cached snapshot is missing a non-empty config.json: {snapshot}")
     try:
-        json.loads(config.read_text(encoding="utf-8"))
+        parsed_config = json.loads(config.read_text(encoding="utf-8"))
+        assert_certified_model_config(parsed_config, f"Cached config {config}")
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"Cached snapshot has an invalid config.json: {snapshot}") from exc
 
@@ -138,6 +144,10 @@ def main() -> None:
 
     payload = json.loads(Path(args.input).read_text(encoding="utf-8"))
     base_model = str(payload["base_model"])
+    if base_model != CERTIFIED_BASE_MODEL:
+        raise ValueError(
+            f"The bundled trainer currently certifies only {CERTIFIED_BASE_MODEL}; got {base_model!r}"
+        )
     cache_dir = payload.get("model_cache")
     configure_hugging_face_cache(cache_dir)
 
@@ -156,18 +166,22 @@ def main() -> None:
         local_files_only=bool(payload.get("local_files_only", False)),
     )
     snapshot = Path(snapshot_path)
+    snapshot_revision = snapshot.name
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", snapshot_revision):
+        raise ValueError(
+            "Hugging Face snapshot did not resolve to a 40-character immutable commit SHA"
+        )
     print(f"Verifying snapshot files under {snapshot}...", flush=True)
     snapshot_files, verified_blob_count = verify_snapshot(snapshot)
 
     write_json(args.output, {
         "ok": True,
         "base_model": base_model,
-        "loader": payload.get("loader"),
         "model_cache": str(constants.HF_HOME),
         "hf_home": str(constants.HF_HOME),
         "hub_cache": str(constants.HF_HUB_CACHE),
         "snapshot_path": snapshot_path,
-        "snapshot_revision": Path(snapshot_path).name,
+        "snapshot_revision": snapshot_revision.lower(),
         "file_count": len(snapshot_files),
         "size_bytes": sum(path.stat().st_size for path in snapshot_files),
         "verified_blob_count": verified_blob_count,

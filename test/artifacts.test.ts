@@ -67,6 +67,18 @@ function modelContract(modelPath: string): Omit<ArtifactManifestModel, "files"> 
   };
 }
 
+function directoryModelContract(modelPath: string): Omit<ArtifactManifestModel, "files"> {
+  return {
+    artifact_kind: "directory",
+    format: "huggingface-directory",
+    framework: "transformers-peft",
+    base_model: "Qwen/Qwen3.5-2B",
+    artifact_uri: fileUri(modelPath),
+    artifact_root: modelPath,
+    servable: true,
+  };
+}
+
 test("writes and verifies an atomic artifact manifest with model contract metadata", async () => {
   const root = await mkdtemp(join(tmpdir(), "tt-local-artifacts-test-"));
   try {
@@ -244,6 +256,60 @@ test("requires recognized weights and adapter metadata for PEFT archives", async
     await assert.rejects(
       writeArtifactManifest(artifacts, { model: modelContract(optimizerOnly) }),
       /no adapter_model\.safetensors or adapter_model\.bin/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("accepts only complete PEFT directories and verifies their checksums", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-peft-directory-test-"));
+  try {
+    const artifacts = resolveRunArtifacts({ artifactRoot: root, prefix: "directory-contract" });
+    const adapter = join(root, "adapter");
+    await prepareRunDirectories(artifacts);
+    await mkdir(adapter);
+    await writeFile(join(adapter, "adapter_model.safetensors"), "weights", "utf8");
+    await writeFile(join(adapter, "adapter_config.json"), "{}", "utf8");
+
+    await writeArtifactManifest(artifacts, { model: directoryModelContract(adapter) });
+    assert.equal((await verifyArtifactManifest(artifacts.artifactManifestJson)).valid, true);
+
+    await writeFile(join(adapter, "adapter_model.safetensors"), "changed", "utf8");
+    const changed = await verifyArtifactManifest(artifacts.artifactManifestJson);
+    assert.equal(changed.valid, false);
+    assert.deepEqual(changed.changed, ["model:adapter_model.safetensors"]);
+
+    const incomplete = join(root, "incomplete-adapter");
+    await mkdir(incomplete);
+    await writeFile(join(incomplete, "adapter_model.safetensors"), "weights", "utf8");
+    await assert.rejects(
+      writeArtifactManifest(artifacts, { model: directoryModelContract(incomplete) }),
+      /requires adapter weights and adapter_config\.json/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects custom or full-model manifest contracts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-peft-only-test-"));
+  try {
+    const artifacts = resolveRunArtifacts({ artifactRoot: root, prefix: "peft-only" });
+    const adapter = join(root, "adapter");
+    await prepareRunDirectories(artifacts);
+    await mkdir(adapter);
+    await writeFile(join(adapter, "adapter_model.safetensors"), "weights", "utf8");
+    await writeFile(join(adapter, "adapter_config.json"), "{}", "utf8");
+    const invalid = {
+      ...directoryModelContract(adapter),
+      framework: "custom",
+      servable: false,
+    } as unknown as Omit<ArtifactManifestModel, "files">;
+
+    await assert.rejects(
+      writeArtifactManifest(artifacts, { model: invalid }),
+      /must be verified, servable Transformers PEFT adapters/,
     );
   } finally {
     await rm(root, { recursive: true, force: true });

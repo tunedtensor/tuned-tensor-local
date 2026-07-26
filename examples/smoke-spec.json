@@ -1,0 +1,41 @@
+{
+  "id": "22222222-2222-4222-8222-222222222222",
+  "name": "Local Smoke Assistant",
+  "description": "Tiny local runner smoke test.",
+  "system_prompt": "Return exactly one sentiment label.",
+  "guidelines": [
+    "Reply with positive or negative."
+  ],
+  "constraints": [
+    "Do not include extra commentary."
+  ],
+  "base_model": "Qwen/Qwen3.5-2B",
+  "examples": [
+    {
+      "input": "Classify sentiment: I love this product.",
+      "output": "positive"
+    },
+    {
+      "input": "Classify sentiment: This was disappointing.",
+      "output": "negative"
+    },
+    {
+      "input": "Classify sentiment: The update works perfectly.",
+      "output": "positive"
+    },
+    {
+      "input": "Classify sentiment: Support never replied.",
+      "output": "negative"
+    }
+  ],
+  "hyperparameters": {
+    "n_epochs": 1,
+    "learning_rate": 0.0002,
+    "batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "lora_rank": 4,
+    "lora_alpha": 8,
+    "max_seq_length": 256,
+    "max_eval_examples": 2
+  }
+}

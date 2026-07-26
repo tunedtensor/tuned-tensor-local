@@ -1,11 +1,17 @@
 import { constants } from "node:fs";
 import { access, mkdir, statfs, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import type { FineTuneRunRequest, LocalRunnerConfig } from "./contracts.js";
-import { withHuggingFaceCacheEnvironment } from "./huggingface-cache.js";
-import { buildEntrypointCommand } from "./process-runner.js";
+import {
+  minimalMachineLearningEnvironment,
+  withHuggingFaceCacheEnvironment,
+} from "./huggingface-cache.js";
+import {
+  buildBundledPythonCommand,
+  withBundledPythonEnvironment,
+} from "./process-runner.js";
 import { resolveTrainingModel } from "./model-registry.js";
 import { defaultLocalHome } from "./store.js";
 import { verifyLocalBaseModel } from "./prefetch.js";
@@ -112,32 +118,6 @@ function commandText(command: string, args: string[]): string {
   return [command, ...args].map((part) => /\s/.test(part) ? JSON.stringify(part) : part).join(" ");
 }
 
-async function executableCheck(
-  command: string,
-  options: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
-): Promise<DoctorCheck> {
-  const env = { ...process.env, ...options.env };
-  const cwd = options.cwd ? resolve(options.cwd) : process.cwd();
-  const candidates = isAbsolute(command) || command.includes("/")
-    ? [isAbsolute(command) ? command : resolve(cwd, command)]
-    : (env.PATH ?? "").split(delimiter).filter(Boolean).map((directory) =>
-        join(isAbsolute(directory) ? directory : resolve(cwd, directory), command)
-      );
-  for (const candidate of candidates) {
-    try {
-      await access(candidate, constants.X_OK);
-      return { name: `executable:${command}`, ok: true, message: candidate };
-    } catch {
-      // Continue searching PATH.
-    }
-  }
-  return {
-    name: `executable:${command}`,
-    ok: false,
-    message: `${command} is not executable or was not found on PATH`,
-  };
-}
-
 async function writableDirectoryCheck(name: string, path: string): Promise<DoctorCheck> {
   const resolvedPath = resolve(path);
   const probePath = join(resolvedPath, `.tt-local-write-probe-${process.pid}-${Date.now()}`);
@@ -166,10 +146,9 @@ async function writableDirectoryCheck(name: string, path: string): Promise<Docto
 }
 
 interface PythonProbePlan {
-  name: "training-python" | "evaluation-python";
+  name: "python-runtime";
   command: string;
   args: string[];
-  cwd?: string;
   env: NodeJS.ProcessEnv;
 }
 
@@ -178,94 +157,43 @@ function pythonProbeSource(device: LocalRunnerConfig["evaluation"]["inference"][
     "import json",
     "import torch, transformers, peft, huggingface_hub",
     `requested = ${JSON.stringify(device)}`,
-    "assert requested != 'cuda' or torch.cuda.is_available(), 'CUDA was requested but torch.cuda.is_available() is false'",
-    "assert requested != 'mps' or (hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()), 'MPS was requested but is unavailable'",
-    "print(json.dumps({'python_ok': True, 'torch': torch.__version__, 'transformers': transformers.__version__, 'cuda_available': torch.cuda.is_available(), 'cuda_device': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None}))",
+    "assert torch.cuda.is_available(), 'TT Local training requires CUDA but torch.cuda.is_available() is false'",
+    "props = torch.cuda.get_device_properties(0)",
+    "print(json.dumps({'python_ok': True, 'torch': torch.__version__, 'transformers': transformers.__version__, 'cuda_available': True, 'cuda_device': torch.cuda.get_device_name(0), 'compute_capability': list(torch.cuda.get_device_capability(0)), 'total_memory_bytes': props.total_memory, 'evaluation_device': requested}))",
   ].join("; ");
 }
 
 function pythonProbePlan(args: {
-  name: PythonProbePlan["name"];
-  entrypoint: LocalRunnerConfig["training"] | LocalRunnerConfig["evaluation"]["inference"];
-  cwd?: string;
-  env: Record<string, string>;
   device: LocalRunnerConfig["evaluation"]["inference"]["device"];
   modelCache?: string;
 }): PythonProbePlan {
-  const entrypoint = buildEntrypointCommand({
-    ...args.entrypoint,
-    backend: "uv",
-    module: undefined,
-    script: "-c",
-    args: [],
-  }, {
-    extraArgs: [pythonProbeSource(args.device)],
-  });
-  const env = withHuggingFaceCacheEnvironment({
-    ...process.env,
-    ...args.env,
-  }, args.modelCache);
+  const entrypoint = buildBundledPythonCommand(
+    "-c",
+    [pythonProbeSource(args.device)],
+  );
+  const env = withBundledPythonEnvironment(
+    withHuggingFaceCacheEnvironment(
+      minimalMachineLearningEnvironment(process.env),
+      args.modelCache,
+    ),
+  );
   return {
-    name: args.name,
+    name: "python-runtime",
     command: entrypoint.command,
     args: entrypoint.commandArgs,
-    cwd: args.cwd,
     env,
   };
 }
 
-/** Build the exact uv environments that a configured run will use. */
+/** Build the exact bundled uv environment that every real stage uses. */
 export function buildDoctorPythonPlans(config: LocalRunnerConfig): PythonProbePlan[] {
   if (config.dryRun) return [];
-  const plans: PythonProbePlan[] = [];
-  if (config.training.backend === "uv") {
-    plans.push(pythonProbePlan({
-      name: "training-python",
-      entrypoint: config.training,
-      cwd: config.training.cwd,
-      env: config.training.env,
+  return [
+    pythonProbePlan({
       device: config.evaluation.inference.device,
       modelCache: config.paths.modelCache,
-    }));
-  }
-  if (config.evaluation.inference.provider === "transformers") {
-    plans.push(pythonProbePlan({
-      name: "evaluation-python",
-      entrypoint: config.evaluation.inference,
-      cwd: config.evaluation.inference.cwd,
-      env: config.evaluation.inference.env,
-      device: config.evaluation.inference.device,
-      modelCache: config.paths.modelCache,
-    }));
-  }
-  return plans;
-}
-
-function configuredCommandChecks(config: LocalRunnerConfig): Array<{
-  name: string;
-  command?: string;
-  cwd?: string;
-  env?: NodeJS.ProcessEnv;
-}> {
-  const checks: Array<{ name: string; command?: string; cwd?: string; env?: NodeJS.ProcessEnv }> = [];
-  if (config.training.backend === "command" && !config.dryRun) {
-    checks.push({
-      name: "training-command",
-      command: config.training.command?.[0],
-      cwd: config.training.cwd,
-      env: config.training.env,
-    });
-  }
-  const inference = config.evaluation.inference;
-  if ((inference.provider === "command" || inference.provider === "batch_command") && !config.dryRun) {
-    checks.push({
-      name: "evaluation-command",
-      command: inference.command?.[0],
-      cwd: inference.cwd,
-      env: inference.env,
-    });
-  }
-  return checks;
+    }),
+  ];
 }
 
 function placeholderSpecCheck(request: FineTuneRunRequest): DoctorCheck {
@@ -278,50 +206,6 @@ function placeholderSpecCheck(request: FineTuneRunRequest): DoctorCheck {
     message: placeholder
       ? "The spec still contains generated placeholder content; edit it before training."
       : `${request.spec_snapshot.examples.length} spec example(s); base model ${request.spec_snapshot.base_model}`,
-  };
-}
-
-function gatedModelTokenCheck(request: FineTuneRunRequest): DoctorCheck | null {
-  let model: ReturnType<typeof resolveTrainingModel>;
-  try {
-    model = resolveTrainingModel(request.spec_snapshot.base_model);
-  } catch {
-    return null;
-  }
-  if (!model.requiresHfToken) return null;
-  const available = Boolean(process.env.HF_TOKEN?.trim());
-  return {
-    name: "hugging-face-token",
-    ok: available,
-    message: available
-      ? `HF_TOKEN is configured for gated model ${model.id}.`
-      : `${model.id} is gated and requires a non-empty HF_TOKEN.`,
-  };
-}
-
-function judgeCheck(config: LocalRunnerConfig): DoctorCheck | null {
-  if (config.evaluation.scoring.mode !== "llm_judge") return null;
-  if (config.evaluation.scoring.fallback === "exact_match" && !config.llm) {
-    return {
-      name: "llm-judge",
-      ok: true,
-      message: "LLM judge is not configured; explicit exact_match fallback will be used.",
-    };
-  }
-  if (!config.llm) {
-    return {
-      name: "llm-judge",
-      ok: false,
-      message: "evaluation.scoring.mode=llm_judge requires an llm configuration, or explicitly set fallback=exact_match.",
-    };
-  }
-  const available = Boolean(process.env[config.llm.apiKeyEnv]);
-  return {
-    name: "llm-judge",
-    ok: available || config.evaluation.scoring.fallback === "exact_match",
-    message: available
-      ? `${config.llm.model} credentials found in ${config.llm.apiKeyEnv}`
-      : `${config.llm.apiKeyEnv} is not set${config.evaluation.scoring.fallback === "exact_match" ? "; explicit exact_match fallback will be used" : ""}`,
   };
 }
 
@@ -361,12 +245,8 @@ export async function runDoctor(config: LocalRunnerConfig, request?: FineTuneRun
 
   if (request) {
     checks.push(placeholderSpecCheck(request));
-    const gatedToken = gatedModelTokenCheck(request);
-    if (gatedToken) checks.push(gatedToken);
+    resolveTrainingModel(request.spec_snapshot.base_model);
   }
-  const judge = judgeCheck(config);
-  if (judge) checks.push(judge);
-
   const pythonPlans = buildDoctorPythonPlans(config);
   if (pythonPlans.length > 0) {
     const uvVersion = await runCommand("uv", ["--version"]);
@@ -381,12 +261,11 @@ export async function runDoctor(config: LocalRunnerConfig, request?: FineTuneRun
     if (uvVersion.code === 0) {
       const uniquePlans = new Map<string, PythonProbePlan>();
       for (const plan of pythonPlans) {
-        const key = JSON.stringify([plan.command, plan.args, plan.cwd, plan.env]);
+        const key = JSON.stringify([plan.command, plan.args, plan.env]);
         if (!uniquePlans.has(key)) uniquePlans.set(key, plan);
       }
       for (const plan of uniquePlans.values()) {
         const result = await runCommand(plan.command, plan.args, {
-          cwd: plan.cwd,
           env: plan.env,
           timeoutMs: 1_800_000,
         });
@@ -396,7 +275,7 @@ export async function runDoctor(config: LocalRunnerConfig, request?: FineTuneRun
           message: result.code === 0
             ? firstLine(result.stdout)
             : result.error ?? (firstLine(result.stderr) || `${plan.command} exited ${result.code}`),
-          details: { command: commandText(plan.command, plan.args), cwd: plan.cwd ?? process.cwd() },
+          details: { command: commandText(plan.command, plan.args) },
         });
       }
     }
@@ -406,30 +285,19 @@ export async function runDoctor(config: LocalRunnerConfig, request?: FineTuneRun
       ok: true,
       message: config.dryRun
         ? "Python dependency checks skipped because dryRun is enabled."
-        : "The configured command/none backends do not require the bundled Python runtime.",
+        : "Python dependency checks were skipped.",
     });
   }
 
-  for (const entry of configuredCommandChecks(config)) {
-    if (!entry.command) {
-      checks.push({ name: entry.name, ok: false, message: `${entry.name} has no command configured` });
-    } else {
-      const check = await executableCheck(entry.command, { cwd: entry.cwd, env: entry.env });
-      checks.push({ ...check, name: entry.name });
-    }
-  }
-
   const device = config.evaluation.inference.device;
-  if (!config.dryRun && (device === "cuda" || device === "auto")) {
+  if (!config.dryRun) {
     const nvidiaSmi = await runCommand("nvidia-smi", []);
     checks.push({
       name: "nvidia-smi",
-      ok: device === "auto" || nvidiaSmi.code === 0,
+      ok: nvidiaSmi.code === 0,
       message: nvidiaSmi.code === 0
         ? firstLine(nvidiaSmi.stdout)
-        : device === "auto"
-          ? "nvidia-smi is unavailable; device=auto may use MPS or CPU."
-          : nvidiaSmi.error ?? (firstLine(nvidiaSmi.stderr) || "nvidia-smi not available"),
+        : nvidiaSmi.error ?? (firstLine(nvidiaSmi.stderr) || "nvidia-smi not available"),
     });
   } else {
     checks.push({
@@ -441,20 +309,14 @@ export async function runDoctor(config: LocalRunnerConfig, request?: FineTuneRun
     });
   }
 
-  const trainingCommand = config.training.backend === "command"
-    ? config.training.command
-    : buildEntrypointCommand(config.training, {
-        defaultScript: request?.training_method === "dpo"
-          ? "training/local-runner/src/train_dpo.py"
-          : "training/local-runner/src/train.py",
-      }).displayCommand;
+  const trainingCommand = buildBundledPythonCommand("train.py").displayCommand;
   checks.push({
     name: "effective-plan",
     ok: true,
     message: "Resolved the configured training and evaluation plan.",
     details: {
       training_command: trainingCommand ?? null,
-      evaluation_provider: config.evaluation.inference.provider,
+      evaluation_provider: "transformers",
       evaluation_device: device,
       artifact_root: resolve(config.artifactRoot),
       store_root: resolve(config.storeRoot ?? defaultLocalHome()),

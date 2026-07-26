@@ -1,18 +1,20 @@
 {
   "artifactRoot": ".tt-local/artifacts",
   "storeRoot": ".tt-local/store",
-  "dryRun": true,
-  "training": {
-    "backend": "uv",
-    "project": "training/local-runner"
+  "paths": {
+    "modelCache": "~/.cache/huggingface"
   },
   "evaluation": {
     "inference": {
-      "provider": "none"
+      "device": "cuda",
+      "maxNewTokens": 32,
+      "temperature": 0,
+      "topP": 1
     },
     "scoring": {
       "mode": "exact_match"
     },
-    "maxExamples": 2
+    "maxExamples": 2,
+    "timeoutMs": 1800000
   }
 }

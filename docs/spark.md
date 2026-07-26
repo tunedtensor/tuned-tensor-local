@@ -1,134 +1,103 @@
-# Running On DGX Spark
+# DGX Spark
 
-TT Local expects the Spark to behave like a single Linux GPU host:
-uv must be installed, Python dependencies must resolve, and CUDA/PyTorch must be
-able to see the GPU.
+DGX Spark is the reference host for TT Local's first supported path:
+`Qwen/Qwen3.5-2B` text SFT with a LoRA adapter.
 
-## Host Checks
+## Check the host
 
-Run these on the Spark host:
+Run on the Spark:
 
 ```bash
 nvidia-smi
+node --version
 uv --version
-uv run python --version
 ```
 
-If uv is missing, install it with the official standalone installer:
+TT Local requires Node 22+, `uv`, working CUDA PyTorch, and enough free space
+for the Hugging Face cache plus run artifacts.
+
+## Create a project
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
+mkdir -p ~/tuned-tensor-runs/support-adapter
+cd ~/tuned-tensor-runs/support-adapter
+tt-local init --name "Support Adapter" --model Qwen/Qwen3.5-2B --profile spark
 ```
 
-Open a new shell or source the installer-updated profile before rerunning
-`uv --version`.
+Edit both generated examples in `tunedtensor.json`. For a meaningful run,
+replace them with a larger, representative dataset and a separate validation
+split.
 
-Then run the project doctor command:
-
-```bash
-npm run build
-tt-local doctor --config examples/local-runner.json
-```
-
-## Dry Run
-
-The example config uses `dryRun: true`, so it validates orchestration, dataset
-compilation, artifact writing, and report generation without launching training:
-
-```bash
-tt-local run examples/smoke-run-request.json --config examples/local-runner.json
-```
-
-## Real Training
-
-For real training with the bundled SFT or DPO workflow, install `tt-local`, set
-`dryRun: false`, and leave the uv project pointed at `training/local-runner`.
-That project is bundled in the npm package, so users do not need a local source
-checkout. Leave `training.script` unset: the runner chooses the bundled script
-from the run request's `training_method`.
-
-- `training_method: "sft"` runs `training/local-runner/src/train.py`.
-- `training_method: "dpo"` runs `training/local-runner/src/train_dpo.py`.
-
-Set `training.script` only when you want to override that selection with a
-specific custom uv script.
+The generated `local-runner.json` uses CUDA and project-local artifacts. A
+durable Spark configuration can set:
 
 ```json
 {
-  "artifactRoot": "/home/eve/tt-local-artifacts",
-  "dryRun": false,
-  "training": {
-    "backend": "uv",
-    "project": "training/local-runner"
-  },
+  "artifactRoot": "/home/eve/tuned-tensor-runs/artifacts",
+  "storeRoot": "/home/eve/tuned-tensor-runs/store",
   "paths": {
     "modelCache": "/home/eve/.cache/huggingface"
-  }
-}
-```
-
-The runner sets:
-
-- `SM_CHANNEL_TRAINING` to the local training JSONL directory;
-- `TT_HYPERPARAMETERS_PATH` to the generated hyperparameter JSON file;
-- `SM_OUTPUT_DIR` to the local training output directory;
-- `SM_MODEL_DIR` to the local model output directory;
-- `SM_CHANNEL_BASE_MODEL` when a local base-model artifact path is configured;
-- `HF_HOME` when `paths.modelCache` is configured.
-
-Real runs also use the Transformers/PEFT evaluator by default. Baseline
-evaluation loads the original Hugging Face model, and candidate evaluation loads
-that same base model plus the fine-tuned artifact from the run directory. Set
-`paths.modelCache` to a persistent Spark-local cache so training and evaluation
-reuse downloads.
-
-To make the first large download explicit, prefetch the base model after
-creating `tunedtensor.json` and the runner config:
-
-```bash
-tt-local models prefetch tunedtensor.json --config spark-runner.json
-```
-
-If you skip this step, the first real `tt-local run` still downloads through
-Transformers automatically.
-
-Custom workflows such as a from-scratch nanoGPT trainer can use command
-entrypoints instead:
-
-```json
-{
-  "artifactRoot": "/home/eve/tt-local-artifacts",
-  "dryRun": false,
-  "training": {
-    "backend": "command",
-    "command": ["python", "nanogpt/train.py"]
   },
   "evaluation": {
     "inference": {
-      "provider": "batch_command",
-      "command": ["python", "nanogpt/evaluate.py"]
+      "device": "cuda"
     },
     "scoring": {
       "mode": "exact_match"
-    }
+    },
+    "timeoutMs": 1800000
   }
 }
 ```
 
-The training command receives the same environment variables listed above. The
-batch evaluator is called with `--input <path> --output <path>` and should write
-the same results JSON shape as the bundled evaluator.
+Every Python stage uses the locked runtime included in the npm package; a
+source checkout and a custom runner path are neither required nor supported.
 
-The included first-pass SFT and DPO scripts can be run by the local runner
-through uv:
+## Preflight and run
 
 ```bash
-tt-local run examples/smoke-run-request.json --config examples/local-runner.json
-tt-local run examples/dpo-run-request.json --config examples/local-runner.json
+tt-local doctor tunedtensor.json
+tt-local validate tunedtensor.json
+tt-local models prefetch tunedtensor.json
+tt-local models verify-base tunedtensor.json
+tt-local run tunedtensor.json
 ```
 
-The SFT uv project currently points Linux installs at the PyTorch CUDA 13.0
-wheel index. If PyTorch does not publish a compatible wheel for the Spark's
-architecture, use `training.env`, `training.project`, or the SFT
-`pyproject.toml` to point uv at the NVIDIA/PyTorch package source that matches
-the host.
+`doctor` resolves the same bundled project and paths the run will use, imports
+Torch/Transformers/PEFT, requires visible CUDA, checks writable storage, and
+rejects unchanged placeholders. `validate` reads and normalizes the actual
+dataset before any run state or artifact directory is claimed.
+
+The runner provides these paths to Python:
+
+- `SM_CHANNEL_TRAINING`: prepared chat JSONL directory;
+- `TT_HYPERPARAMETERS_PATH`: generated SFT/LoRA parameters;
+- `SM_OUTPUT_DIR`: logs and metrics;
+- `SM_MODEL_DIR`: adapter output;
+- `SM_CHANNEL_BASE_MODEL`: optional verified local model snapshot;
+- `HF_HOME`: configured persistent model cache.
+
+## Verify and serve
+
+```bash
+tt-local runs report <run-id>
+tt-local models verify local-<run-id>
+tt-local serve local-<run-id> --spec tunedtensor.json --port 8000
+```
+
+In another shell:
+
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/v1/models
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Classify: I loved it."}]}'
+```
+
+If a run fails, start with `tt-local runs events <run-id>` and
+`tt-local runs get <run-id>`. The run record reports its `artifact_dir`; the
+main subprocess logs there are `training/training.log`,
+`baseline-eval.json.inference.log`, and `candidate-eval.json.inference.log`.
+The adapter is registered as soon as its manifest verifies, even if candidate
+evaluation fails afterward.

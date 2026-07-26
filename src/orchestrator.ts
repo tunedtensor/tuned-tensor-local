@@ -1,9 +1,9 @@
-import { copyFile, lstat, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   defaultArtifactPrefix,
@@ -39,7 +39,6 @@ import {
   compileSpecToJsonl,
   examplesFromChatJsonl,
   examplesFromSpec,
-  localAssetPathsFromChatJsonl,
   normalizeChatJsonlForRelocation,
 } from "./dataset.js";
 import {
@@ -47,7 +46,6 @@ import {
   compareEvalReports,
   deriveSampleSeed,
   evaluateExamples,
-  rescoreEvalReport,
   splitSpecExamples,
 } from "./evaluation.js";
 import { launchProcessTraining } from "./process-training.js";
@@ -58,8 +56,6 @@ import { createLocalStore, type LocalRunStatus, type LocalStore } from "./store.
 import { withHuggingFaceCacheEnvironment } from "./huggingface-cache.js";
 import { verifyLocalBaseModel } from "./prefetch.js";
 
-export type LocalRunStage = "prepare" | "baseline" | "train" | "candidate" | "score" | "report" | "all";
-
 export interface LocalRunResult {
   request: FineTuneRunRequest;
   report: RunReport;
@@ -67,30 +63,11 @@ export interface LocalRunResult {
   artifactDir: string;
 }
 
-export interface LocalStageRunResult {
-  request: FineTuneRunRequest;
-  stage: LocalRunStage;
-  report?: RunReport;
-  reportPath?: string;
-  artifactDir: string;
-  artifacts: {
-    training_jsonl: string;
-    stage_metadata: string;
-    training_report: string;
-    baseline_eval: string;
-    candidate_eval: string;
-    report: string;
-    artifact_manifest: string;
-  };
-}
-
 interface StageMetadata {
   run_id: string;
   behavior_spec_id: string;
   user_id: string;
-  training_method: FineTuneRunRequest["training_method"];
   request_fingerprint: string;
-  effective_config_fingerprint: string;
   runtime_fingerprint: string;
   source_fingerprint: string;
   eval_split: EvalSplit;
@@ -106,8 +83,6 @@ interface StageMetadata {
   base_model_for_evaluation: string;
   base_model_revision: string | null;
   base_model_fingerprint: string | null;
-  parent_model_artifact: string | null;
-  parent_model_fingerprint: string | null;
   system_prompt_sha256: string;
   prepared_at: string;
 }
@@ -135,11 +110,8 @@ export async function loadLocalRunnerConfig(path?: string): Promise<LocalRunnerC
   const configPath = resolve(path);
   const base = dirname(configPath);
   const config = localRunnerConfigSchema.parse(await loadJsonFile<unknown>(configPath));
-  const configPathValue = (value: string | undefined, preserveBundled = false): string | undefined => {
+  const configPathValue = (value: string | undefined): string | undefined => {
     if (!value) return undefined;
-    if (preserveBundled && (value === "training/local-runner" || value.startsWith("training/local-runner/"))) {
-      return value;
-    }
     if (value === "~") return homedir();
     if (value.startsWith("~/")) return resolve(homedir(), value.slice(2));
     return resolve(base, value);
@@ -148,24 +120,9 @@ export async function loadLocalRunnerConfig(path?: string): Promise<LocalRunnerC
     ...config,
     artifactRoot: configPathValue(config.artifactRoot)!,
     storeRoot: configPathValue(config.storeRoot),
-    training: {
-      ...config.training,
-      cwd: configPathValue(config.training.cwd),
-      project: configPathValue(config.training.project, true)!,
-      script: configPathValue(config.training.script, true),
-    },
     paths: {
       baseModel: configPathValue(config.paths.baseModel),
       modelCache: configPathValue(config.paths.modelCache),
-    },
-    evaluation: {
-      ...config.evaluation,
-      inference: {
-        ...config.evaluation.inference,
-        cwd: configPathValue(config.evaluation.inference.cwd),
-        project: configPathValue(config.evaluation.inference.project, true)!,
-        script: configPathValue(config.evaluation.inference.script, true)!,
-      },
     },
   };
 }
@@ -188,31 +145,177 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-function selectPrebuiltEvaluation(dataset: FineTuneRunRequest["dataset_prebuilt"]): {
-  path: string;
-  split: EvalSplit;
-} {
+function selectPrebuiltEvaluationSplit(dataset: FineTuneRunRequest["dataset_prebuilt"]): EvalSplit {
   if (!dataset) throw new Error("dataset_prebuilt is required");
-  if (dataset.validation) return { path: stripFileUri(dataset.validation), split: "prebuilt_validation" };
-  if (dataset.test) return { path: stripFileUri(dataset.test), split: "prebuilt_test" };
-  return { path: stripFileUri(dataset.training), split: "prebuilt_training" };
+  if (dataset.validation) return "prebuilt_validation";
+  if (dataset.test) return "prebuilt_test";
+  throw new Error("dataset_prebuilt requires a distinct validation or test split");
 }
 
-function selectDpoEvaluation(request: FineTuneRunRequest): {
-  path?: string;
-  split: EvalSplit;
-} {
-  if (request.dataset_prebuilt?.validation) {
-    return { path: stripFileUri(request.dataset_prebuilt.validation), split: "prebuilt_validation" };
+interface ValidatedDataset {
+  trainingJsonl: string;
+  trainingExampleCount: number;
+  evaluationExamples: BehaviorSpecExample[];
+  evalSplit: EvalSplit;
+}
+
+function assertMatchingDatasetSystems(
+  jsonl: string,
+  expectedSystem: string,
+  split: string,
+): void {
+  for (const [index, line] of jsonl.split(/\r?\n/).entries()) {
+    if (!line.trim()) continue;
+    const row = JSON.parse(line) as {
+      messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+    };
+    const actualSystem = row.messages.find((message) => message.role === "system")?.content ?? "";
+    if (actualSystem !== expectedSystem) {
+      throw new Error(
+        `Prebuilt ${split} row ${index + 1} system message must match the behavior spec system message.`,
+      );
+    }
   }
-  if (request.dataset_prebuilt?.test) {
-    return { path: stripFileUri(request.dataset_prebuilt.test), split: "prebuilt_test" };
+}
+
+function addDryRunPlaceholders(request: unknown, dryRun: boolean): unknown {
+  if (!dryRun || !request || typeof request !== "object" || Array.isArray(request)) return request;
+  const candidate = request as Record<string, unknown>;
+  if (candidate.dataset_prebuilt) return request;
+  const snapshot = candidate.spec_snapshot;
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return request;
+  const examples = (snapshot as Record<string, unknown>).examples;
+  if (!Array.isArray(examples) || examples.length > 0) return request;
+  return {
+    ...candidate,
+    spec_snapshot: {
+      ...(snapshot as Record<string, unknown>),
+      examples: [
+        { input: "Dry-run placeholder input A", output: "Dry-run placeholder output A" },
+        { input: "Dry-run placeholder input B", output: "Dry-run placeholder output B" },
+      ],
+    },
+  };
+}
+
+async function validateDatasetInputs(
+  request: FineTuneRunRequest,
+  config: LocalRunnerConfig,
+): Promise<ValidatedDataset> {
+  const inputIdentity = (value: string) =>
+    value.normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase("en");
+  const evalSampleSeed = config.evaluation.sampleSeed
+    ?? deriveSampleSeed(request.behavior_spec_id);
+  if (!request.dataset_prebuilt) {
+    const inlineExamples = examplesFromSpec(request.spec_snapshot);
+    const seenInputs = new Map<string, number>();
+    for (const [index, example] of inlineExamples.entries()) {
+      const identity = inputIdentity(example.input);
+      const previous = seenInputs.get(identity);
+      if (previous !== undefined) {
+        throw new Error(
+          `Inline examples ${previous + 1} and ${index + 1} have duplicate inputs; `
+          + "training and held-out evaluation require distinct prompts.",
+        );
+      }
+      seenInputs.set(identity, index);
+    }
+    if (!config.dryRun && inlineExamples.length < 2) {
+      throw new Error(
+        "A real local fine-tune requires at least 2 inline examples so training and evaluation use distinct data.",
+      );
+    }
+    const split = splitSpecExamples(inlineExamples, evalSampleSeed);
+    const hasHoldout = split.holdout.length > 0;
+    const trainingExamples = hasHoldout ? split.train : inlineExamples;
+    const evaluationExamples = hasHoldout ? split.holdout : inlineExamples;
+    return {
+      trainingJsonl: compileSpecToJsonl({ ...request.spec_snapshot, examples: trainingExamples }),
+      trainingExampleCount: trainingExamples.length,
+      evaluationExamples,
+      evalSplit: hasHoldout ? "spec_holdout" : "spec_examples",
+    };
   }
-  return { split: "spec_examples" };
+
+  const dataset = request.dataset_prebuilt;
+  const splitEntries = [
+    ["training", dataset.training],
+    ["validation", dataset.validation],
+    ["test", dataset.test],
+  ] as const;
+  const normalized = new Map<string, { jsonl: string; examples: BehaviorSpecExample[] }>();
+  const expectedSystem = buildSystemMessage(request.spec_snapshot);
+  for (const [name, value] of splitEntries) {
+    if (!value) continue;
+    const path = stripFileUri(value);
+    const jsonl = await normalizeChatJsonlForRelocation(path);
+    assertMatchingDatasetSystems(jsonl, expectedSystem, name);
+    normalized.set(name, {
+      jsonl,
+      examples: await examplesFromChatJsonl(path),
+    });
+  }
+
+  const evaluationSplit = selectPrebuiltEvaluationSplit(dataset);
+  const evaluationKey = evaluationSplit === "prebuilt_validation"
+    ? "validation"
+    : "test";
+  const training = normalized.get("training");
+  const evaluationData = normalized.get(evaluationKey);
+  if (!training || !evaluationData) {
+    throw new Error("Unable to load the configured prebuilt training and evaluation datasets.");
+  }
+  const trainingInputs = new Set(
+    training.examples.map((example) => inputIdentity(example.input)),
+  );
+  for (const splitName of ["validation", "test"] as const) {
+    const split = normalized.get(splitName);
+    if (!split) continue;
+    const splitInputs = new Set<string>();
+    for (const example of split.examples) {
+      const identity = inputIdentity(example.input);
+      if (splitInputs.has(identity)) {
+        throw new Error(
+          `Prebuilt ${splitName} data contains duplicate inputs; `
+          + "evaluation prompts must be unique so metrics and comparisons remain well-defined.",
+        );
+      }
+      splitInputs.add(identity);
+    }
+    const overlap = split.examples.filter((example) =>
+      trainingInputs.has(inputIdentity(example.input))
+    );
+    if (overlap.length > 0) {
+      throw new Error(
+        `Prebuilt training and ${splitName} data overlap on ${overlap.length} input(s); `
+        + "evaluation examples must be held out from training.",
+      );
+    }
+  }
+  return {
+    trainingJsonl: training.jsonl,
+    trainingExampleCount: training.examples.length,
+    evaluationExamples: evaluationData.examples,
+    evalSplit: evaluationSplit,
+  };
+}
+
+/**
+ * Parses the public contracts and fully validates every dataset before a run
+ * lock, store record, or artifact-directory claim is created.
+ */
+export async function validateLocalFineTuneInput(input: {
+  request: unknown;
+  config: unknown;
+}): Promise<{ request: FineTuneRunRequest; config: LocalRunnerConfig }> {
+  const config = localRunnerConfigSchema.parse(input.config);
+  const request = fineTuneRunRequestSchema.parse(addDryRunPlaceholders(input.request, config.dryRun));
+  await validateDatasetInputs(request, config);
+  return { request, config };
 }
 
 function artifactPrefix(request: FineTuneRunRequest): string {
-  return request.artifacts?.prefix ?? defaultArtifactPrefix({
+  return defaultArtifactPrefix({
     userId: request.user_id,
     behaviorSpecId: request.behavior_spec_id,
     runId: request.run_id,
@@ -249,34 +352,6 @@ async function packageVersion(): Promise<string> {
   }
 }
 
-async function effectiveConfigFingerprint(config: LocalRunnerConfig): Promise<string> {
-  const bundledProject = resolve(packageRoot, "training/local-runner");
-  const projectRoots = [...new Set([
-    bundledProject,
-    config.training.project === "training/local-runner" ? bundledProject : config.training.project,
-    config.evaluation.inference.project === "training/local-runner"
-      ? bundledProject
-      : config.evaluation.inference.project,
-  ].filter((value): value is string => Boolean(value)).map((value) => resolve(value)))];
-  const projectFingerprints: Record<string, { pyproject: string | null; uv_lock: string | null }> = {};
-  for (const project of projectRoots) {
-    projectFingerprints[project] = {
-      pyproject: await hashFileIfPresent(resolve(project, "pyproject.toml")),
-      uv_lock: await hashFileIfPresent(resolve(project, "uv.lock")),
-    };
-  }
-  return hashJson({
-    config,
-    runtime: {
-      tt_local_version: await packageVersion(),
-      node_version: process.version,
-      platform: process.platform,
-      architecture: process.arch,
-      project_fingerprints: projectFingerprints,
-    },
-  });
-}
-
 async function runtimeFingerprint(): Promise<string> {
   const bundledProject = resolve(packageRoot, "training/local-runner");
   return hashJson({
@@ -295,7 +370,6 @@ function preparedSourceFingerprint(args: {
   preparationConfig: unknown;
   baseModelRevision?: string;
   baseModelFingerprint?: string;
-  parentModelFingerprint?: string;
   datasetFingerprints: Record<string, string>;
 }): string {
   return hashJson({
@@ -304,14 +378,8 @@ function preparedSourceFingerprint(args: {
     preparation_config: args.preparationConfig,
     base_model_revision: args.baseModelRevision ?? null,
     base_model_fingerprint: args.baseModelFingerprint ?? null,
-    parent_model_fingerprint: args.parentModelFingerprint ?? null,
     dataset_fingerprints: args.datasetFingerprints,
   });
-}
-
-async function countJsonlRows(path: string): Promise<number> {
-  const text = await readFile(path, "utf8");
-  return text.split(/\r?\n/).filter((line) => line.trim()).length;
 }
 
 async function hashFile(path: string): Promise<string> {
@@ -332,23 +400,6 @@ async function datasetFingerprints(request: FineTuneRunRequest): Promise<Record<
     if (!value) continue;
     const datasetPath = stripFileUri(value);
     fingerprints[key] = await hashFile(datasetPath);
-    for (const assetPath of await localAssetPathsFromChatJsonl(datasetPath)) {
-      fingerprints[`${key}_asset:${assetPath}`] = await hashFile(assetPath);
-    }
-  }
-  for (const [exampleIndex, example] of request.spec_snapshot.examples.entries()) {
-    for (const [assetIndex, asset] of (example.input_assets ?? []).entries()) {
-      const value = asset.image ?? asset.data_uri ?? asset.uri ?? asset.path;
-      if (
-        !value
-        || value.startsWith("data:")
-        || (/^[a-z][a-z0-9+.-]*:/i.test(value) && !value.startsWith("file://"))
-      ) {
-        continue;
-      }
-      const assetPath = stripFileUri(value);
-      fingerprints[`spec_asset:${exampleIndex}:${assetIndex}:${assetPath}`] = await hashFile(assetPath);
-    }
   }
   return fingerprints;
 }
@@ -373,42 +424,6 @@ async function resolveBaseModelRevision(
   } catch {
     return undefined;
   }
-}
-
-async function fingerprintLocalArtifact(uri: string): Promise<string> {
-  const root = localModelArtifactPath(uri);
-  const metadata = await lstat(root);
-  if (metadata.isSymbolicLink()) {
-    throw new Error(`Parent model artifact must not be a symbolic link: ${root}`);
-  }
-  if (metadata.isFile()) {
-    return hashJson({ kind: "file", size_bytes: metadata.size, sha256: await hashFile(root) });
-  }
-  if (!metadata.isDirectory()) throw new Error(`Parent model artifact is not a file or directory: ${root}`);
-  const files: Array<{ path: string; size_bytes: number; sha256: string }> = [];
-  const visit = async (directory: string): Promise<void> => {
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
-      const child = resolve(directory, entry.name);
-      if (entry.isSymbolicLink()) {
-        throw new Error(`Parent model artifact must not contain symbolic links: ${child}`);
-      }
-      if (entry.isDirectory()) {
-        await visit(child);
-        continue;
-      }
-      const childMetadata = await stat(child);
-      if (!childMetadata.isFile()) continue;
-      files.push({
-        path: relative(root, child).split("\\").join("/"),
-        size_bytes: childMetadata.size,
-        sha256: await hashFile(child),
-      });
-    }
-  };
-  await visit(root);
-  files.sort((left, right) => left.path.localeCompare(right.path));
-  if (files.length === 0) throw new Error(`Parent model artifact directory is empty: ${root}`);
-  return hashJson({ kind: "directory", files });
 }
 
 /** Hash a local base model while permitting Hugging Face snapshot file links. */
@@ -453,7 +468,6 @@ function statusForProgressStage(stage: string): LocalRunStatus {
   if (stage === "evaluating_candidate") return "evaluating_candidate";
   if (stage === "training") return "training";
   if (stage === "preparing") return "preparing";
-  if (stage === "scoring") return "scoring";
   if (stage === "reporting") return "reporting";
   return "training";
 }
@@ -469,10 +483,6 @@ async function readStageMetadata(path: string): Promise<StageMetadata | null> {
   }
 }
 
-async function clearDependentStageArtifacts(artifacts: RunArtifacts): Promise<void> {
-  await cleanupStageArtifacts(artifacts, "prepare");
-}
-
 async function removePrefixedArtifacts(path: string): Promise<void> {
   const directory = dirname(path);
   const prefix = `${basename(path)}.`;
@@ -483,7 +493,10 @@ async function removePrefixedArtifacts(path: string): Promise<void> {
   ]);
 }
 
-async function cleanupStageArtifacts(artifacts: RunArtifacts, stage: LocalRunStage): Promise<void> {
+async function cleanupStageArtifacts(
+  artifacts: RunArtifacts,
+  stage: "prepare" | "baseline" | "train" | "candidate" | "report",
+): Promise<void> {
   const removeReport = async () => rm(artifacts.runReportJson, { force: true });
   if (stage === "prepare") {
     await Promise.all([
@@ -619,64 +632,33 @@ function isDryTraining(training: TrainingReport): boolean {
   return training.metrics?.dry_run === true;
 }
 
-function stringMetadata(
-  value: Record<string, unknown> | null | undefined,
-  key: string,
-): string | undefined {
-  const entry = value?.[key];
-  return typeof entry === "string" && entry.length > 0 ? entry : undefined;
-}
-
 async function modelManifestContract(
   prepared: PreparedRun,
   training: TrainingReport,
 ): Promise<Omit<ArtifactManifestModel, "files"> | undefined> {
   if (isDryTraining(training) || !training.model_artifact_uri) return undefined;
-  const metadata = training.artifact_metadata;
-  const explicitContract = Boolean(metadata?.framework && metadata?.format);
-  const inspection = await assertUsableModelArtifact(training.model_artifact_uri, {
-    allowUnrecognizedPayload: explicitContract,
-  });
+  const inspection = await assertUsableModelArtifact(training.model_artifact_uri);
   const adapterWeights = inspection.adapter_weight_file_count > 0
     && inspection.adapter_weight_bytes > 0;
-  const fullModelWeights = inspection.full_model_weight_file_count > 0
-    && inspection.full_model_weight_bytes > 0;
-  if (!adapterWeights && !fullModelWeights && !explicitContract) {
+  if (!adapterWeights || !inspection.has_adapter_config) {
     throw new Error(
-      `Model artifact ${inspection.path} has no loadable adapter or Transformers full-model weights. `
-      + "Custom trainers must set training.artifact.framework and training.artifact.format.",
+      `Local training must produce a PEFT adapter with adapter_model.safetensors or adapter_model.bin and `
+      + `a non-empty adapter_config.json: ${inspection.path}`,
     );
   }
-  if ((metadata?.framework === "transformers-peft" || metadata?.servable === true)
-    && (!adapterWeights || !inspection.has_adapter_config)) {
-    throw new Error(
-      `Model artifact ${inspection.path} requires adapter_model.safetensors or adapter_model.bin and a non-empty `
-      + "adapter_config.json for a PEFT/servable contract.",
-    );
-  }
-  if (metadata?.framework === "transformers-full" && !fullModelWeights) {
-    throw new Error(`Model artifact ${inspection.path} has no Transformers full-model weights.`);
-  }
-  const implicitPeftAdapter = adapterWeights && inspection.has_adapter_config;
-  const format = metadata?.format
-    ?? (inspection.kind === "file" && inspection.path.endsWith(".tar.gz")
-      ? "tar.gz"
-      : inspection.kind === "directory" ? "huggingface-directory" : "file");
+  const format = inspection.kind === "file" ? "tar.gz" : "huggingface-directory";
   return {
     artifact_kind: inspection.kind,
     format,
-    framework: metadata?.framework ?? (implicitPeftAdapter ? "transformers-peft" : fullModelWeights ? "transformers-full" : "custom"),
+    framework: "transformers-peft",
     base_model: prepared.request.spec_snapshot.base_model,
-    base_model_revision: stringMetadata(metadata, "base_model_revision")
-      ?? stringMetadata(training.metrics, "base_model_revision")
-      ?? prepared.metadata.base_model_revision
+    base_model_revision: prepared.metadata.base_model_revision
       ?? prepared.request.hyperparameters.base_model_revision,
     base_model_artifact_uri: training.base_model_artifact_uri,
     base_model_fingerprint: prepared.metadata.base_model_fingerprint ?? undefined,
-    parent_model_artifact: prepared.request.hyperparameters.parent_model_artifact,
     artifact_uri: training.model_artifact_uri,
     artifact_root: inspection.path,
-    servable: metadata?.servable ?? implicitPeftAdapter,
+    servable: true,
   };
 }
 
@@ -703,38 +685,19 @@ function stageFingerprintPath(prepared: PreparedRun, stage: FingerprintedStage):
   return `${stageOutputPath(prepared, stage)}.stage.json`;
 }
 
-function configuredPath(path: string, cwd?: string): string | null {
-  if (path === "training/local-runner" || path.startsWith("training/local-runner/")) {
-    return resolve(packageRoot, path);
-  }
-  if (path.startsWith("file://")) return stripFileUri(path);
-  if (isAbsolute(path)) return path;
-  const fileLike = path.startsWith("./")
-    || path.startsWith("../")
-    || path.includes("/")
-    || path.includes("\\")
-    || /\.(?:py|js|mjs|cjs|ts|tsx|sh|bash|zsh|pl|rb)$/i.test(path);
-  return fileLike ? resolve(cwd ?? process.cwd(), path) : null;
-}
-
-async function entrypointFileFingerprints(args: {
-  values: Array<string | undefined>;
-  cwd?: string;
-  project?: string;
-}): Promise<Record<string, string | null>> {
-  const candidates = new Set<string>();
-  for (const value of args.values) {
-    if (!value) continue;
-    const path = configuredPath(value, args.cwd);
-    if (path) candidates.add(path);
-  }
-  if (args.project) {
-    const project = configuredPath(args.project, args.cwd) ?? resolve(args.cwd ?? process.cwd(), args.project);
-    candidates.add(resolve(project, "pyproject.toml"));
-    candidates.add(resolve(project, "uv.lock"));
-  }
+async function runnerFileFingerprints(): Promise<Record<string, string | null>> {
+  const project = resolve(packageRoot, "training/local-runner");
+  const bundledSource = resolve(packageRoot, "training/local-runner/src");
+  const pythonSources = (await readdir(bundledSource, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".py"))
+    .map((entry) => resolve(bundledSource, entry.name));
+  const candidates = [...new Set([
+    ...pythonSources,
+    resolve(project, "pyproject.toml"),
+    resolve(project, "uv.lock"),
+  ])];
   const fingerprints: Record<string, string | null> = {};
-  for (const path of [...candidates].sort()) fingerprints[path] = await hashFileIfPresent(path);
+  for (const path of candidates.sort()) fingerprints[path] = await hashFileIfPresent(path);
   return fingerprints;
 }
 
@@ -750,46 +713,20 @@ async function stageFingerprint(args: {
     dry_run: args.config.dryRun,
   };
   if (args.stage === "train") {
-    const entrypointFiles = await entrypointFileFingerprints({
-      values: [
-        args.config.training.script
-          ?? (args.prepared.request.training_method === "dpo"
-            ? "training/local-runner/src/train_dpo.py"
-            : "training/local-runner/src/train.py"),
-        ...(args.config.training.command ?? []),
-      ],
-      cwd: args.config.training.cwd,
-      project: args.config.training.project,
-    });
+    const entrypointFiles = await runnerFileFingerprints();
     return hashJson({
       ...common,
-      training: args.config.training,
       paths: args.config.paths,
       entrypoint_files: entrypointFiles,
     });
   }
-  const selectedCommand = args.stage === "baseline"
-    ? args.config.evaluation.baselineCommand
-    : args.config.evaluation.candidateCommand;
-  const entrypointFiles = await entrypointFileFingerprints({
-    values: [
-      args.config.evaluation.inference.script,
-      ...(args.config.evaluation.inference.command ?? []),
-      ...(selectedCommand ?? []),
-    ],
-    cwd: args.config.evaluation.inference.cwd,
-    project: args.config.evaluation.inference.project,
-  });
+  const entrypointFiles = await runnerFileFingerprints();
   const evaluation = {
     inference_protocol_version: INFERENCE_PROTOCOL_VERSION,
-    command: args.stage === "baseline"
-      ? args.config.evaluation.baselineCommand
-      : args.config.evaluation.candidateCommand,
     inference: args.config.evaluation.inference,
     scoring: args.config.evaluation.scoring,
     timeout_ms: args.config.evaluation.timeoutMs,
     baseline_cache: args.config.evaluation.baselineCache,
-    llm: args.config.llm,
     model_cache: args.config.paths.modelCache,
   };
   return hashJson({
@@ -941,64 +878,20 @@ async function computePreparedRun(args: {
   writeArtifacts: boolean;
 }): Promise<PreparedRun> {
   const { request, config, artifacts } = args;
-  const evalSampleSeed = config.evaluation.sampleSeed ?? deriveSampleSeed(request.run_id);
-  let examples = examplesFromSpec(request.spec_snapshot);
-  let evalSplit: EvalSplit = "spec_examples";
-  let trainingExampleCount: number | null = examples.length;
-
-  if (request.training_method === "dpo") {
-    if (!request.dataset_prebuilt) throw new Error("DPO training requires dataset_prebuilt.");
-    const trainingPath = stripFileUri(request.dataset_prebuilt.training);
-    if (args.writeArtifacts) await copyFile(trainingPath, artifacts.trainingJsonl);
-    trainingExampleCount = await countJsonlRows(trainingPath);
-    const evaluation = selectDpoEvaluation(request);
-    evalSplit = evaluation.split;
-    examples = evaluation.path
-      ? await examplesFromChatJsonl(evaluation.path)
-      : examplesFromSpec(request.spec_snapshot);
-  } else if (request.dataset_prebuilt) {
-    const trainingPath = stripFileUri(request.dataset_prebuilt.training);
-    const evaluation = selectPrebuiltEvaluation(request.dataset_prebuilt);
-    evalSplit = evaluation.split;
-    if (evalSplit === "prebuilt_training" && !config.dryRun && !config.evaluation.allowPrebuiltTrainingEval) {
-      throw new Error(
-        "dataset_prebuilt has no test or validation split, so evaluation would run on the training data and "
-        + "overstate improvement. Provide dataset_prebuilt.test or dataset_prebuilt.validation, or set "
-        + "evaluation.allowPrebuiltTrainingEval=true to evaluate on the training split anyway.",
-      );
-    }
-    if (args.writeArtifacts) {
-      const normalizedTraining = await normalizeChatJsonlForRelocation(trainingPath);
-      await writeFile(artifacts.trainingJsonl, `${normalizedTraining}\n`, "utf8");
-    }
-    examples = await examplesFromChatJsonl(evaluation.path);
-    trainingExampleCount = null;
-  } else {
-    const split = splitSpecExamples(request.spec_snapshot.examples, evalSampleSeed);
-    let trainingExamples = request.spec_snapshot.examples;
-    if (split.holdout.length > 0) {
-      trainingExamples = split.train;
-      examples = split.holdout;
-      evalSplit = "spec_holdout";
-    }
-    trainingExampleCount = trainingExamples.length;
-    if (args.writeArtifacts) {
-      const jsonl = compileSpecToJsonl({ ...request.spec_snapshot, examples: trainingExamples });
-      await writeFile(artifacts.trainingJsonl, `${jsonl}\n`, "utf8");
-    }
+  const evalSampleSeed = config.evaluation.sampleSeed
+    ?? deriveSampleSeed(request.behavior_spec_id);
+  const dataset = await validateDatasetInputs(request, config);
+  const examples = dataset.evaluationExamples;
+  if (args.writeArtifacts) {
+    await writeFileAtomic(artifacts.trainingJsonl, `${dataset.trainingJsonl}\n`);
   }
 
   const system = buildSystemMessage(request.spec_snapshot);
   const baseModelForEvaluation = config.paths.baseModel ?? request.spec_snapshot.base_model;
-  const parentModelArtifact = request.hyperparameters.parent_model_artifact;
-  const parentModelFingerprint = parentModelArtifact
-    ? await fingerprintLocalArtifact(parentModelArtifact)
-    : undefined;
   const maxEvalExamples = config.evaluation.maxExamples ?? request.hyperparameters.max_eval_examples;
   const evalExamplesUsed = Math.min(maxEvalExamples ?? examples.length, examples.length);
   const fingerprints = await datasetFingerprints(request);
   const requestFingerprint = hashJson(request);
-  const effectiveConfigFingerprintValue = await effectiveConfigFingerprint(config);
   const runtimeFingerprintValue = await runtimeFingerprint();
   const baseModelRevision = await resolveBaseModelRevision(request, config);
   const baseModelFingerprint = config.paths.baseModel
@@ -1008,9 +901,7 @@ async function computePreparedRun(args: {
     run_id: request.run_id,
     behavior_spec_id: request.behavior_spec_id,
     user_id: request.user_id,
-    training_method: request.training_method,
     request_fingerprint: requestFingerprint,
-    effective_config_fingerprint: effectiveConfigFingerprintValue,
     runtime_fingerprint: runtimeFingerprintValue,
     source_fingerprint: preparedSourceFingerprint({
       requestFingerprint,
@@ -1020,19 +911,17 @@ async function computePreparedRun(args: {
         base_model_path: config.paths.baseModel,
         max_eval_examples: config.evaluation.maxExamples,
         eval_sample_seed: config.evaluation.sampleSeed,
-        allow_prebuilt_training_eval: config.evaluation.allowPrebuiltTrainingEval,
       },
       baseModelRevision,
       baseModelFingerprint,
-      parentModelFingerprint,
       datasetFingerprints: fingerprints,
     }),
-    eval_split: evalSplit,
+    eval_split: dataset.evalSplit,
     eval_sample_seed: evalSampleSeed,
     eval_examples_total: examples.length,
     eval_examples_used: evalExamplesUsed,
     max_eval_examples: maxEvalExamples ?? null,
-    training_example_count: trainingExampleCount,
+    training_example_count: dataset.trainingExampleCount,
     dataset_prebuilt: Boolean(request.dataset_prebuilt),
     dataset_format: request.dataset_prebuilt?.format ?? null,
     dataset_fingerprints: fingerprints,
@@ -1040,8 +929,6 @@ async function computePreparedRun(args: {
     base_model_for_evaluation: baseModelForEvaluation,
     base_model_revision: baseModelRevision ?? null,
     base_model_fingerprint: baseModelFingerprint ?? null,
-    parent_model_artifact: parentModelArtifact ?? null,
-    parent_model_fingerprint: parentModelFingerprint ?? null,
     system_prompt_sha256: createHash("sha256").update(system).digest("hex"),
     prepared_at: new Date().toISOString(),
   };
@@ -1063,7 +950,6 @@ async function prepareStage(args: {
   artifacts: RunArtifacts;
   store: LocalStore;
   reporter?: LocalRunReporter;
-  force?: boolean;
 }): Promise<PreparedRun> {
   const preparedExists = await pathExists(args.artifacts.stageMetadataJson)
     && await pathExists(args.artifacts.trainingJsonl);
@@ -1074,7 +960,6 @@ async function prepareStage(args: {
     ? await readStageMetadata(args.artifacts.stageMetadataJson)
     : null;
   let canReuse = preparedExists
-    && !args.force
     && existingMetadata?.source_fingerprint === prepared.metadata.source_fingerprint;
   if (canReuse) {
     canReuse = await verifyReusableArtifacts(args.artifacts, [
@@ -1103,28 +988,10 @@ async function prepareStage(args: {
   });
   await throwIfCancelled(args.store, args.request);
   await args.store.invalidateRunOutputs(args.request.run_id, { report: true, model: true });
-  await clearDependentStageArtifacts(args.artifacts);
+  await cleanupStageArtifacts(args.artifacts, "prepare");
   const refreshed = await computePreparedRun({ ...args, writeArtifacts: true });
   await refreshArtifactManifest(refreshed);
   return refreshed;
-}
-
-async function ensurePrepared(args: {
-  request: FineTuneRunRequest;
-  config: LocalRunnerConfig;
-  artifacts: RunArtifacts;
-  store: LocalStore;
-  reporter?: LocalRunReporter;
-  forcePrepare?: boolean;
-}): Promise<PreparedRun> {
-  return prepareStage({
-    request: args.request,
-    config: args.config,
-    artifacts: args.artifacts,
-    store: args.store,
-    reporter: args.reporter,
-    force: args.forcePrepare,
-  });
 }
 
 async function runBaselineStage(args: {
@@ -1133,11 +1000,9 @@ async function runBaselineStage(args: {
   store: LocalStore;
   reporter?: LocalRunReporter;
   runReporter: LocalRunReporter;
-  force?: boolean;
 }): Promise<EvalReport> {
   if (
-    !args.force
-    && await canReuseStageArtifact({
+    await canReuseStageArtifact({
       stage: "baseline",
       prepared: args.prepared,
       config: args.config,
@@ -1171,19 +1036,17 @@ async function runBaselineStage(args: {
       examples: args.prepared.examples.length,
       eval_examples_used: args.prepared.metadata.eval_examples_used,
       eval_split: args.prepared.metadata.eval_split,
-      model_id: args.prepared.metadata.parent_model_artifact ?? args.prepared.baseModelForEvaluation,
-      parent_model_artifact: args.prepared.metadata.parent_model_artifact,
+      model_id: args.prepared.baseModelForEvaluation,
     },
   });
   const report = await evaluateExamples({
     kind: "baseline",
-    modelId: args.prepared.metadata.parent_model_artifact ?? args.prepared.baseModelForEvaluation,
+    modelId: args.prepared.baseModelForEvaluation,
     baseModelId: args.prepared.baseModelForEvaluation,
     baseModelRevision: args.config.paths.baseModel
       ? undefined
       : args.prepared.metadata.base_model_revision ?? undefined,
-    sourceFingerprint: args.prepared.metadata.source_fingerprint,
-    adapterPath: args.prepared.metadata.parent_model_artifact ?? undefined,
+    sourceFingerprint: args.prepared.metadata.base_model_fingerprint ?? undefined,
     examples: args.prepared.examples,
     system: args.prepared.system,
     config: args.config,
@@ -1205,11 +1068,9 @@ async function runTrainStage(args: {
   store: LocalStore;
   reporter?: LocalRunReporter;
   runReporter: LocalRunReporter;
-  force?: boolean;
 }): Promise<TrainingReport> {
   if (
-    !args.force
-    && await canReuseStageArtifact({
+    await canReuseStageArtifact({
       stage: "train",
       prepared: args.prepared,
       config: args.config,
@@ -1249,7 +1110,7 @@ async function runTrainStage(args: {
     status: "training",
     stage: "training",
     message: args.config.dryRun ? "Recording dry-run training result." : "Launching local training process.",
-    details: { training_backend: args.config.training.backend, dry_run: args.config.dryRun },
+    details: { training_backend: "local-uv", dry_run: args.config.dryRun },
   });
   const training = await launchProcessTraining({
     request: args.prepared.request,
@@ -1282,40 +1143,15 @@ async function runTrainStage(args: {
   return training;
 }
 
-async function writeExternalTrainingReport(args: {
-  prepared: PreparedRun;
-  config: LocalRunnerConfig;
-  modelArtifact: string;
-}): Promise<TrainingReport> {
-  const training = trainingReportSchema.parse({
-    provider: args.config.training.backend === "command" ? "local-command" : "local-uv",
-    training_job_name: `external-${args.prepared.request.run_id}`,
-    model_artifact_uri: fileUri(localModelArtifactPath(args.modelArtifact)),
-    base_model_artifact_uri: args.config.paths.baseModel ? fileUri(args.config.paths.baseModel) : undefined,
-    parent_model_artifact_uri: args.prepared.metadata.parent_model_artifact ?? undefined,
-    artifact_metadata: {
-      ...(args.config.training.artifact ?? {}),
-      notes: args.config.training.artifact?.notes ?? "External model artifact supplied with --model-artifact.",
-    },
-    metrics: { external_model_artifact: true },
-    exit_code: null,
-    log_uri: fileUri(args.prepared.artifacts.trainingReportJson),
-  });
-  await writeJsonAtomic(args.prepared.artifacts.trainingReportJson, training);
-  return training;
-}
-
 async function runCandidateStage(args: {
   prepared: PreparedRun;
   config: LocalRunnerConfig;
   store: LocalStore;
   reporter?: LocalRunReporter;
   runReporter: LocalRunReporter;
-  force?: boolean;
-  modelArtifact?: string;
 }): Promise<EvalReport> {
   let verifiedTraining: TrainingReport | undefined;
-  if (!args.modelArtifact && await pathExists(args.prepared.artifacts.trainingReportJson)) {
+  if (await pathExists(args.prepared.artifacts.trainingReportJson)) {
     const trainingCurrent = await canReuseStageArtifact({
       stage: "train",
       prepared: args.prepared,
@@ -1329,9 +1165,7 @@ async function runCandidateStage(args: {
     }
   }
   if (
-    !args.force
-    && !args.modelArtifact
-    && verifiedTraining
+    verifiedTraining
     && await canReuseStageArtifact({
       stage: "candidate",
       prepared: args.prepared,
@@ -1366,30 +1200,15 @@ async function runCandidateStage(args: {
     await throwIfCancelled(args.store, args.prepared.request);
     return report;
   }
-  if (!args.modelArtifact && !verifiedTraining) {
-    throw new Error("candidate stage requires current verified training output. Run --stage train first.");
+  if (!verifiedTraining) {
+    throw new Error("Candidate evaluation requires current verified training output.");
   }
   await throwIfCancelled(args.store, args.prepared.request);
-  await args.store.invalidateRunOutputs(args.prepared.request.run_id, {
-    report: true,
-    model: Boolean(args.modelArtifact),
-  });
+  await args.store.invalidateRunOutputs(args.prepared.request.run_id, { report: true });
   await cleanupStageArtifacts(args.prepared.artifacts, "candidate");
-  let training: TrainingReport;
-  if (args.modelArtifact) {
-    training = await writeExternalTrainingReport({
-      prepared: args.prepared,
-      config: args.config,
-      modelArtifact: args.modelArtifact,
-    });
-    await writeStageFingerprint({ stage: "train", prepared: args.prepared, config: args.config });
-  } else if (verifiedTraining) {
-    training = verifiedTraining;
-  } else {
-    throw new Error("candidate stage requires training output or --model-artifact.");
-  }
+  const training = verifiedTraining;
   const modelArtifact = training.model_artifact_uri;
-  if (!modelArtifact) throw new Error("candidate stage requires a model_artifact_uri in training-report.json or --model-artifact.");
+  if (!modelArtifact) throw new Error("candidate stage requires a model_artifact_uri in training-report.json.");
   if (!isDryTraining(training)) {
     await modelManifestContract(args.prepared, training);
     await refreshArtifactManifest(args.prepared);
@@ -1437,78 +1256,6 @@ async function runCandidateStage(args: {
   return report;
 }
 
-async function runScoreStage(args: {
-  prepared: PreparedRun;
-  config: LocalRunnerConfig;
-  store: LocalStore;
-  reporter?: LocalRunReporter;
-  runReporter: LocalRunReporter;
-}): Promise<{ baseline: EvalReport; candidate: EvalReport }> {
-  if (!await pathExists(args.prepared.artifacts.baselineEvalJson)) {
-    throw new Error("score stage requires baseline-eval.json. Run --stage baseline first.");
-  }
-  if (!await pathExists(args.prepared.artifacts.candidateEvalJson)) {
-    throw new Error("score stage requires candidate-eval.json. Run --stage candidate first.");
-  }
-  await verifyReusableArtifacts(args.prepared.artifacts, [
-    args.prepared.artifacts.baselineEvalJson,
-    stageFingerprintPath(args.prepared, "baseline"),
-    args.prepared.artifacts.candidateEvalJson,
-    stageFingerprintPath(args.prepared, "candidate"),
-  ]);
-  await throwIfCancelled(args.store, args.prepared.request);
-  await args.store.invalidateRunOutputs(args.prepared.request.run_id, { report: true });
-  await cleanupStageArtifacts(args.prepared.artifacts, "score");
-  await updateRun({
-    store: args.store,
-    reporter: args.reporter,
-    request: args.prepared.request,
-    status: "scoring",
-    stage: "scoring",
-    message: "Rescoring existing baseline and candidate outputs.",
-    details: { scoring_mode: args.config.evaluation.scoring.mode },
-  });
-  const rollbackPaths = [
-    args.prepared.artifacts.baselineEvalJson,
-    stageFingerprintPath(args.prepared, "baseline"),
-    args.prepared.artifacts.candidateEvalJson,
-    stageFingerprintPath(args.prepared, "candidate"),
-  ];
-  const originals = new Map<string, Buffer>();
-  for (const path of rollbackPaths) originals.set(path, await readFile(path));
-  try {
-    const baseline = await rescoreEvalReport({
-      report: evalReportSchema.parse(await readJson<unknown>(args.prepared.artifacts.baselineEvalJson)),
-      config: args.config,
-      outputPath: args.prepared.artifacts.baselineEvalJson,
-      system: args.prepared.system,
-      reporter: args.runReporter,
-    });
-    const candidate = await rescoreEvalReport({
-      report: evalReportSchema.parse(await readJson<unknown>(args.prepared.artifacts.candidateEvalJson)),
-      config: args.config,
-      outputPath: args.prepared.artifacts.candidateEvalJson,
-      system: args.prepared.system,
-      reporter: args.runReporter,
-    });
-    await throwIfCancelled(args.store, args.prepared.request);
-    await writeStageFingerprint({ stage: "baseline", prepared: args.prepared, config: args.config });
-    const training = await pathExists(args.prepared.artifacts.trainingReportJson)
-      ? trainingReportSchema.parse(await readJson<unknown>(args.prepared.artifacts.trainingReportJson))
-      : undefined;
-    await writeStageFingerprint({
-      stage: "candidate",
-      prepared: args.prepared,
-      config: args.config,
-      training,
-    });
-    return { baseline, candidate };
-  } catch (error) {
-    await Promise.all([...originals].map(([path, contents]) => writeFileAtomic(path, contents)));
-    throw error;
-  }
-}
-
 async function runReportStage(args: {
   prepared: PreparedRun;
   config: LocalRunnerConfig;
@@ -1516,16 +1263,15 @@ async function runReportStage(args: {
   reporter?: LocalRunReporter;
   startedAt: string;
   startedPerf: number;
-  emitReportingEvent?: boolean;
 }): Promise<RunReport> {
   if (!await pathExists(args.prepared.artifacts.baselineEvalJson)) {
-    throw new Error("report stage requires baseline-eval.json. Run --stage baseline first.");
+    throw new Error("Run reporting requires baseline-eval.json.");
   }
   if (!await pathExists(args.prepared.artifacts.candidateEvalJson)) {
-    throw new Error("report stage requires candidate-eval.json. Run --stage candidate first.");
+    throw new Error("Run reporting requires candidate-eval.json.");
   }
   if (!await pathExists(args.prepared.artifacts.trainingReportJson)) {
-    throw new Error("report stage requires training-report.json. Run --stage train first, or --stage candidate --model-artifact <path>.");
+    throw new Error("Run reporting requires training-report.json.");
   }
   const currentTraining = await canReuseStageArtifact({
     stage: "train",
@@ -1558,17 +1304,15 @@ async function runReportStage(args: {
   await throwIfCancelled(args.store, args.prepared.request);
   await args.store.invalidateRunOutputs(args.prepared.request.run_id, { report: true });
   await cleanupStageArtifacts(args.prepared.artifacts, "report");
-  if (args.emitReportingEvent) {
-    await updateRun({
-      store: args.store,
-      reporter: args.reporter,
-      request: args.prepared.request,
-      status: "reporting",
-      stage: "reporting",
-      message: "Writing run report.",
-      details: { report_path: args.prepared.artifacts.runReportJson },
-    });
-  }
+  await updateRun({
+    store: args.store,
+    reporter: args.reporter,
+    request: args.prepared.request,
+    status: "reporting",
+    stage: "reporting",
+    message: "Writing run report.",
+    details: { report_path: args.prepared.artifacts.runReportJson },
+  });
   const baseline = evalReportSchema.parse(await readJson<unknown>(args.prepared.artifacts.baselineEvalJson));
   const candidate = evalReportSchema.parse(await readJson<unknown>(args.prepared.artifacts.candidateEvalJson));
   const training = trainingReportSchema.parse(await readJson<unknown>(args.prepared.artifacts.trainingReportJson));
@@ -1596,8 +1340,6 @@ async function runReportStage(args: {
     run_metadata: {
       base_model: args.prepared.request.spec_snapshot.base_model,
       fine_tuned_model_id: training.model_artifact_uri ?? training.training_job_name,
-      parent_model_artifact: args.prepared.metadata.parent_model_artifact,
-      training_method: args.prepared.request.training_method,
       dataset_prebuilt: args.prepared.metadata.dataset_prebuilt,
       dataset_format: args.prepared.metadata.dataset_format,
       dataset_uri: fileUri(args.prepared.artifacts.trainingJsonl),
@@ -1639,17 +1381,18 @@ async function runReportStage(args: {
   return report;
 }
 
-export async function runLocalFineTuneStage(input: {
+export async function runLocalFineTune(input: {
   request: FineTuneRunRequest;
   config: LocalRunnerConfig;
   reporter?: LocalRunReporter;
-  stage?: LocalRunStage;
-  force?: boolean;
-  modelArtifact?: string;
-}): Promise<LocalStageRunResult> {
+}): Promise<LocalRunResult> {
+  const validated = await validateLocalFineTuneInput({
+    request: input.request,
+    config: input.config,
+  });
+  input = { ...input, ...validated };
   const startedPerf = performance.now();
   const startedAt = new Date().toISOString();
-  const stage = input.stage ?? "all";
   const prefix = artifactPrefix(input.request);
   const artifacts = resolveRunArtifacts({ artifactRoot: input.config.artifactRoot, prefix });
   const store = createLocalStore(input.config.storeRoot);
@@ -1669,118 +1412,51 @@ export async function runLocalFineTuneStage(input: {
 
     try {
       await throwIfCancelled(store, input.request);
-      prepared = await ensurePrepared({
-      request: input.request,
-      config: input.config,
-      artifacts,
-      store,
-      reporter: input.reporter,
-      forcePrepare: Boolean(input.force && (stage === "prepare" || stage === "all")),
-    });
-    await throwIfCancelled(store, input.request);
-    let report: RunReport | undefined;
-
-    const completeRequestedStage = async (completedStage: Exclude<LocalRunStage, "all" | "report">) => {
+      prepared = await prepareStage({
+        request: input.request,
+        config: input.config,
+        artifacts,
+        store,
+        reporter: input.reporter,
+      });
       await throwIfCancelled(store, input.request);
-      const message = `${completedStage} stage completed.`;
-      const completedState = await store.updateRun({
-        runId: input.request.run_id,
-        status: "stage_completed",
-        stage: `${completedStage}_completed`,
-        message,
-        details: { requested_stage: completedStage },
-      });
-      if (completedState.status === "cancelled") {
-        throw new ProcessCancelledError(`Run ${input.request.run_id} was cancelled.`);
-      }
-      await input.reporter?.onEvent?.({
-        stage: `${completedStage}_completed`,
-        status: "completed",
-        message,
-        details: { requested_stage: completedStage },
-      });
-    };
-
-    if (stage === "prepare") {
-      await completeRequestedStage(stage);
-      return stageResult({ request: input.request, stage, artifacts });
-    }
-
-    if (stage === "baseline" || stage === "all") {
       await runBaselineStage({
         prepared,
         config: input.config,
         store,
         reporter: input.reporter,
         runReporter,
-        force: Boolean(input.force),
       });
       await refreshArtifactManifest(prepared);
-      if (stage === "baseline") {
-        await completeRequestedStage(stage);
-        return stageResult({ request: input.request, stage, artifacts });
-      }
-    }
-
-    if (stage === "train" || stage === "all") {
       await runTrainStage({
         prepared,
         config: input.config,
         store,
         reporter: input.reporter,
         runReporter,
-        force: Boolean(input.force),
       });
-      if (stage === "train") {
-        await completeRequestedStage(stage);
-        return stageResult({ request: input.request, stage, artifacts });
-      }
-    }
-
-    if (stage === "candidate" || stage === "all") {
       await runCandidateStage({
         prepared,
         config: input.config,
         store,
         reporter: input.reporter,
         runReporter,
-        force: Boolean(input.force),
-        modelArtifact: input.modelArtifact,
       });
       await refreshArtifactManifest(prepared);
-      if (stage === "candidate") {
-        await completeRequestedStage(stage);
-        return stageResult({ request: input.request, stage, artifacts });
-      }
-    }
-
-    if (stage === "score") {
-      await runScoreStage({
-        prepared,
-        config: input.config,
-        store,
-        reporter: input.reporter,
-        runReporter,
-      });
-      await refreshArtifactManifest(prepared);
-      await completeRequestedStage(stage);
-      return stageResult({ request: input.request, stage, artifacts });
-    }
-
-    if (stage === "report" || stage === "all") {
-      report = await runReportStage({
+      const report = await runReportStage({
         prepared,
         config: input.config,
         store,
         reporter: input.reporter,
         startedAt,
         startedPerf,
-        emitReportingEvent: stage === "report",
       });
-      return stageResult({ request: input.request, stage, artifacts, report });
-    }
-
-    throw new Error(`Unknown run stage: ${stage}`);
+      return {
+        request: input.request,
+        report,
+        reportPath: artifacts.runReportJson,
+        artifactDir: artifacts.runDir,
+      };
     } catch (error) {
       const cancelled = error instanceof ProcessCancelledError
         || await store.isCancellationRequested(input.request.run_id).catch(() => false);
@@ -1807,50 +1483,4 @@ export async function runLocalFineTuneStage(input: {
     await releaseArtifactLock?.();
     await releaseRunLock();
   }
-}
-
-function stageResult(args: {
-  request: FineTuneRunRequest;
-  stage: LocalRunStage;
-  artifacts: RunArtifacts;
-  report?: RunReport;
-}): LocalStageRunResult {
-  return {
-    request: args.request,
-    stage: args.stage,
-    report: args.report,
-    reportPath: args.report ? args.artifacts.runReportJson : undefined,
-    artifactDir: dirname(args.artifacts.runReportJson),
-    artifacts: {
-      training_jsonl: args.artifacts.trainingJsonl,
-      stage_metadata: args.artifacts.stageMetadataJson,
-      training_report: args.artifacts.trainingReportJson,
-      baseline_eval: args.artifacts.baselineEvalJson,
-      candidate_eval: args.artifacts.candidateEvalJson,
-      report: args.artifacts.runReportJson,
-      artifact_manifest: args.artifacts.artifactManifestJson,
-    },
-  };
-}
-
-export async function runLocalFineTune(input: {
-  request: FineTuneRunRequest;
-  config: LocalRunnerConfig;
-  reporter?: LocalRunReporter;
-}): Promise<LocalRunResult> {
-  const result = await runLocalFineTuneStage({
-    request: input.request,
-    config: input.config,
-    reporter: input.reporter,
-    stage: "all",
-  });
-  if (!result.report || !result.reportPath) {
-    throw new Error("Full local fine-tune run did not produce a report.");
-  }
-  return {
-    request: result.request,
-    report: result.report,
-    reportPath: result.reportPath,
-    artifactDir: result.artifactDir,
-  };
 }

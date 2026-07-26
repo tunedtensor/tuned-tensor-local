@@ -1,28 +1,20 @@
 import { z } from "zod";
 import { canonicalizeTrainingModel } from "./model-registry.js";
 
-export const trainingMethodSchema = z.enum(["sft", "dpo"]);
-export const datasetFormatSchema = z.enum(["chat_jsonl", "document_ocr_chat_jsonl", "preference_jsonl"]);
-
-export const documentInputAssetSchema = z.object({
-  type: z.literal("image").default("image"),
-  mime_type: z.string().min(1).optional(),
-  image: z.string().min(1).optional(),
-  data_uri: z.string().min(1).optional(),
-  uri: z.string().min(1).optional(),
-  path: z.string().min(1).optional(),
-  page: z.number().int().min(1).optional(),
-}).refine(
-  (asset) => Boolean(asset.image || asset.data_uri || asset.uri || asset.path),
-  { message: "image asset must include image, data_uri, uri, or path" },
-);
+/**
+ * TT Local deliberately has one training contract today: text supervised
+ * fine-tuning with a LoRA adapter. Additional methods should only be added
+ * after they have their own end-to-end CUDA acceptance test.
+ */
+export const datasetFormatSchema = z.literal("chat_jsonl");
+export const baseModelRevisionSchema = z.string()
+  .regex(/^[0-9a-f]{40}$/i, "base_model_revision must be a 40-character Hugging Face commit SHA")
+  .transform((value) => value.toLowerCase());
 
 export const behaviorSpecExampleSchema = z.object({
   input: z.string().min(1),
   output: z.string().min(1),
-  input_assets: z.array(documentInputAssetSchema).optional(),
-  modality: z.literal("document_ocr").optional(),
-});
+}).strict();
 
 export const specSnapshotSchema = z.object({
   name: z.string().min(1),
@@ -32,17 +24,25 @@ export const specSnapshotSchema = z.object({
   examples: z.array(behaviorSpecExampleSchema).default([]),
   constraints: z.array(z.string()).default([]),
   base_model: z.string().transform((value) => canonicalizeTrainingModel(value)),
-});
+}).strict();
 
 export const datasetPrebuiltSchema = z.object({
   training: z.string().min(1),
   validation: z.string().min(1).optional(),
   test: z.string().min(1).optional(),
-  format: datasetFormatSchema.optional(),
+  format: datasetFormatSchema.default("chat_jsonl"),
+}).strict().superRefine((dataset, context) => {
+  if (!dataset.validation && !dataset.test) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["validation"],
+      message: "Provide a distinct validation or test split for held-out evaluation",
+    });
+  }
 });
 
 export const fineTuneHyperparametersSchema = z.object({
-  n_epochs: z.number().int().min(1).max(20).default(3),
+  n_epochs: z.number().int().min(1).max(20).default(1),
   learning_rate: z.number().positive().optional(),
   batch_size: z.number().int().min(1).optional(),
   lora_rank: z.number().int().min(1).optional(),
@@ -50,97 +50,34 @@ export const fineTuneHyperparametersSchema = z.object({
   lora_dropout: z.number().min(0).max(1).optional(),
   max_seq_length: z.number().int().min(128).max(32768).optional(),
   gradient_accumulation_steps: z.number().int().min(1).optional(),
-  save_adapter_only: z.boolean().default(false),
-  augment: z.boolean().default(false),
-  use_llm_judge: z.boolean().default(false),
   max_eval_examples: z.number().int().min(1).optional(),
-  chat_template_kwargs: z.record(z.string(), z.unknown()).optional(),
-  dpo_beta: z.number().positive().optional(),
-  dpo_loss_type: z.string().min(1).optional(),
-  dpo_label_smoothing: z.number().min(0).max(1).optional(),
-  dpo_reference_free: z.boolean().optional(),
-  max_prompt_length: z.number().int().min(1).optional(),
-  max_completion_length: z.number().int().min(1).optional(),
-  /** Immutable Hugging Face commit/revision used for reproducible loading. */
-  base_model_revision: z.string().min(1).optional(),
-  parent_model_artifact: z.string().min(1).optional(),
-}).passthrough();
-
-export const modelArtifactMetadataSchema = z.object({
-  framework: z.string().min(1).optional(),
-  format: z.string().min(1).optional(),
-  entrypoint: z.string().min(1).optional(),
-  servable: z.boolean().optional(),
-  notes: z.string().min(1).optional(),
-}).passthrough();
-
-export const localArtifactsSchema = z.object({
-  prefix: z.string().min(1).optional(),
-});
+  /** Immutable Hugging Face commit used by every stage of the run. */
+  base_model_revision: baseModelRevisionSchema.optional(),
+}).strict();
 
 export const fineTuneRunRequestSchema = z.object({
   run_id: z.string().uuid(),
   user_id: z.string().min(1),
   behavior_spec_id: z.string().uuid(),
   run_number: z.number().int().min(1),
-  training_method: trainingMethodSchema.default("sft"),
   spec_snapshot: specSnapshotSchema,
-  hyperparameters: fineTuneHyperparametersSchema.default({
-    n_epochs: 3,
-    save_adapter_only: false,
-    augment: false,
-    use_llm_judge: false,
-  }),
-  artifacts: localArtifactsSchema.optional(),
+  hyperparameters: fineTuneHyperparametersSchema.default({ n_epochs: 1 }),
   dataset_prebuilt: datasetPrebuiltSchema.optional(),
-}).superRefine((request, ctx) => {
-  if (request.training_method === "dpo") {
-    if (!request.dataset_prebuilt) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["dataset_prebuilt"],
-        message: "DPO training requires dataset_prebuilt.training with format preference_jsonl",
-      });
-    } else if (request.dataset_prebuilt.format !== "preference_jsonl") {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["dataset_prebuilt", "format"],
-        message: "DPO training requires dataset_prebuilt.format to be preference_jsonl",
-      });
-    }
-    if (!request.dataset_prebuilt?.test && !request.dataset_prebuilt?.validation && request.spec_snapshot.examples.length === 0) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["spec_snapshot", "examples"],
-        message: "DPO evaluation requires dataset_prebuilt.test, dataset_prebuilt.validation, or spec_snapshot.examples",
-      });
-    }
-  } else if (request.dataset_prebuilt?.format === "preference_jsonl") {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ["dataset_prebuilt", "format"],
-      message: "preference_jsonl datasets require training_method dpo",
-    });
-  }
-
-  if (request.training_method === "sft" && request.spec_snapshot.examples.length === 0 && !request.dataset_prebuilt) {
-    ctx.addIssue({
+}).strict().superRefine((request, context) => {
+  if (request.spec_snapshot.examples.length === 0 && !request.dataset_prebuilt) {
+    context.addIssue({
       code: z.ZodIssueCode.custom,
       path: ["spec_snapshot", "examples"],
-      message: "spec_snapshot.examples must have at least 1 example unless dataset_prebuilt is provided",
+      message: "Add examples or provide dataset_prebuilt training and validation files",
     });
   }
 });
 
 export const localBehaviorSpecFileSchema = specSnapshotSchema.extend({
   id: z.string().uuid().optional(),
-  user_id: z.string().min(1).default("local-user"),
-  run_number: z.number().int().min(1).default(1),
-  training_method: trainingMethodSchema.default("sft"),
   hyperparameters: fineTuneHyperparametersSchema.optional(),
-  artifacts: localArtifactsSchema.optional(),
   dataset_prebuilt: datasetPrebuiltSchema.optional(),
-});
+}).strict();
 
 export const evalExampleResultSchema = z.object({
   prompt: z.string(),
@@ -150,8 +87,8 @@ export const evalExampleResultSchema = z.object({
   score: z.number().min(0).max(1),
   reasoning: z.string().nullable(),
   latency_ms: z.number().int().nonnegative(),
-  scored_by: z.enum(["llm_judge", "exact_match", "json_fields", "heuristic", "exact_match_fallback"]).optional(),
-});
+  scored_by: z.enum(["exact_match", "json_fields", "heuristic"]).optional(),
+}).strict();
 
 export const jsonFieldMetricsSchema = z.object({
   fields: z.array(z.string()),
@@ -165,15 +102,14 @@ export const jsonFieldMetricsSchema = z.object({
     correct: z.number().int().nonnegative(),
     total: z.number().int().nonnegative(),
     accuracy: z.number().min(0).max(1),
-  })),
-});
+  }).strict()),
+}).strict();
 
 export const evalSplitSchema = z.enum([
   "spec_examples",
   "spec_holdout",
   "prebuilt_test",
   "prebuilt_validation",
-  "prebuilt_training",
 ]);
 
 export const evalReportSchema = z.object({
@@ -190,53 +126,42 @@ export const evalReportSchema = z.object({
   exact_match_rate: z.number().min(0).max(1),
   avg_token_f1: z.number().min(0).max(1).optional(),
   avg_latency_ms: z.number().int().nonnegative(),
-  judge_scored_count: z.number().int().nonnegative().optional(),
-  fallback_scored_count: z.number().int().nonnegative().optional(),
-  judge_only_avg_score: z.number().min(0).max(1).nullable().optional(),
   cached: z.boolean().optional(),
   cache_key: z.string().optional(),
   results: z.array(evalExampleResultSchema),
   artifact_uri: z.string(),
-  scoring_method: z.enum(["heuristic", "command", "llm_judge", "exact_match", "json_fields"]),
-  judge_model_id: z.string().nullable().optional(),
-  inference_provider: z.enum(["none", "command", "batch_command", "transformers"]).optional(),
-  scoring_mode: z.enum(["exact_match", "llm_judge", "json_fields"]).optional(),
+  scoring_method: z.enum(["heuristic", "exact_match", "json_fields"]),
+  inference_provider: z.enum(["none", "transformers"]).optional(),
+  scoring_mode: z.enum(["exact_match", "json_fields"]).optional(),
   json_field_metrics: jsonFieldMetricsSchema.optional(),
   generation_config: z.record(z.string(), z.unknown()).optional(),
   log_uri: z.string().optional(),
-});
-
-export const regressionCategorySchema = z.enum(["factual", "omission", "style", "fallback", "other"]);
+}).strict();
 
 export const comparisonReportSchema = z.object({
   avg_score_delta: z.number(),
   pass_rate_delta: z.number(),
   exact_match_rate_delta: z.number(),
   token_f1_delta: z.number().optional(),
-  judge_only_avg_score_delta: z.number().nullable().optional(),
   regressions: z.number().int().nonnegative(),
   improvements: z.number().int().nonnegative(),
-  regression_taxonomy: z.record(regressionCategorySchema, z.number().int().nonnegative()).optional(),
   regressed_examples: z.array(z.object({
     prompt: z.string(),
     old_score: z.number(),
     new_score: z.number(),
-    category: regressionCategorySchema.optional(),
-  })),
-});
+  }).strict()),
+}).strict();
 
 export const trainingReportSchema = z.object({
-  provider: z.enum(["local-uv", "local-command"]),
+  provider: z.literal("local-uv"),
   training_job_name: z.string(),
   model_artifact_uri: z.string().optional(),
   base_model_artifact_uri: z.string().optional(),
-  parent_model_artifact_uri: z.string().optional(),
-  artifact_metadata: modelArtifactMetadataSchema.optional(),
   metrics: z.record(z.string(), z.unknown()).nullable(),
   exit_code: z.number().int().nullable(),
   log_uri: z.string(),
   command: z.array(z.string()).optional(),
-});
+}).strict();
 
 export const runReportSchema = z.object({
   run_id: z.string().uuid(),
@@ -255,12 +180,10 @@ export const runReportSchema = z.object({
     baseline_eval: z.string(),
     candidate_eval: z.string(),
     report: z.string(),
-  }),
+  }).strict(),
   run_metadata: z.object({
     base_model: z.string(),
     fine_tuned_model_id: z.string(),
-    parent_model_artifact: z.string().nullable().optional(),
-    training_method: trainingMethodSchema.default("sft"),
     dataset_prebuilt: z.boolean(),
     dataset_format: datasetFormatSchema.nullable().optional(),
     dataset_uri: z.string(),
@@ -274,137 +197,57 @@ export const runReportSchema = z.object({
     completed_at: z.string(),
     elapsed_ms: z.number().int().nonnegative(),
     elapsed_seconds: z.number().nonnegative(),
-  }),
+  }).strict(),
   created_at: z.string(),
-});
+}).strict();
 
-export const commandSchema = z.array(z.string().min(1)).min(1);
+const inferenceConfigSchema = z.object({
+  maxNewTokens: z.number().int().min(1).default(256),
+  temperature: z.number().min(0).default(0),
+  topP: z.number().min(0).max(1).default(1),
+  device: z.enum(["cuda", "cpu"]).default("cuda"),
+}).strict();
 
-export const labelingConfigSchema = z.object({
-  /** Teacher model id; falls back to llm.model when unset. */
-  model: z.string().min(1).optional(),
-  maxTokens: z.number().int().min(64).default(2048),
-  /** Low temperature: we want the teacher's best label, not its creativity. */
-  temperature: z.number().min(0).default(0.2),
-  concurrency: z.number().int().min(1).max(32).default(4),
-  minIntervalMs: z.number().int().min(0).default(0),
-  maxAttempts: z.number().int().min(1).max(10).default(3),
-  maxRows: z.number().int().min(1).max(500_000).default(50_000),
-  timeoutMs: z.number().int().min(100).default(120_000),
-});
+const scoringConfigSchema = z.object({
+  mode: z.enum(["exact_match", "json_fields"]).default("exact_match"),
+  fields: z.array(z.string().min(1)).optional(),
+}).strict();
+
+const evaluationConfigSchema = z.object({
+  inference: inferenceConfigSchema.default({
+    maxNewTokens: 256,
+    temperature: 0,
+    topP: 1,
+    device: "cuda",
+  }),
+  scoring: scoringConfigSchema.default({ mode: "exact_match" }),
+  timeoutMs: z.number().int().min(100).default(1_800_000),
+  maxExamples: z.number().int().min(1).optional(),
+  sampleSeed: z.number().int().optional(),
+  baselineCache: z.boolean().default(true),
+}).strict();
 
 export const localRunnerConfigSchema = z.object({
   storeRoot: z.string().optional(),
   artifactRoot: z.string().default(".tt-local/artifacts"),
   dryRun: z.boolean().default(false),
-  training: z.object({
-    backend: z.enum(["uv", "command"]).default("uv"),
-    command: commandSchema.optional(),
-    artifact: modelArtifactMetadataSchema.optional(),
-    project: z.string().default("training/local-runner"),
-    cwd: z.string().optional(),
-    module: z.string().optional(),
-    script: z.string().optional(),
-    args: z.array(z.string()).default([]),
-    with: z.array(z.string()).default([]),
-    env: z.record(z.string(), z.string()).default({}),
-  }).default({
-    backend: "uv",
-    project: "training/local-runner",
-    args: [],
-    with: [],
-    env: {},
-  }),
   paths: z.object({
     baseModel: z.string().optional(),
     modelCache: z.string().optional(),
-  }).default({}),
-  evaluation: z.object({
-    baselineCommand: commandSchema.optional(),
-    candidateCommand: commandSchema.optional(),
-    inference: z.object({
-      provider: z.enum(["transformers", "batch_command", "command", "none"]).default("transformers"),
-      command: commandSchema.optional(),
-      project: z.string().default("training/local-runner"),
-      cwd: z.string().optional(),
-      module: z.string().optional(),
-      script: z.string().default("training/local-runner/src/evaluate.py"),
-      args: z.array(z.string()).default([]),
-      with: z.array(z.string()).default([]),
-      env: z.record(z.string(), z.string()).default({}),
-      maxNewTokens: z.number().int().min(1).default(256),
-      temperature: z.number().min(0).default(0),
-      topP: z.number().min(0).max(1).default(1),
-      trustRemoteCode: z.boolean().default(true),
-      device: z.enum(["auto", "cpu", "cuda", "mps"]).default("auto"),
-      chatTemplateKwargs: z.record(z.string(), z.unknown()).optional(),
-    }).default({
-      provider: "transformers",
-      project: "training/local-runner",
-      script: "training/local-runner/src/evaluate.py",
-      args: [],
-      with: [],
-      env: {},
-      maxNewTokens: 256,
-      temperature: 0,
-      topP: 1,
-      trustRemoteCode: true,
-      device: "auto",
-    }),
-    scoring: z.object({
-      mode: z.enum(["exact_match", "llm_judge", "json_fields"]).default("exact_match"),
-      fallback: z.enum(["exact_match", "fail"]).default("fail"),
-      fields: z.array(z.string().min(1)).optional(),
-    }).default({
-      mode: "exact_match",
-      fallback: "fail",
-    }),
-    timeoutMs: z.number().int().min(100).default(1_800_000),
-    maxExamples: z.number().int().min(1).optional(),
-    sampleSeed: z.number().int().optional(),
-    allowPrebuiltTrainingEval: z.boolean().default(false),
-    baselineCache: z.boolean().default(true),
-  }).default({
+  }).strict().default({}),
+  evaluation: evaluationConfigSchema.default({
     inference: {
-      provider: "transformers",
-      project: "training/local-runner",
-      script: "training/local-runner/src/evaluate.py",
-      args: [],
-      with: [],
-      env: {},
       maxNewTokens: 256,
       temperature: 0,
       topP: 1,
-      trustRemoteCode: true,
-      device: "auto",
+      device: "cuda",
     },
-    scoring: {
-      mode: "exact_match",
-      fallback: "fail",
-    },
+    scoring: { mode: "exact_match" },
     timeoutMs: 1_800_000,
-    allowPrebuiltTrainingEval: false,
     baselineCache: true,
   }),
-  llm: z.object({
-    provider: z.literal("openrouter").default("openrouter"),
-    model: z.string().min(1).default("openai/gpt-5.5"),
-    apiKeyEnv: z.string().min(1).default("OPENROUTER_API_KEY"),
-    appName: z.string().optional(),
-    siteUrl: z.string().url().optional(),
-  }).optional(),
-  labeling: labelingConfigSchema.default({
-    maxTokens: 2048,
-    temperature: 0.2,
-    concurrency: 4,
-    minIntervalMs: 0,
-    maxAttempts: 3,
-    maxRows: 50_000,
-    timeoutMs: 120_000,
-  }),
-});
+}).strict();
 
-export type DocumentInputAsset = z.infer<typeof documentInputAssetSchema>;
 export type BehaviorSpecExample = z.infer<typeof behaviorSpecExampleSchema>;
 export type SpecSnapshot = z.infer<typeof specSnapshotSchema>;
 export type FineTuneHyperparameters = z.infer<typeof fineTuneHyperparametersSchema>;
@@ -416,5 +259,4 @@ export type EvalReport = z.infer<typeof evalReportSchema>;
 export type ComparisonReport = z.infer<typeof comparisonReportSchema>;
 export type TrainingReport = z.infer<typeof trainingReportSchema>;
 export type RunReport = z.infer<typeof runReportSchema>;
-export type LocalLabelingConfig = z.infer<typeof labelingConfigSchema>;
 export type LocalRunnerConfig = z.infer<typeof localRunnerConfigSchema>;

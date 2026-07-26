@@ -2,15 +2,21 @@ import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { LocalRunnerConfig } from "./contracts.js";
-import { minimalMachineLearningEnvironment, withHuggingFaceCacheEnvironment } from "./huggingface-cache.js";
+import {
+  minimalMachineLearningEnvironment,
+  withOfflineHuggingFaceCacheEnvironment,
+} from "./huggingface-cache.js";
 import { resolveTrainingModel } from "./model-registry.js";
-import { buildEntrypointCommand } from "./process-runner.js";
+import {
+  buildBundledPythonCommand,
+  withBundledPythonEnvironment,
+} from "./process-runner.js";
 import type { LocalModelRecord } from "./store.js";
 
 export interface LocalModelServeOptions {
   host?: string;
   port?: number;
-  device?: "auto" | "cpu" | "cuda" | "mps";
+  device?: "cpu" | "cuda";
   maxTokens?: number;
   temperature?: number;
   topP?: number;
@@ -26,7 +32,6 @@ export interface LocalModelServerLaunch {
   command: string;
   commandArgs: string[];
   displayCommand: string[];
-  cwd?: string;
   env: NodeJS.ProcessEnv;
   url: string;
   modelName: string;
@@ -101,41 +106,35 @@ export function buildLocalModelServerLaunch(args: {
     );
   }
   const localBaseModelPath = recordedBaseModelPath ?? configuredBaseModelPath;
-  const resolvedModel = resolveTrainingModel(args.model.base_model);
-  const entrypoint = buildEntrypointCommand({
-    backend: "uv",
-    project: args.config.evaluation.inference.project ?? "training/local-runner",
-    cwd: args.config.evaluation.inference.cwd,
-    script: "training/local-runner/src/serve.py",
-  });
+  resolveTrainingModel(args.model.base_model);
+  const entrypoint = buildBundledPythonCommand("serve.py");
   const modelName = args.model.id;
-  const env = withHuggingFaceCacheEnvironment({
-    ...minimalMachineLearningEnvironment(process.env, { includeHfToken: resolvedModel.requiresHfToken }),
-    ...args.config.evaluation.inference.env,
-    TT_MODEL_ARTIFACT: artifactPath,
-    TT_BASE_MODEL: localBaseModelPath ?? args.model.base_model,
-    ...(options.baseModelRevision && !localBaseModelPath
-      ? { TT_BASE_MODEL_REVISION: options.baseModelRevision }
-      : {}),
-    TT_MODEL_NAME: modelName,
-    TT_MODEL_LOADER: resolvedModel.loader,
-    TT_HOST: host,
-    TT_PORT: String(port),
-    TT_DEVICE: options.device ?? args.config.evaluation.inference.device,
-    TT_MAX_TOKENS: String(maxTokens),
-    TT_TEMPERATURE: String(temperature),
-    TT_TOP_P: String(topP),
-    TT_TRUST_REMOTE_CODE: String(resolvedModel.trustRemoteCode && args.config.evaluation.inference.trustRemoteCode),
-    TT_MAX_CONCURRENT_REQUESTS: String(maxConcurrentRequests),
-    TT_CHAT_TEMPLATE_KWARGS: JSON.stringify(args.config.evaluation.inference.chatTemplateKwargs ?? {}),
-    ...(options.systemPrompt ? { TT_SYSTEM_PROMPT: options.systemPrompt } : {}),
-    ...(apiKey ? { TT_API_KEY: apiKey } : {}),
-  }, args.config.paths.modelCache);
+  const env = withBundledPythonEnvironment(
+    withOfflineHuggingFaceCacheEnvironment({
+      ...minimalMachineLearningEnvironment(process.env),
+      TT_MODEL_ARTIFACT: artifactPath,
+      TT_BASE_MODEL: localBaseModelPath ?? args.model.base_model,
+      ...(options.baseModelRevision && !localBaseModelPath
+        ? { TT_BASE_MODEL_REVISION: options.baseModelRevision }
+        : {}),
+      TT_MODEL_NAME: modelName,
+      TT_MODEL_LOADER: "causal_lm",
+      TT_HOST: host,
+      TT_PORT: String(port),
+      TT_DEVICE: options.device ?? args.config.evaluation.inference.device,
+      TT_MAX_TOKENS: String(maxTokens),
+      TT_TEMPERATURE: String(temperature),
+      TT_TOP_P: String(topP),
+      TT_TRUST_REMOTE_CODE: "false",
+      TT_MAX_CONCURRENT_REQUESTS: String(maxConcurrentRequests),
+      ...(options.systemPrompt ? { TT_SYSTEM_PROMPT: options.systemPrompt } : {}),
+      ...(apiKey ? { TT_API_KEY: apiKey } : {}),
+    }, args.config.paths.modelCache),
+  );
   return {
     command: entrypoint.command,
     commandArgs: entrypoint.commandArgs,
     displayCommand: entrypoint.displayCommand,
-    cwd: entrypoint.kind === "uv" ? args.config.evaluation.inference.cwd : undefined,
     env,
     url: `http://${httpHost(host)}:${port}`,
     modelName,
@@ -146,7 +145,6 @@ export function buildLocalModelServerLaunch(args: {
 export async function serveLocalModel(launch: LocalModelServerLaunch): Promise<void> {
   await new Promise<void>((resolveServer, reject) => {
     const child = spawn(launch.command, launch.commandArgs, {
-      cwd: launch.cwd,
       env: launch.env,
       stdio: "inherit",
       detached: process.platform !== "win32",

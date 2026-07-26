@@ -1,20 +1,24 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { compileSpecToJsonl, buildSystemMessage, examplesFromChatJsonl } from "../src/dataset.js";
+import { test } from "node:test";
 import { fineTuneRunRequestSchema } from "../src/contracts.js";
+import {
+  buildSystemMessage,
+  compileSpecToJsonl,
+  examplesFromChatJsonl,
+  normalizeChatJsonlForRelocation,
+} from "../src/dataset.js";
 
-test("compiles behavior spec examples to chat JSONL", () => {
+test("compiles a canonical Qwen text-SFT row with the assistant last", () => {
   const request = fineTuneRunRequestSchema.parse({
     run_id: "11111111-1111-4111-8111-111111111111",
-    user_id: "user",
+    user_id: "local-user",
     behavior_spec_id: "22222222-2222-4222-8222-222222222222",
     run_number: 1,
     spec_snapshot: {
-      name: "Example",
-      description: "",
+      name: "Classifier",
       system_prompt: "Be precise.",
       guidelines: ["Return one label."],
       constraints: ["No prose."],
@@ -24,67 +28,99 @@ test("compiles behavior spec examples to chat JSONL", () => {
   });
 
   assert.equal(request.spec_snapshot.base_model, "Qwen/Qwen3.5-2B");
-  assert.match(buildSystemMessage(request.spec_snapshot), /Guidelines:/);
-
-  const lines = compileSpecToJsonl(request.spec_snapshot).split("\n");
-  assert.equal(lines.length, 1);
-  const row = JSON.parse(lines[0] ?? "");
-  assert.equal(row.messages[0].role, "system");
-  assert.equal(row.messages[1].content, "hello");
-  assert.equal(row.messages[2].content, "greeting");
+  assert.equal(
+    buildSystemMessage(request.spec_snapshot),
+    "Be precise.\n\nGuidelines:\n- Return one label.\n\nConstraints:\n- No prose.",
+  );
+  assert.deepEqual(JSON.parse(compileSpecToJsonl(request.spec_snapshot)), {
+    messages: [
+      {
+        role: "system",
+        content: "Be precise.\n\nGuidelines:\n- Return one label.\n\nConstraints:\n- No prose.",
+      },
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "greeting" },
+    ],
+  });
 });
 
-test("compiles and reads multimodal chat JSONL image assets", async () => {
+test("uses one non-empty system prompt when the spec provides no prose", () => {
   const request = fineTuneRunRequestSchema.parse({
     run_id: "11111111-1111-4111-8111-111111111111",
-    user_id: "user",
+    user_id: "local-user",
     behavior_spec_id: "22222222-2222-4222-8222-222222222222",
     run_number: 1,
     spec_snapshot: {
-      name: "Chart QA",
-      description: "",
-      system_prompt: "Read charts.",
-      base_model: "qwen/qwen3-vl-2b",
-      examples: [{
-        input: "What is the blue value?",
-        output: "42",
-        input_assets: [{ type: "image", image: "charts/example.png", mime_type: "image/png" }],
-      }],
+      name: "Demonstrated behavior",
+      system_prompt: "",
+      guidelines: [],
+      constraints: [],
+      base_model: "Qwen/Qwen3.5-2B",
+      examples: [{ input: "hello", output: "hi" }],
     },
   });
 
-  const line = compileSpecToJsonl(request.spec_snapshot);
-  const row = JSON.parse(line);
-  assert.deepEqual(row.messages[1].content, [
-    { type: "image", image: "charts/example.png", mime_type: "image/png" },
-    { type: "text", text: "What is the blue value?" },
-  ]);
+  assert.equal(
+    buildSystemMessage(request.spec_snapshot),
+    "Follow the demonstrated behavior.",
+  );
+});
 
-  const root = await mkdtemp(join(tmpdir(), "tt-local-dataset-mm-test-"));
+test("normalizes and reads text-only prebuilt chat JSONL", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-dataset-"));
   try {
-    const path = join(root, "data.jsonl");
-    await writeFile(path, `${line}\n`, "utf8");
-    const examples = await examplesFromChatJsonl(path);
-    assert.equal(examples[0]?.input, "What is the blue value?");
-    assert.equal(examples[0]?.output, "42");
-    assert.deepEqual(examples[0]?.input_assets, [{
-      type: "image",
-      image: join(root, "charts", "example.png"),
-      mime_type: "image/png",
+    const path = join(root, "training.jsonl");
+    await writeFile(path, [
+      JSON.stringify({
+        extra: "discarded",
+        messages: [
+          { role: "system", content: "Classify." },
+          { role: "user", content: "first" },
+          { role: "assistant", content: "final answer" },
+        ],
+      }),
+      "",
+    ].join("\n"), "utf8");
+
+    const normalized = await normalizeChatJsonlForRelocation(path);
+    assert.equal((JSON.parse(normalized) as Record<string, unknown>).extra, undefined);
+    assert.deepEqual(await examplesFromChatJsonl(path), [{
+      input: "first",
+      output: "final answer",
     }]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects malformed, empty, and structured-content chat rows", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tt-local-dataset-invalid-"));
+  try {
+    const path = join(root, "training.jsonl");
+    await writeFile(path, "{not json}\n", "utf8");
+    await assert.rejects(normalizeChatJsonlForRelocation(path), /row 1: malformed JSON/);
+
+    await writeFile(path, "\n", "utf8");
+    await assert.rejects(normalizeChatJsonlForRelocation(path), /contains no examples/);
 
     await writeFile(path, `${JSON.stringify({
-      images: ["charts/top-level.png"],
       messages: [
-        { role: "user", content: "What is shown?" },
-        { role: "assistant", content: "A chart" },
+        { role: "user", content: [{ type: "text", text: "hello" }] },
+        { role: "assistant", content: "hi" },
       ],
     })}\n`, "utf8");
-    const topLevelExamples = await examplesFromChatJsonl(path);
-    assert.deepEqual(topLevelExamples[0]?.input_assets, [{
-      type: "image",
-      image: join(root, "charts", "top-level.png"),
-    }]);
+    await assert.rejects(
+      normalizeChatJsonlForRelocation(path),
+      /optional system message, one user message, and one assistant answer/,
+    );
+
+    await writeFile(path, `${JSON.stringify({
+      messages: [{ role: "user", content: "hello" }],
+    })}\n`, "utf8");
+    await assert.rejects(
+      examplesFromChatJsonl(path),
+      /optional system message, one user message, and one assistant answer/,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
