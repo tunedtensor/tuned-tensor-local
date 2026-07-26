@@ -4,6 +4,17 @@ All notable changes to TT Local will be documented in this file.
 
 ## Unreleased
 
+## 0.3.0 - 2026-07-26
+
+### Added
+
+- Added one certified end-to-end local workflow for CUDA LoRA SFT of
+  `Qwen/Qwen3.5-2B`, including immutable snapshot prefetch, held-out
+  base-versus-tuned evaluation, verified PEFT artifacts, and
+  OpenAI-compatible local serving.
+- Added exact Qwen model-contract checks in both TypeScript and Python, plus
+  strict text-only chat JSONL validation and assistant-only SFT data tests.
+
 ### Removed
 
 - **Breaking:** reduced TT Local to its end-to-end verified purpose: text LoRA
@@ -31,6 +42,9 @@ All notable changes to TT Local will be documented in this file.
   environment overrides.
 - Bundled `uv` commands now use `--frozen` and a content-keyed virtual
   environment in the writable user cache instead of modifying the npm package.
+- After prefetch verifies an immutable snapshot, training, evaluation, and
+  serving enforce offline Hugging Face cache use and the current Transformers
+  `dtype` loading API.
 - Explicit base-model revisions must be immutable 40-character Hugging Face
   commit SHAs; moving branches and tags are rejected.
 - Default holdout sampling is stable across runs of the same behavior spec,

@@ -95,6 +95,9 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Classify: I loved it."}]}'
 ```
 
-If a run fails, inspect `.tt-local/artifacts/<run-id>/logs/` and
-`tt-local runs events <run-id>`. The adapter is registered as soon as its
-manifest verifies, even if candidate evaluation fails afterward.
+If a run fails, start with `tt-local runs events <run-id>` and
+`tt-local runs get <run-id>`. The run record reports its `artifact_dir`; the
+main subprocess logs there are `training/training.log`,
+`baseline-eval.json.inference.log`, and `candidate-eval.json.inference.log`.
+The adapter is registered as soon as its manifest verifies, even if candidate
+evaluation fails afterward.

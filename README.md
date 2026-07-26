@@ -135,7 +135,7 @@ Run state is intentionally plain and recoverable:
 
 ```text
 .tt-local/
-  artifacts/<run-id>/...
+  artifacts/users/<user-id>/specs/<spec-id>/runs/<run-id>/...
   store/specs/<spec-id>/spec.json
   store/runs/<run-id>/{request.json,state.json,progress.jsonl,run-report.json}
   store/models/<model-id>/model.json

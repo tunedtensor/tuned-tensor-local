@@ -369,7 +369,7 @@ test("baseline cache keys include revision, source fingerprint, inference, and s
     evalSplit: "spec_holdout" as const,
     evalSampleSeed: 123,
     config: localRunnerConfigSchema.parse({}),
-    packageVersion: "0.2.9",
+    packageVersion: "0.3.0",
   };
   const first = baselineCacheKey(base);
   assert.equal(first, baselineCacheKey(base));

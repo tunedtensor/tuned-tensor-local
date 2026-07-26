@@ -1,6 +1,6 @@
 {
   "name": "@tuned-tensor/local",
-  "version": "0.2.9",
+  "version": "0.3.0",
   "description": "Local CUDA LoRA fine-tuning with held-out base-versus-tuned evaluation.",
   "license": "Apache-2.0",
   "private": false,

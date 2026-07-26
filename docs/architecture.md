@@ -11,7 +11,7 @@ boundary is text SFT of `Qwen/Qwen3.5-2B` into a LoRA adapter on CUDA.
 4. Train a PEFT adapter with the bundled, locked `uv` project.
 5. Verify and register the adapter before downstream evaluation.
 6. Evaluate the adapter on the same held-out rows.
-7. write a base-versus-tuned report.
+7. Write a base-versus-tuned report.
 
 The orchestrator retains explicit stages and fingerprints internally so an
 interrupted run can safely resume. These mechanics are reliability

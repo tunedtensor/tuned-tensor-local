@@ -205,7 +205,7 @@ const COMMAND_DEFINITIONS: Record<string, CliCommandDefinition> = {
 
 const COMMAND_GROUPS: Record<string, CliCommandGroup> = {
   runs: {
-    description: "Inspect and manage locally stored runs.",
+    description: "Inspect locally stored runs.",
     defaultSubcommand: "list",
     subcommands: {
       list: { usage: "tt-local runs list [--config path]", description: "List local runs.", options: [CONFIG_OPTION], maxPositionals: 0 },
