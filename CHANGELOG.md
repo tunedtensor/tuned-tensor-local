@@ -4,6 +4,19 @@ All notable changes to TT Local will be documented in this file.
 
 ## Unreleased
 
+### Deprecated
+
+- Deprecated the standalone `tt-local` CLI in favor of the unified
+  `@tuned-tensor/cli` surface, where the same commands are available under
+  `tt local`. The package remains in maintenance mode as the local runtime
+  used by the unified CLI, and existing project files and artifacts remain
+  compatible.
+
+### Changed
+
+- Updated the README and DGX Spark guide to use `tt local` and added a
+  migration note for existing standalone users.
+
 ## 0.4.0 - 2026-07-26
 
 ### Added

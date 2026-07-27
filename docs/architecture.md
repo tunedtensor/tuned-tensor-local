@@ -1,7 +1,9 @@
 # Architecture
 
-TT Local is a focused, single-host fine-tuning tool. Its supported product
-boundary is text SFT of `Qwen/Qwen3.5-2B` into a LoRA adapter on CUDA.
+This repository is the maintenance-mode local runtime behind the unified
+`tt local` workflow. The standalone `tt-local` product surface is deprecated;
+see [the deprecation note](../DEPRECATION.md). Its supported runtime boundary
+is text SFT of `Qwen/Qwen3.5-2B` into a LoRA adapter on CUDA.
 
 ## Workflow
 
