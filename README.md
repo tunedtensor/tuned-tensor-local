@@ -5,12 +5,9 @@
 
 > [!IMPORTANT]
 > The standalone `tt-local` CLI is deprecated. Install
-> [`@tuned-tensor/cli`](https://www.npmjs.com/package/@tuned-tensor/cli) and use
-> `tt local ...` instead. The unified `tt` CLI exposes this complete workflow
-> alongside the hosted workflow and is where new user-experience work will
-> happen. This repository remains available in maintenance mode as the local
-> runtime used by `tt`. See [DEPRECATION.md](DEPRECATION.md) for scope and
-> migration details.
+> [`@tuned-tensor/cli`](https://www.npmjs.com/package/@tuned-tensor/cli) and
+> replace `tt-local ...` with `tt local ...`. Existing projects and data still
+> work. See [DEPRECATION.md](DEPRECATION.md).
 
 TT Local fine-tunes an open-weight language model on your own NVIDIA GPU. It
 turns a small behavior spec or chat JSONL dataset into a verified LoRA adapter,

@@ -1,9 +1,8 @@
 # DGX Spark
 
 > [!IMPORTANT]
-> The standalone `tt-local` command is deprecated. Install
-> `@tuned-tensor/cli` and use the `tt local` commands shown below. See
-> [the deprecation note](../DEPRECATION.md) for details.
+> `tt-local` is deprecated. Install `@tuned-tensor/cli` and use `tt local`.
+> Existing projects still work.
 
 DGX Spark is the reference host for the local workflow's first supported path:
 `Qwen/Qwen3.5-2B` text SFT with a LoRA adapter.
