@@ -1,6 +1,10 @@
 # DGX Spark
 
-DGX Spark is the reference host for TT Local's first supported path:
+> [!IMPORTANT]
+> `tt-local` is deprecated. Install `@tuned-tensor/cli` and use `tt local`.
+> Existing projects still work.
+
+DGX Spark is the reference host for the local workflow's first supported path:
 `Qwen/Qwen3.5-2B` text SFT with a LoRA adapter.
 
 ## Check the host
@@ -21,7 +25,7 @@ for the Hugging Face cache plus run artifacts.
 ```bash
 mkdir -p ~/tuned-tensor-runs/support-adapter
 cd ~/tuned-tensor-runs/support-adapter
-tt-local init --name "Support Adapter" --model Qwen/Qwen3.5-2B --profile spark
+tt local init --name "Support Adapter" --model Qwen/Qwen3.5-2B --profile spark
 ```
 
 Edit both generated examples in `tunedtensor.json`. For a meaningful run,
@@ -56,11 +60,11 @@ source checkout and a custom runner path are neither required nor supported.
 ## Preflight and run
 
 ```bash
-tt-local doctor tunedtensor.json
-tt-local validate tunedtensor.json
-tt-local models prefetch tunedtensor.json
-tt-local models verify-base tunedtensor.json
-tt-local run tunedtensor.json
+tt local doctor tunedtensor.json
+tt local validate tunedtensor.json
+tt local models prefetch tunedtensor.json
+tt local models verify-base tunedtensor.json
+tt local run tunedtensor.json
 ```
 
 `doctor` resolves the same bundled project and paths the run will use, imports
@@ -80,9 +84,9 @@ The runner provides these paths to Python:
 ## Verify and serve
 
 ```bash
-tt-local runs report <run-id>
-tt-local models verify local-<run-id>
-tt-local serve local-<run-id> --spec tunedtensor.json --port 8000
+tt local runs report <run-id>
+tt local models verify local-<run-id>
+tt local serve local-<run-id> --spec tunedtensor.json --port 8000
 ```
 
 In another shell:
@@ -95,8 +99,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"Classify: I loved it."}]}'
 ```
 
-If a run fails, start with `tt-local runs events <run-id>` and
-`tt-local runs get <run-id>`. The run record reports its `artifact_dir`; the
+If a run fails, start with `tt local runs events <run-id>` and
+`tt local runs get <run-id>`. The run record reports its `artifact_dir`; the
 main subprocess logs there are `training/training.log`,
 `baseline-eval.json.inference.log`, and `candidate-eval.json.inference.log`.
 The adapter is registered as soon as its manifest verifies, even if candidate

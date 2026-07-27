@@ -1,7 +1,7 @@
 {
   "name": "@tuned-tensor/local",
   "version": "0.4.0",
-  "description": "Local CUDA LoRA fine-tuning with held-out base-versus-tuned evaluation.",
+  "description": "Maintenance-mode local CUDA runtime for the unified Tuned Tensor CLI.",
   "license": "Apache-2.0",
   "private": false,
   "repository": {
@@ -24,6 +24,7 @@
     "training/local-runner/uv.lock",
     "training/local-runner/src/*.py",
     "README.md",
+    "DEPRECATION.md",
     "CHANGELOG.md",
     "LICENSE"
   ],

@@ -3,6 +3,12 @@
 [![CI](https://github.com/tunedtensor/tuned-tensor-local/actions/workflows/ci.yml/badge.svg)](https://github.com/tunedtensor/tuned-tensor-local/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/@tuned-tensor/local)](https://www.npmjs.com/package/@tuned-tensor/local)
 
+> [!IMPORTANT]
+> The standalone `tt-local` CLI is deprecated. Install
+> [`@tuned-tensor/cli`](https://www.npmjs.com/package/@tuned-tensor/cli) and
+> replace `tt-local ...` with `tt local ...`. Existing projects and data still
+> work. See [DEPRECATION.md](DEPRECATION.md).
+
 TT Local fine-tunes an open-weight language model on your own NVIDIA GPU. It
 turns a small behavior spec or chat JSONL dataset into a verified LoRA adapter,
 compares the base and tuned model on held-out examples, and can serve the
@@ -29,8 +35,8 @@ repeatable end-to-end GPU acceptance test.
 The npm package includes the locked Python training environment.
 
 ```bash
-npm install -g @tuned-tensor/local
-tt-local info
+npm install -g @tuned-tensor/cli
+tt local info
 ```
 
 ## Fine-tune a model
@@ -39,7 +45,7 @@ Create a project on the GPU host:
 
 ```bash
 mkdir support-adapter && cd support-adapter
-tt-local init --name "Support Adapter" --model Qwen/Qwen3.5-2B --profile spark
+tt local init --name "Support Adapter" --model Qwen/Qwen3.5-2B --profile spark
 ```
 
 This creates `tunedtensor.json` and `local-runner.json`. Edit the generated
@@ -50,10 +56,10 @@ training and evaluation must not use the same row.
 Preflight the machine, input, and cached base model:
 
 ```bash
-tt-local doctor tunedtensor.json
-tt-local validate tunedtensor.json
-tt-local models prefetch tunedtensor.json
-tt-local models verify-base tunedtensor.json
+tt local doctor tunedtensor.json
+tt local validate tunedtensor.json
+tt local models prefetch tunedtensor.json
+tt local models verify-base tunedtensor.json
 ```
 
 Commands discover `local-runner.json` beside the spec. Use
@@ -62,14 +68,14 @@ Commands discover `local-runner.json` beside the spec. Use
 Run the complete base-evaluate, train, tuned-evaluate, and report workflow:
 
 ```bash
-tt-local run tunedtensor.json
+tt local run tunedtensor.json
 ```
 
 Inspect the evidence and verify the adapter:
 
 ```bash
-tt-local runs report <run-id>
-tt-local models verify local-<run-id>
+tt local runs report <run-id>
+tt local models verify local-<run-id>
 ```
 
 To protect broad capability, configure a separate chat JSONL suite in
@@ -96,11 +102,11 @@ After a passing run, activation is a lightweight pointer to the existing model
 record:
 
 ```bash
-tt-local models activate local-<run-id>
-tt-local models active
-tt-local serve active --config local-runner.json
-tt-local models rollback
-tt-local serve base --config local-runner.json
+tt local models activate local-<run-id>
+tt local models active
+tt local serve active --config local-runner.json
+tt local models rollback
+tt local serve base --config local-runner.json
 ```
 
 Activation re-verifies the model artifact and requires a completed run with a
@@ -138,13 +144,13 @@ test file for trustworthy evaluation.
 ## Serve the adapter
 
 ```bash
-tt-local serve local-<run-id> \
+tt local serve local-<run-id> \
   --spec tunedtensor.json \
   --host 127.0.0.1 \
   --port 8000
 ```
 
-`tt-local models serve` is an equivalent nested command. Before launch, TT
+`tt local models serve` is an equivalent nested command. Before launch, TT
 Local re-hashes the stored artifact manifest and then loads the recorded base
 model plus PEFT adapter with the bundled Python environment.
 
