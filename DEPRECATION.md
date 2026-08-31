@@ -7,15 +7,16 @@ npm install -g @tuned-tensor/cli
 tt local <command>
 ```
 
-Replace `tt-local ...` with `tt local ...`. The rest of the command stays the
-same.
+For an adapter project created with this package, replace `tt-local ...` with
+`tt local ...`. The rest of the command stays the same.
 
-Existing projects need no migration. `tt local` uses the same
+Those existing projects need no migration. `tt local` uses the same
 `tunedtensor.json`, `local-runner.json`, `.tt-local` artifacts, and local store.
 
-The standalone command will continue to work for compatibility. This package
-now serves as the local runtime behind `tt`; new user-facing work belongs in
-the [main CLI](https://github.com/tunedtensor/tuned-tensor-cli).
+The standalone package is a frozen legacy adapter-only CLI. It continues to
+support its Qwen 3.5 2B adapter workflow, but it is not the implementation of
+current `tt` features. The Foundation Pipeline and newer certified models are
+available only in the [main CLI](https://github.com/tunedtensor/tuned-tensor-cli).
 
 ## Examples
 
