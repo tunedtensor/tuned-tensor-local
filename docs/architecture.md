@@ -1,9 +1,9 @@
 # Architecture
 
-This repository is the maintenance-mode local runtime behind the unified
-`tt local` workflow. The standalone `tt-local` product surface is deprecated;
-see [the deprecation note](../DEPRECATION.md). Its supported runtime boundary
-is text SFT of `Qwen/Qwen3.5-2B` into a LoRA adapter on CUDA.
+This repository contains the frozen legacy adapter-only `tt-local` CLI. It is
+not the implementation of current `tt` features. The standalone product surface
+is deprecated; see [the deprecation note](../DEPRECATION.md). Its supported
+runtime boundary is text SFT of `Qwen/Qwen3.5-2B` into a LoRA adapter on CUDA.
 
 ## Workflow
 
