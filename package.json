@@ -1,7 +1,7 @@
 {
   "name": "@tuned-tensor/local",
   "version": "0.4.0",
-  "description": "Maintenance-mode local CUDA runtime for the unified Tuned Tensor CLI.",
+  "description": "Deprecated frozen legacy adapter-only CUDA CLI for Tuned Tensor.",
   "license": "Apache-2.0",
   "private": false,
   "repository": {
