@@ -4,10 +4,12 @@
 [![npm](https://img.shields.io/npm/v/@tuned-tensor/local)](https://www.npmjs.com/package/@tuned-tensor/local)
 
 > [!IMPORTANT]
-> The standalone `tt-local` CLI is deprecated. Install
+> The standalone `tt-local` CLI is a deprecated, frozen legacy adapter-only
+> package. For an adapter project created with this package, install
 > [`@tuned-tensor/cli`](https://www.npmjs.com/package/@tuned-tensor/cli) and
-> replace `tt-local ...` with `tt local ...`. Existing projects and data still
-> work. See [DEPRECATION.md](DEPRECATION.md).
+> replace `tt-local ...` with `tt local ...`; that project and its data remain
+> compatible. For the Foundation Pipeline and newer certified models, use the
+> main CLI directly. See [DEPRECATION.md](DEPRECATION.md).
 
 TT Local fine-tunes an open-weight language model on your own NVIDIA GPU. It
 turns a small behavior spec or chat JSONL dataset into a verified LoRA adapter,
